@@ -2,7 +2,7 @@
 
 ## What's dingofs
 
-DingoFS is a project fork from Curve. 
+DingoFS is a project fork from Curve.
 
 Curve is a sandbox project hosted by the CNCF Foundation. It's cloud-native, high-performance, and easy to operate. Curve is an open-source distributed storage system for block and shared file storage.
 
@@ -38,12 +38,15 @@ tar zxvf cmake-3.30.1-linux-x86_64.tar.gz
 sudo cp -rf cmake-3.30.1-linux-x86_64/bin/* /usr/local/bin/ && sudo cp -rf  cmake-3.30.1-linux-x86_64/share/* /usr/local/share && rm -rf cmake-3.30.1-linux-x86_64
 ```
 
-## How to build 
+## How to build
 
 ### Build dingo-eureka
 
 refer https://github.com/dingodb/dingo-eureka
 
+### Build dingo-sdk
+
+refer https://github.com/dingodb/dingo-sdk
 
 ### Install jemalloc
 ```shell
@@ -52,7 +55,7 @@ tar -xjvf jemalloc-5.3.0.tar.bz2
 cd jemalloc-5.3.0 && ./configure && make && make install
 ```
 
-### Download dep 
+### Download dep
 
 ```sh
 git submodule sync
@@ -65,7 +68,7 @@ git submodule update --init --recursive
 bash build_thirdparties.sh
 ```
 
-### Build 
+### Build
 ```sh
 mkdir build
 cd build

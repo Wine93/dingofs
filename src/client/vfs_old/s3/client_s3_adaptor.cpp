@@ -25,17 +25,19 @@
 #include <brpc/channel.h>
 #include <brpc/controller.h>
 
-#include "client/blockcache/block_cache.h"
-#include "client/blockcache/error.h"
+#include <utility>
+
+#include "cache/blockcache/block_cache.h"
+#include "cache/common/errno.h"
 #include "client/datastream/data_stream.h"
 #include "client/vfs_old/filesystem/filesystem.h"
 
 namespace dingofs {
 namespace client {
 
-using blockcache::BCACHE_ERROR;
-using blockcache::BlockCache;
-using blockcache::S3Client;
+using cache::blockcache::BlockCache;
+using cache::blockcache::Errno;
+using cache::blockcache::S3Client;
 using common::S3ClientAdaptorOption;
 using datastream::DataStream;
 using filesystem::FileSystem;
@@ -84,7 +86,7 @@ S3ClientAdaptorImpl::Init(const S3ClientAdaptorOption& option,
   // init block cache
   {
     auto rc = block_cache_->Init();
-    if (rc != BCACHE_ERROR::OK) {
+    if (rc != Errno::OK) {
       LOG(ERROR) << "Init bcache cache failed: " << StrErr(rc);
       return DINGOFS_ERROR::INTERNAL;
     }
@@ -341,7 +343,7 @@ DINGOFS_ERROR S3ClientAdaptorImpl::FlushAllCache(uint64_t inodeId) {
             << " related chunk upload to s3";
 
     auto rc = block_cache_->Flush(inodeId);
-    if (rc != BCACHE_ERROR::OK) {
+    if (rc != Errno::OK) {
       return DINGOFS_ERROR::INTERNAL;
     }
 
