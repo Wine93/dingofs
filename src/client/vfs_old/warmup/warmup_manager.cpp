@@ -34,8 +34,8 @@
 #include <utility>
 
 #include "base/filepath/filepath.h"
-#include "client/blockcache/cache_store.h"
-#include "client/blockcache/s3_client.h"
+#include "cache/blockcache/cache_store.h"
+#include "cache/common/s3_client.h"
 #include "client/common/common.h"
 #include "client/vfs/vfs_meta.h"
 #include "client/vfs_old/inode_wrapper.h"
@@ -50,9 +50,9 @@ namespace warmup {
 using aws::GetObjectAsyncCallBack;
 using aws::GetObjectAsyncContext;
 using base::filepath::PathSplit;
-using blockcache::BCACHE_ERROR;
 using blockcache::Block;
 using blockcache::BlockKey;
+using blockcache::Errno;
 using blockcache::S3ClientImpl;
 using common::ClientOption;
 using common::WarmupStorageType;
@@ -738,7 +738,7 @@ void WarmupManagerS3Impl::PutObjectToCache(
       CHECK(key.ParseFilename(items.back()));
       auto block_cache = s3Adaptor_->GetBlockCache();
       auto rc = block_cache->Cache(key, block);
-      if (rc != BCACHE_ERROR::OK) {
+      if (rc != Errno::OK) {
         // cache failed,add error count
         iter->second.ErrorsPlusOne();
         LOG_EVERY_SECOND(INFO) << "Cache block (" << key.Filename() << ")"
