@@ -85,3 +85,5 @@ build/
 docker/rocky9/dingofs
 dist/
 
+.cache
+.playground

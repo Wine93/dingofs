@@ -27,8 +27,8 @@
 #include <vector>
 
 #include "aws/s3_adapter.h"
-#include "client/blockcache/block_cache.h"
-#include "client/blockcache/s3_client.h"
+#include "cache/blockcache/block_cache.h"
+#include "cache/blockcache/s3_client.h"
 #include "client/common/dynamic_config.h"
 #include "client/common/status.h"
 #include "client/datastream/data_stream.h"
