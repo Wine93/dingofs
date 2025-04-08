@@ -35,7 +35,7 @@ namespace dingofs {
 namespace client {
 namespace blockcache {
 
-using ::dingofs::utils::RWLock;
+using ::dingofs::utils::Mutex;
 using ::dingofs::utils::TaskThreadPool;
 
 class BlockPrefetcher {
@@ -79,7 +79,7 @@ class BlockPrefetcherImpl : public BlockPrefetcher {
   void Prefetch(const BlockKey& key, size_t length);
 
  private:
-  utils::RWLock rwlock_;
+  Mutex mutex_;
   PrefetchFunc prefetch_func_;
   std::atomic<bool> running_;
   std::unordered_map<std::string, bool> busy_;

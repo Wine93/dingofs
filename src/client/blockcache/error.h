@@ -23,6 +23,7 @@
 #ifndef DINGOFS_SRC_CLIENT_BLOCKCACHE_ERROR_H_
 #define DINGOFS_SRC_CLIENT_BLOCKCACHE_ERROR_H_
 
+#include <cstdint>
 #include <ostream>
 #include <string>
 

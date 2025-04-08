@@ -576,8 +576,8 @@ bool FileCacheManager::ReadKVRequestFromS3(const std::string& name,
   {
     *rc = s3ClientAdaptor_->GetS3Client()->Range(name, offset, length, databuf);
     if (*rc != BCACHE_ERROR::OK) {
-      LOG(ERROR) << "Object " << name << " read from s3 failed" << ", rc=" << rc
-                 << ", " << StrErr(*rc);
+      LOG(ERROR) << "Object " << name << " read from s3 failed"
+                 << ", rc=" << rc << ", " << StrErr(*rc);
       return false;
     }
   }
@@ -741,7 +741,7 @@ void FileCacheManager::PrefetchS3Objs(
     uint64_t read_len = obj.second;
     VLOG(3) << "try to prefetch s3 obj inodeId=" << key.ino
             << " block: " << name << ", read len: " << read_len;
-    s3ClientAdaptor_->GetBlockCache()->SubmitPreFetch(key, read_len);
+    s3ClientAdaptor_->GetBlockCache()->SubmitPrefetch(key, read_len);
   }
 }
 

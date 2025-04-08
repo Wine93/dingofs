@@ -120,7 +120,10 @@ void BlockCacheUploader::UploadingWorker() {
     auto stage_block = uploading_queue_->Pop();
     if (stage_block.Valid()) {
       UploadStageBlock(stage_block);
+      continue;
     }
+    LOG(WARNING) << "Abort invalid block: key = " << stage_block.key.Filename()
+                 << ", seq_num = " << stage_block.seq_num;
   }
 }
 
@@ -203,12 +206,18 @@ void BlockCacheUploader::RemoveBlock(const StageBlock& stage_block) {
 }
 
 void BlockCacheUploader::Staging(const StageBlock& stage_block) {
+  LOG(INFO) << "block(" << stage_block.key.Filename() << ","
+            << stage_block.seq_num << ") staging.";
+
   if (NeedCount(stage_block)) {
     stage_count_->Add(stage_block.key.ino, 1, false);
   }
 }
 
 void BlockCacheUploader::Uploaded(const StageBlock& stage_block, bool success) {
+  LOG(INFO) << "block(" << stage_block.key.Filename() << ","
+            << stage_block.seq_num << ") uploaded.";
+
   if (NeedCount(stage_block)) {
     stage_count_->Add(stage_block.key.ino, -1, !success);
   }
