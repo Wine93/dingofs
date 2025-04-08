@@ -65,11 +65,11 @@ class BlockCache {
   virtual BCACHE_ERROR Range(const BlockKey& key, off_t offset, size_t length,
                              char* buffer, bool retrive = true) = 0;
 
-  virtual void SubmitPreFetch(const BlockKey& key, size_t length) = 0;
-
   virtual BCACHE_ERROR Cache(const BlockKey& key, const Block& block) = 0;
 
   virtual BCACHE_ERROR Flush(uint64_t ino) = 0;
+
+  virtual void SubmitPrefetch(const BlockKey& key, size_t length) = 0;
 
   virtual bool IsCached(const BlockKey& key) = 0;
 
@@ -92,18 +92,18 @@ class BlockCacheImpl : public BlockCache {
   BCACHE_ERROR Range(const BlockKey& key, off_t offset, size_t length,
                      char* buffer, bool retrive = true) override;
 
-  void SubmitPreFetch(const BlockKey& key, size_t size) override;
-
   BCACHE_ERROR Cache(const BlockKey& key, const Block& block) override;
 
   BCACHE_ERROR Flush(uint64_t ino) override;
+
+  void SubmitPrefetch(const BlockKey& key, size_t size) override;
 
   bool IsCached(const BlockKey& key) override;
 
   StoreType GetStoreType() override;
 
  private:
-  BCACHE_ERROR DoPreFetch(const BlockKey& key, size_t size);
+  BCACHE_ERROR DoPrefetch(const BlockKey& key, size_t size);
 
  private:
   friend class BlockCacheBuilder;

@@ -29,7 +29,7 @@ namespace dingofs {
 namespace client {
 namespace blockcache {
 
-static const std::unordered_map<BCACHE_ERROR, std::string> errors = {
+static const std::unordered_map<BCACHE_ERROR, std::string> kErrors = {
     {BCACHE_ERROR::OK, "OK"},
     {BCACHE_ERROR::INVALID_ARGUMENT, "invalid argument"},
     {BCACHE_ERROR::NOT_FOUND, "not found"},
@@ -47,8 +47,8 @@ static const std::unordered_map<BCACHE_ERROR, std::string> errors = {
 };
 
 std::string StrErr(BCACHE_ERROR code) {
-  auto it = errors.find(code);
-  if (it != errors.end()) {
+  auto it = kErrors.find(code);
+  if (it != kErrors.end()) {
     return it->second;
   }
   return "unknown";

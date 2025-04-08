@@ -76,7 +76,7 @@ BCACHE_ERROR BlockCacheImpl::Init() {
     rc =
         prefetcher_->Init(option_.prefetch_workers, option_.prefetch_queue_size,
                           [this](const BlockKey& key, size_t length) {
-                            return DoPreFetch(key, length);
+                            return DoPrefetch(key, length);
                           });
     if (rc != BCACHE_ERROR::OK) {
       return rc;
@@ -157,11 +157,30 @@ BCACHE_ERROR BlockCacheImpl::Range(const BlockKey& key, off_t offset,
   return rc;
 }
 
-void BlockCacheImpl::SubmitPreFetch(const BlockKey& key, size_t length) {
+BCACHE_ERROR BlockCacheImpl::Cache(const BlockKey& key, const Block& block) {
+  BCACHE_ERROR rc;
+  LogGuard log([&]() {
+    return StrFormat("cache(%s,%d): %s", key.Filename(), block.size,
+                     StrErr(rc));
+  });
+
+  rc = store_->Cache(key, block);
+  return rc;
+}
+
+BCACHE_ERROR BlockCacheImpl::Flush(uint64_t ino) {
+  BCACHE_ERROR rc;
+  LogGuard log([&]() { return StrFormat("flush(%d): %s", ino, StrErr(rc)); });
+
+  rc = stage_count_->Wait(ino);
+  return rc;
+}
+
+void BlockCacheImpl::SubmitPrefetch(const BlockKey& key, size_t length) {
   prefetcher_->Submit(key, length);
 }
 
-BCACHE_ERROR BlockCacheImpl::DoPreFetch(const BlockKey& key, size_t length) {
+BCACHE_ERROR BlockCacheImpl::DoPrefetch(const BlockKey& key, size_t length) {
   BCACHE_ERROR rc;
   PhaseTimer timer;
   LogGuard log([&]() {
@@ -182,25 +201,6 @@ BCACHE_ERROR BlockCacheImpl::DoPreFetch(const BlockKey& key, size_t length) {
     Block block(buffer.get(), length);
     rc = store_->Cache(key, block);
   }
-  return rc;
-}
-
-BCACHE_ERROR BlockCacheImpl::Cache(const BlockKey& key, const Block& block) {
-  BCACHE_ERROR rc;
-  LogGuard log([&]() {
-    return StrFormat("cache(%s,%d): %s", key.Filename(), block.size,
-                     StrErr(rc));
-  });
-
-  rc = store_->Cache(key, block);
-  return rc;
-}
-
-BCACHE_ERROR BlockCacheImpl::Flush(uint64_t ino) {
-  BCACHE_ERROR rc;
-  LogGuard log([&]() { return StrFormat("flush(%d): %s", ino, StrErr(rc)); });
-
-  rc = stage_count_->Wait(ino);
   return rc;
 }
 

@@ -309,6 +309,7 @@ static void InitBlockCacheOption(Configuration* c, BlockCacheOption* option) {
 
   {  // disk cache option
     DiskCacheOption o;
+    c->GetValueFatalIfFail("disk_cache.filesystem_type", &o.filesystem_type);
     c->GetValueFatalIfFail("disk_cache.cache_dir", &o.cache_dir);
     c->GetValueFatalIfFail("disk_cache.cache_size_mb", &o.cache_size);
     c->GetValueFatalIfFail("disk_cache.free_space_ratio",
@@ -320,6 +321,11 @@ static void InitBlockCacheOption(Configuration* c, BlockCacheOption* option) {
         &FLAGS_disk_cache_cleanup_expire_interval_millsecond);
     c->GetValueFatalIfFail("disk_cache.drop_page_cache",
                            &FLAGS_drop_page_cache);
+    c->GetValueFatalIfFail("disk_cache.ioring_iodepth", &o.ioring_iodepth);
+
+    if (o.filesystem_type != "local" && o.filesystem_type != "3fs") {
+      CHECK(false) << "Only support local or 3fs filesystem.";
+    }
     if (option->cache_store == "disk") {
       SplitDiskCacheOption(o, &option->disk_cache_options);
     }
