@@ -404,8 +404,10 @@ BCACHE_ERROR LocalFileSystem::GetDiskUsage(const std::string& path,
     stat->total_files = statfs.f_files;
     stat->free_bytes = statfs.f_bfree * statfs.f_bsize;
     stat->free_files = statfs.f_ffree;
-    stat->free_bytes_ratio = Divide(stat->free_bytes, stat->total_bytes);
-    stat->free_files_ratio = Divide(stat->free_files, stat->total_files);
+    stat->free_bytes_ratio = 1;
+    stat->free_files_ratio = 1;
+    // stat->free_bytes_ratio = Divide(stat->free_bytes, stat->total_bytes);
+    // stat->free_files_ratio = Divide(stat->free_files, stat->total_files);
   }
   return rc;
 }
