@@ -27,6 +27,7 @@
 
 #include "blockaccess/accesser_common.h"
 #include "blockaccess/block_accesser.h"
+#include "cache/blockcache/block_cache.h"
 #include "cache/blockcache/cache_store.h"
 #include "cache/common/type.h"
 #include "cache/storage/closure.h"
@@ -61,11 +62,12 @@ class StorageClosure : public Closure {
   BthreadConditionVariable cond_;
 };
 
-class UploadClosure final : public StorageClosure {
+class PutClosure final : public StorageClosure {
  public:
-  UploadClosure(ContextSPtr ctx, const BlockKey& key, const Block& block,
-                UploadOption option, blockaccess::BlockAccesser* block_accesser,
-                ExecutionQueueSPtr retry_queue);
+  PutClosure(ContextSPtr ctx, const BlockKey& key, const Block& block,
+             Storage::PutOption option,
+             blockaccess::BlockAccesser* block_accesser,
+             ExecutionQueueSPtr retry_queue);
 
   void Run() override;
 
@@ -80,17 +82,17 @@ class UploadClosure final : public StorageClosure {
   ContextSPtr ctx_;
   BlockKey key_;
   Block block_;
-  UploadOption option_;
+  Storage::PutOption option_;
   blockaccess::BlockAccesser* block_accesser_;
   ExecutionQueueSPtr retry_queue_;
 };
 
-class DownloadClosure final : public StorageClosure {
+class RangeClosure final : public StorageClosure {
  public:
-  DownloadClosure(ContextSPtr ctx, const BlockKey& key, off_t offset,
-                  size_t length, IOBuffer* buffer, DownloadOption option,
-                  blockaccess::BlockAccesser* block_accesser,
-                  ExecutionQueueSPtr retry_queue);
+  RangeClosure(ContextSPtr ctx, const BlockKey& key, off_t offset,
+               size_t length, IOBuffer* buffer, Storage::RangeOption option,
+               blockaccess::BlockAccesser* block_accesser,
+               ExecutionQueueSPtr retry_queue);
 
   void Run() override;
 
@@ -105,7 +107,7 @@ class DownloadClosure final : public StorageClosure {
   off_t offset_;
   size_t length_;
   IOBuffer* buffer_;
-  DownloadOption option_;
+  Storage::RangeOption option_;
   blockaccess::BlockAccesser* block_accesser_;
   ExecutionQueueSPtr retry_queue_;
 };

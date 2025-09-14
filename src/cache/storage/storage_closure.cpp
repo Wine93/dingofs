@@ -44,10 +44,10 @@ DEFINE_int64(storage_download_retry_timeout_s, 1800,
              "Timeout in seconds for download retry");
 DEFINE_validator(storage_download_retry_timeout_s, brpc::PassValidate);
 
-UploadClosure::UploadClosure(ContextSPtr ctx, const BlockKey& key,
-                             const Block& block, UploadOption option,
-                             blockaccess::BlockAccesser* block_accesser,
-                             ExecutionQueueSPtr retry_queue)
+PutClosure::PutClosure(ContextSPtr ctx, const BlockKey& key, const Block& block,
+                       Storage::PutOption option,
+                       blockaccess::BlockAccesser* block_accesser,
+                       ExecutionQueueSPtr retry_queue)
     : ctx_(ctx),
       key_(key),
       block_(block),
@@ -55,15 +55,15 @@ UploadClosure::UploadClosure(ContextSPtr ctx, const BlockKey& key,
       block_accesser_(block_accesser),
       retry_queue_(retry_queue) {}
 
-void UploadClosure::Run() {
+void PutClosure::Run() {
   auto ctx = OnPrepare();
   block_accesser_->AsyncPut(ctx);
 }
 
-blockaccess::PutObjectAsyncContextSPtr UploadClosure::OnPrepare() {
+blockaccess::PutObjectAsyncContextSPtr PutClosure::OnPrepare() {
   auto block = CopyBlock();  // Copy data to continuous memory
-  if (option_.async_cache_func) {
-    option_.async_cache_func(key_, block);
+  if (option_.async_cache_fn) {
+    option_.async_cache_fn(key_, block);
   }
 
   auto ctx = std::make_shared<blockaccess::PutObjectAsyncContext>();
@@ -78,8 +78,7 @@ blockaccess::PutObjectAsyncContextSPtr UploadClosure::OnPrepare() {
   return ctx;
 }
 
-void UploadClosure::OnCallback(
-    const blockaccess::PutObjectAsyncContextSPtr& ctx) {
+void PutClosure::OnCallback(const blockaccess::PutObjectAsyncContextSPtr& ctx) {
   auto status = ctx->status;
   if (status.ok()) {
     OnComplete(status);
@@ -88,7 +87,7 @@ void UploadClosure::OnCallback(
   }
 }
 
-void UploadClosure::OnRetry(const blockaccess::PutObjectAsyncContextSPtr& ctx) {
+void PutClosure::OnRetry(const blockaccess::PutObjectAsyncContextSPtr& ctx) {
   ctx->retry++;
   LOG(WARNING) << "Retry upload block: key = " << ctx->key << ", retry("
                << ctx->retry << "), elapsed("
@@ -98,12 +97,12 @@ void UploadClosure::OnRetry(const blockaccess::PutObjectAsyncContextSPtr& ctx) {
   retry_queue_->Submit([this, ctx]() { block_accesser_->AsyncPut(ctx); });
 }
 
-void UploadClosure::OnComplete(Status s) {
+void PutClosure::OnComplete(Status s) {
   StorageClosure::status() = s;
   StorageClosure::Run();
 }
 
-Block UploadClosure::CopyBlock() {
+Block PutClosure::CopyBlock() {
   char* data = new char[block_.size];
   block_.buffer.CopyTo(data);
 
@@ -112,11 +111,11 @@ Block UploadClosure::CopyBlock() {
   return Block(buffer);
 }
 
-DownloadClosure::DownloadClosure(ContextSPtr ctx, const BlockKey& key,
-                                 off_t offset, size_t length, IOBuffer* buffer,
-                                 DownloadOption option,
-                                 blockaccess::BlockAccesser* block_accesser,
-                                 ExecutionQueueSPtr retry_queue)
+RangeClosure::RangeClosure(ContextSPtr ctx, const BlockKey& key, off_t offset,
+                           size_t length, IOBuffer* buffer,
+                           Storage::RangeOption option,
+                           blockaccess::BlockAccesser* block_accesser,
+                           ExecutionQueueSPtr retry_queue)
     : ctx_(ctx),
       key_(key),
       offset_(offset),
@@ -126,12 +125,12 @@ DownloadClosure::DownloadClosure(ContextSPtr ctx, const BlockKey& key,
       block_accesser_(block_accesser),
       retry_queue_(retry_queue) {}
 
-void DownloadClosure::Run() {
+void RangeClosure::Run() {
   auto ctx = OnPrepare();
   block_accesser_->AsyncGet(ctx);
 }
 
-blockaccess::GetObjectAsyncContextSPtr DownloadClosure::OnPrepare() {
+blockaccess::GetObjectAsyncContextSPtr RangeClosure::OnPrepare() {
   char* data = new char[length_];
   buffer_->AppendUserData(data, length_, Helper::DeleteBuffer);
 
@@ -150,7 +149,7 @@ blockaccess::GetObjectAsyncContextSPtr DownloadClosure::OnPrepare() {
   return ctx;
 }
 
-void DownloadClosure::OnCallback(
+void RangeClosure::OnCallback(
     const blockaccess::GetObjectAsyncContextSPtr& ctx) {
   auto status = ctx->status;
   if (status.ok()) {
@@ -173,8 +172,7 @@ void DownloadClosure::OnCallback(
   }
 }
 
-void DownloadClosure::OnRetry(
-    const blockaccess::GetObjectAsyncContextSPtr& ctx) {
+void RangeClosure::OnRetry(const blockaccess::GetObjectAsyncContextSPtr& ctx) {
   ctx->retry++;
   LOG(WARNING) << "Retry download block: key = " << ctx->key << ", retry("
                << ctx->retry << "), elapsed("
@@ -184,7 +182,7 @@ void DownloadClosure::OnRetry(
   retry_queue_->Submit([this, ctx]() { block_accesser_->AsyncGet(ctx); });
 }
 
-void DownloadClosure::OnComplete(Status s) {
+void RangeClosure::OnComplete(Status s) {
   StorageClosure::status() = s;
   StorageClosure::Run();
 }
