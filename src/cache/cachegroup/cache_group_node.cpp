@@ -37,7 +37,6 @@
 #include "cache/common/const.h"
 #include "cache/common/macro.h"
 #include "cache/common/mds_client.h"
-#include "cache/metric/cache_group_node_metric.h"
 #include "cache/utils/context.h"
 #include "cache/utils/helper.h"
 #include "cache/utils/step_timer.h"
