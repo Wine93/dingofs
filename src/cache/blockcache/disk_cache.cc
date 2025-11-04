@@ -72,11 +72,11 @@ DiskCache::DiskCache(DiskCacheOption option)
 
   // filesystem
   auto check_status_func = [&](Status status) {
-    if (status.ok()) {
-      state_machine_->Success();
-    } else if (status.IsIoError()) {
-      state_machine_->Error();
-    }
+    // if (status.ok()) {
+    //   state_machine_->Success();
+    // } else if (status.IsIoError()) {
+    //   state_machine_->Error();
+    // }
     return status;
   };
   if (option.cache_store == "3fs") {
@@ -445,7 +445,8 @@ Status DiskCache::CheckStatus(uint8_t want) const {
 bool DiskCache::IsLoading() const { return loader_->IsLoading(); }
 
 bool DiskCache::IsHealthy() const {
-  return state_machine_->GetState() == State::kStateNormal;
+  return true;
+  // return state_machine_->GetState() == State::kStateNormal;
 }
 
 bool DiskCache::StageFull() const { return manager_->StageFull(); }

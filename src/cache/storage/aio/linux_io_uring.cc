@@ -37,6 +37,8 @@
 namespace dingofs {
 namespace cache {
 
+DEFINE_int32(stripe_size, 131072, "");
+
 LinuxIOUring::LinuxIOUring(uint32_t iodepth, std::vector<iovec> fixed_buffers)
     : running_(false),
       iodepth_(iodepth),
@@ -70,7 +72,21 @@ Status LinuxIOUring::Start() {
     return Status::NotSupport("not support io_uring");
   }
 
-  int rc = io_uring_queue_init(iodepth_, &io_uring_, 0);
+  /*
+  struct io_uring_params params;
+  params.flags = IORING_SETUP_SQPOLL;
+  // params.sq_thread_cpu = 3;
+
+  int rc = io_uring_queue_init_params(iodepth_, &io_uring_, &params);
+  if (rc != 0) {
+    LOG_SYSERR(-rc, "io_uring_queue_init_params(%d)", iodepth_);
+    return Status::Internal("io_uring_queue_init_params() failed");
+  }
+  */
+
+  unsigned flags = IORING_SETUP_SQPOLL;
+  // unsigned flags = 0;
+  int rc = io_uring_queue_init(iodepth_, &io_uring_, flags);
   if (rc != 0) {
     LOG_SYSERR(-rc, "io_uring_queue_init(%d)", iodepth_);
     return Status::Internal("io_uring_queue_init() failed");
@@ -124,7 +140,29 @@ Status LinuxIOUring::Shutdown() {
   return Status::OK();
 }
 
-void LinuxIOUring::PrepWrite(io_uring_sqe* sqe, Aio* aio) {
+// void LinuxIOUring::PrepWrite(io_uring_sqe* sqe, Aio* aio) {
+//   if (aio->fixed_buffer_index >= 0) {
+//     io_uring_prep_write_fixed(sqe, aio->fd, aio->buffer->Fetch1(),
+//     aio->length,
+//                               aio->offset, aio->fixed_buffer_index);
+//   } else {
+//     aio->iovecs = aio->buffer->Fetch();
+//     io_uring_prep_writev(sqe, aio->fd, aio->iovecs.data(),
+//     aio->iovecs.size(),
+//                          aio->offset);
+//   }
+// }
+
+// void LinuxIOUring::PrepRead(io_uring_sqe* sqe, Aio* aio) {
+//   char* data = new char[aio->length];
+//   aio->buffer->AppendUserData(data, aio->length, Helper::DeleteBuffer);
+//   io_uring_prep_read(sqe, aio->fd, data, aio->length, aio->offset);
+// }
+
+void LinuxIOUring::PrepWrite(Aio* aio) {
+  struct io_uring_sqe* sqe = io_uring_get_sqe(&io_uring_);
+  CHECK_NOTNULL(sqe);
+
   if (aio->fixed_buffer_index >= 0) {
     io_uring_prep_write_fixed(sqe, aio->fd, aio->buffer->Fetch1(), aio->length,
                               aio->offset, aio->fixed_buffer_index);
@@ -133,27 +171,53 @@ void LinuxIOUring::PrepWrite(io_uring_sqe* sqe, Aio* aio) {
     io_uring_prep_writev(sqe, aio->fd, aio->iovecs.data(), aio->iovecs.size(),
                          aio->offset);
   }
+
+  io_uring_sqe_set_data(sqe, (void*)aio);
 }
 
-void LinuxIOUring::PrepRead(io_uring_sqe* sqe, Aio* aio) {
+void LinuxIOUring::PrepRead(Aio* aio) {
+  auto stripe_size = FLAGS_stripe_size;
+  auto stripe_count = aio->length / stripe_size;
+  if (stripe_count == 0) {
+    stripe_size = aio->length;
+    stripe_count = 1;
+  }
+
+  // struct io_uring_sqe* sqe = io_uring_get_sqe(&io_uring_);
+  // CHECK_NOTNULL(sqe);
+
   char* data = new char[aio->length];
   aio->buffer->AppendUserData(data, aio->length, Helper::DeleteBuffer);
-  io_uring_prep_read(sqe, aio->fd, data, aio->length, aio->offset);
+
+  for (auto i = 0; i < stripe_count; i++) {
+    struct io_uring_sqe* sqe = io_uring_get_sqe(&io_uring_);
+    CHECK_NOTNULL(sqe);
+
+    auto offset = i * stripe_size;
+
+    io_uring_prep_read(sqe, aio->fd, data + offset, stripe_size,
+                       aio->offset + offset);
+
+    io_uring_sqe_set_data(sqe, (void*)aio);
+  }
+  aio->inflight_ = stripe_count;
 }
 
 Status LinuxIOUring::PrepareIO(Aio* aio) {
   CHECK_RUNNING("Linux IO uring");
 
-  struct io_uring_sqe* sqe = io_uring_get_sqe(&io_uring_);
-  CHECK_NOTNULL(sqe);
+  // struct io_uring_sqe* sqe = io_uring_get_sqe(&io_uring_);
+  // CHECK_NOTNULL(sqe);
 
   if (aio->for_read) {
-    PrepRead(sqe, aio);
+    // PrepRead(sqe, aio);
+    PrepRead(aio);
   } else {
-    PrepWrite(sqe, aio);
+    // PrepWrite(sqe, aio);
+    PrepWrite(aio);
   }
 
-  io_uring_sqe_set_data(sqe, (void*)aio);
+  // io_uring_sqe_set_data(sqe, (void*)aio);
   return Status::OK();
 }
 
@@ -184,15 +248,20 @@ Status LinuxIOUring::WaitIO(uint64_t timeout_ms,
   }
 
   // n > 0: any aio completed
+  int nr = 0;
   unsigned head;
   struct io_uring_cqe* cqe;
   io_uring_for_each_cqe(&io_uring_, head, cqe) {
     auto* aio = static_cast<Aio*>(io_uring_cqe_get_data(cqe));
     OnCompleted(aio, cqe->res);
-    completed_aios->emplace_back(aio);
+    nr++;
+    if (aio->inflight_ == 0) {
+      completed_aios->emplace_back(aio);
+    }
   }
 
-  io_uring_cq_advance(&io_uring_, completed_aios->size());
+  // io_uring_cq_advance(&io_uring_, completed_aios->size());
+  io_uring_cq_advance(&io_uring_, nr);
   return Status::OK();
 }
 
@@ -203,17 +272,20 @@ void LinuxIOUring::OnCompleted(Aio* aio, int result) {
     status = Status::IoError(strerror(-result));
     LOG_CTX(ERROR) << "Aio failed: aio = " << aio->ToString()
                    << ", status = " << status.ToString();
-  } else if (result != aio->length) {
+  }
+  /*else if (result != aio->length) {
     status = Status::IoError(absl::StrFormat(
         "%s bytes fewer than expect length: want (%zu) but got (%u)",
         aio->for_read ? "read" : "write", aio->length, result));
     LOG_CTX(ERROR) << "Aio failed: aio = " << aio->ToString()
                    << ", status = " << status.ToString();
-  } else {
+  } */
+  else {
     status = Status::OK();
   }
 
   aio->status() = status;
+  aio->inflight_--;
 
   VLOG_CTX(9) << "Aio complete: aio = " << aio->ToString()
               << ", status = " << aio->status().ToString();

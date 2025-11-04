@@ -47,8 +47,11 @@ class LinuxIOUring final : public IORing {
  private:
   static bool Supported();
 
-  void PrepWrite(io_uring_sqe* sqe, Aio* aio);
-  void PrepRead(io_uring_sqe* sqe, Aio* aio);
+  // void PrepWrite(io_uring_sqe* sqe, Aio* aio);
+  // void PrepRead(io_uring_sqe* sqe, Aio* aio);
+
+  void PrepWrite(Aio* aio);
+  void PrepRead(Aio* aio);
   void OnCompleted(Aio* aio, int result);
 
   std::atomic<bool> running_;

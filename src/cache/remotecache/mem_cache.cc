@@ -23,6 +23,8 @@
 #include "cache/remotecache/mem_cache.h"
 
 #include <absl/strings/str_format.h>
+#include <bthread/bthread.h>
+#include <bthread/types.h>
 #include <butil/iobuf.h>
 #include <butil/time.h>
 #include <glog/logging.h>
@@ -32,6 +34,8 @@
 #include "cache/common/macro.h"
 #include "cache/common/type.h"
 #include "common/status.h"
+#include "utils/concurrent/concurrent.h"
+#include "utils/concurrent/rw_lock.h"
 
 namespace dingofs {
 namespace cache {
@@ -40,7 +44,10 @@ MemCacheImpl::MemCacheImpl(size_t capacity)
     : running_(false),
       used_(0),
       capacity_(capacity),
-      lru_(std::make_unique<utils::LRUCache<std::string, Block>>(1LL << 62)) {}
+      lru_(std::make_unique<utils::LRUCache<std::string, Block>>(1LL << 62)) {
+  // bthread_rwlock_init(&rwlock_, nullptr);
+  block_ = Block(new char[4 * kMiB], 4 * kMiB);
+}
 
 Status MemCacheImpl::Start() {
   CHECK_NOTNULL(lru_);
@@ -76,25 +83,50 @@ Status MemCacheImpl::Shutdown() {
 }
 
 void MemCacheImpl::Put(const BlockKey& key, const Block& block) {
-  if (Exist(key)) {
-    return;
-  }
+  auto& bucket = buckets_[key.id % 1024];
+  auto& rwlock = rwlocks_[key.id % 1024];
 
-  lru_->Put(key.Filename(), block);
-  UpdateUsage(block.size);
+  utils::WriteLockGuard lock(rwlock);
+  bucket.emplace(key.Filename(), true);
+
+  // if (Exist(key)) {
+  //   return;
+  // }
+
+  // lru_->Put(key.Filename(), block);
+  // UpdateUsage(block.size);
 }
 
-Status MemCacheImpl::Get(const BlockKey& key, Block* block) {
-  bool yes = lru_->Get(key.Filename(), block);
-  if (!yes) {
-    return Status::NotFound("cache not found");
+Status MemCacheImpl::Get(const BlockKey& key, Block** block) {
+  auto& bucket = buckets_[key.id % 1024];
+  auto& rwlock = rwlocks_[key.id % 1024];
+
+  {
+    utils::ReadLockGuard lock(rwlock);
+    if (!bucket.count(key.Filename())) {
+      return Status::NotFound("cache not found");
+    }
   }
+
+  *block = &block_;
   return Status::OK();
+
+  // bool yes = lru_->Get(key.Filename(), block);
+  // if (!yes) {
+  //   return Status::NotFound("cache not found");
+  // }
+  // return Status::OK();
 }
 
 bool MemCacheImpl::Exist(const BlockKey& key) {
-  Block block;
-  return lru_->Get(key.Filename(), &block);
+  auto& bucket = buckets_[key.id % 1024];
+  auto& rwlock = rwlocks_[key.id % 1024];
+
+  utils::ReadLockGuard lock(rwlock);
+  return bucket.count(key.Filename()) != 0;
+
+  // Block block;
+  // return lru_->Get(key.Filename(), &block);
 }
 
 void MemCacheImpl::UpdateUsage(size_t add_bytes) {

@@ -39,19 +39,22 @@ class PageCacheManager {
   Status Start();
   Status Shutdown();
 
-  void AsyncDropPageCache(ContextSPtr ctx, int fd, off_t offset, size_t length,
-                          bool sync_data = false);
+  void AsyncDropPageCache(ContextSPtr ctx, char* data, int fd, off_t offset,
+                          size_t length, bool sync_data = false);
 
  private:
   struct Task {  // drop task
-    Task(ContextSPtr ctx, int fd, off_t offset, size_t length, bool sync_data)
+    Task(ContextSPtr ctx, char* data, int fd, off_t offset, size_t length,
+         bool sync_data)
         : ctx(ctx),
+          data(data),
           fd(fd),
           offset(offset),
           length(length),
           sync_data(sync_data) {}
 
     ContextSPtr ctx;
+    char* data;
     int fd;
     off_t offset;
     size_t length;
