@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#ifndef DINGOFS_CLIENT_VFS_H_
-#define DINGOFS_CLIENT_VFS_H_
+#ifndef DINGOFS_SRC_CLIENT_VFS_VFS_H_
+#define DINGOFS_SRC_CLIENT_VFS_VFS_H_
 
 #include <json/value.h>
 
@@ -158,4 +158,4 @@ class VFS {
 }  // namespace client
 }  // namespace dingofs
 
-#endif  // DINGOFS_CLIENT_VFS_H_
+#endif  // DINGOFS_SRC_CLIENT_VFS_VFS_H_

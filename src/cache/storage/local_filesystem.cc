@@ -262,7 +262,7 @@ Status LocalFileSystem::AioWrite(ContextSPtr ctx, int fd, IOBuffer* buffer,
   }
 
   if (!option.direct_io && option.drop_page_cache) {
-    page_cache_manager_->AsyncDropPageCache(ctx, fd, 0, buffer->Size());
+    // page_cache_manager_->AsyncDropPageCache(ctx, fd, 0, buffer->Size());
   } else {
     CloseFd(ctx, fd);
   }
@@ -283,7 +283,7 @@ Status LocalFileSystem::AioRead(ContextSPtr ctx, int fd, off_t offset,
   }
 
   if (option.drop_page_cache) {
-    page_cache_manager_->AsyncDropPageCache(ctx, fd, offset, length);
+    // page_cache_manager_->AsyncDropPageCache(ctx, fd, offset, length);
   }
   return status;
 }
@@ -310,7 +310,8 @@ Status LocalFileSystem::MapFile(ContextSPtr ctx, int fd, off_t offset,
     }
 
     if (option.drop_page_cache) {  // it will close fd
-      page_cache_manager_->AsyncDropPageCache(ctx, fd, offset, length);
+      page_cache_manager_->AsyncDropPageCache(ctx, (char*)data, fd, offset,
+                                              length);
     } else {
       CloseFd(ctx, fd);
     }

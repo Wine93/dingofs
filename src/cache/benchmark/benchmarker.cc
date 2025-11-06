@@ -87,6 +87,11 @@ void Benchmarker::StopAll() {
   StopWorkers();
   StopReporter();
   StopCollector();
+
+  std::cout << "All done" << '\n';
+
+  char c;
+  std::cin >> c;
 }
 
 // init

@@ -24,8 +24,11 @@
 #define DINGOFS_SRC_CACHE_REMOTECACHE_MEM_CACHE_H_
 
 #include <bthread/execution_queue.h>
+#include <bthread/rwlock.h>
+#include <bthread/types.h>
 
 #include <memory>
+#include <unordered_map>
 
 #include "cache/blockcache/cache_store.h"
 #include "cache/common/type.h"
@@ -43,7 +46,7 @@ class MemCache {
   virtual Status Shutdown() = 0;
 
   virtual void Put(const BlockKey& key, const Block& block) = 0;
-  virtual Status Get(const BlockKey& key, Block* block) = 0;
+  virtual Status Get(const BlockKey& key, Block** block) = 0;
   virtual bool Exist(const BlockKey& key) = 0;
 };
 
@@ -57,7 +60,7 @@ class MemCacheImpl final : public MemCache {
   Status Shutdown() override;
 
   void Put(const BlockKey& key, const Block& block) override;
-  Status Get(const BlockKey& key, Block* block) override;
+  Status Get(const BlockKey& key, Block** block) override;
   bool Exist(const BlockKey& key) override;
 
  private:
@@ -67,10 +70,15 @@ class MemCacheImpl final : public MemCache {
                          bthread::TaskIterator<std::vector<std::string>>& iter);
 
   BthreadMutex mutex_;  // for used_, capacity_
+  Block block_;
+
   std::atomic<bool> running_;
   size_t used_;
   size_t capacity_;
   std::unique_ptr<utils::LRUCache<std::string, Block>> lru_;
+
+  BthreadRWLock rwlocks_[1024];
+  std::unordered_map<std::string, bool> buckets_[1024];
 };
 
 };  // namespace cache

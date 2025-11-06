@@ -81,8 +81,9 @@ Status PageCacheManager::Shutdown() {
   return Status::OK();
 }
 
-void PageCacheManager::AsyncDropPageCache(ContextSPtr ctx, int fd, off_t offset,
-                                          size_t length, bool sync_data) {
+void PageCacheManager::AsyncDropPageCache(ContextSPtr ctx, char* data, int fd,
+                                          off_t offset, size_t length,
+                                          bool sync_data) {
   if (!IsRunning()) {
     LOG_CTX(WARNING)
         << "Page cache manager is not running, abort drop page cache: fd = "
@@ -91,7 +92,7 @@ void PageCacheManager::AsyncDropPageCache(ContextSPtr ctx, int fd, off_t offset,
     return;
   }
 
-  Task task(ctx, fd, offset, length, sync_data);
+  Task task(ctx, data, fd, offset, length, sync_data);
   CHECK_EQ(0, bthread::execution_queue_execute(queue_id_, task));
 }
 
@@ -113,6 +114,8 @@ void PageCacheManager::Handle(const Task& task) {
   VLOG_CTX(9) << "Drop page cache: fd = " << task.fd
               << ", offset = " << task.offset << ", length = " << task.length
               << ", sync = " << task.sync_data;
+
+  // Posix::MUnmap(task.data, task.length);
 
   if (task.sync_data) {
     SyncData(ctx, task.fd);
