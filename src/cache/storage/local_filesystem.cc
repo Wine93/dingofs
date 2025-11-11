@@ -227,25 +227,26 @@ Status LocalFileSystem::ReadFile(ContextSPtr ctx, const std::string& path,
     return CheckStatus(status);
   }
 
-  if (Helper::IsAligned(offset, Helper::GetSysPageSize())) {
-    NEXT_STEP("mmap");
-    status = MapFile(ctx, fd, offset, length, buffer, option);
-    if (!status.ok()) {
-      LOG_CTX(ERROR) << "Map file failed: path = " << path
-                     << ", offset = " << offset << ", length = " << length
-                     << ", status = " << status.ToString();
-    }
-  } else {
-    NEXT_STEP("aio_read");
-    status = AioRead(ctx, fd, offset, length, buffer, option);
-    if (!status.ok()) {
-      LOG_CTX(ERROR) << "Aio read failed: path = " << path
-                     << ", offset = " << offset << ", length = " << length
-                     << ", status = " << status.ToString();
-    }
+  // if (Helper::IsAligned(offset, Helper::GetSysPageSize())) {
+  NEXT_STEP("mmap");
+  status = MapFile(ctx, fd, offset, length, buffer, option);
+  if (!status.ok()) {
+    LOG_CTX(ERROR) << "Map file failed: path = " << path
+                   << ", offset = " << offset << ", length = " << length
+                   << ", status = " << status.ToString();
   }
+}
+else {
+  NEXT_STEP("aio_read");
+  status = AioRead(ctx, fd, offset, length, buffer, option);
+  if (!status.ok()) {
+    LOG_CTX(ERROR) << "Aio read failed: path = " << path
+                   << ", offset = " << offset << ", length = " << length
+                   << ", status = " << status.ToString();
+  }
+}
 
-  return CheckStatus(status);
+return CheckStatus(status);
 }
 
 Status LocalFileSystem::AioWrite(ContextSPtr ctx, int fd, IOBuffer* buffer,
@@ -300,14 +301,15 @@ Status LocalFileSystem::MapFile(ContextSPtr ctx, int fd, off_t offset,
   }
 
   auto deleter = [this, ctx, fd, offset, length, option](void* data) {
-    auto status = Posix::MUnmap(data, length);
-    if (!status.ok()) {
-      LOG_CTX(ERROR) << "MUnmap failed: fd = " << fd << ", offset = " << offset
-                     << ", length = " << length
-                     << ", status = " << status.ToString();
-      CloseFd(ctx, fd);
-      return;
-    }
+    // auto status = Posix::MUnmap(data, length);
+    // if (!status.ok()) {
+    //   LOG_CTX(ERROR) << "MUnmap failed: fd = " << fd << ", offset = " <<
+    //   offset
+    //                  << ", length = " << length
+    //                  << ", status = " << status.ToString();
+    //   CloseFd(ctx, fd);
+    //   return;
+    // }
 
     if (option.drop_page_cache) {  // it will close fd
       page_cache_manager_->AsyncDropPageCache(ctx, (char*)data, fd, offset,

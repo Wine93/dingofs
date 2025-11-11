@@ -116,10 +116,19 @@ void PageCacheManager::Handle(const Task& task) {
               << ", sync = " << task.sync_data;
 
   // Posix::MUnmap(task.data, task.length);
-
-  if (task.sync_data) {
-    SyncData(ctx, task.fd);
+  auto status = Posix::MUnmap(task.data, task.length);
+  if (!status.ok()) {
+    LOG_CTX(ERROR) << "MUnmap failed: fd = " << task.fd
+                   << ", offset = " << task.offset
+                   << ", length = " << task.length
+                   << ", status = " << status.ToString();
+    CloseFd(ctx, task.fd);
+    return;
   }
+
+  // if (task.sync_data) {
+  //   SyncData(ctx, task.fd);
+  // }
 
   DropCache(ctx, task.fd, task.offset, task.length);
   CloseFd(ctx, task.fd);
