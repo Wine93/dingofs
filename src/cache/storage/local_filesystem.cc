@@ -220,23 +220,13 @@ Status LocalFileSystem::ReadFile(ContextSPtr ctx, const std::string& path,
 
   NEXT_STEP("open");
   int fd;
-  status = Posix::Open(path, O_RDONLY, &fd);
+  status = Posix::Open(path, O_RDONLY | O_DIRECT, &fd);
   if (!status.ok()) {
     LOG_CTX(ERROR) << "Open file failed: path = " << path
                    << ", status = " << status.ToString();
     return CheckStatus(status);
   }
 
-  // if (Helper::IsAligned(offset, Helper::GetSysPageSize())) {
-  NEXT_STEP("mmap");
-  status = MapFile(ctx, fd, offset, length, buffer, option);
-  if (!status.ok()) {
-    LOG_CTX(ERROR) << "Map file failed: path = " << path
-                   << ", offset = " << offset << ", length = " << length
-                   << ", status = " << status.ToString();
-  }
-}
-else {
   NEXT_STEP("aio_read");
   status = AioRead(ctx, fd, offset, length, buffer, option);
   if (!status.ok()) {
@@ -244,9 +234,28 @@ else {
                    << ", offset = " << offset << ", length = " << length
                    << ", status = " << status.ToString();
   }
-}
 
-return CheckStatus(status);
+  /*
+  if (Helper::IsAligned(offset, Helper::GetSysPageSize())) {
+    NEXT_STEP("mmap");
+    status = MapFile(ctx, fd, offset, length, buffer, option);
+    if (!status.ok()) {
+      LOG_CTX(ERROR) << "Map file failed: path = " << path
+                     << ", offset = " << offset << ", length = " << length
+                     << ", status = " << status.ToString();
+    }
+  } else {
+    NEXT_STEP("aio_read");
+    status = AioRead(ctx, fd, offset, length, buffer, option);
+    if (!status.ok()) {
+      LOG_CTX(ERROR) << "Aio read failed: path = " << path
+                     << ", offset = " << offset << ", length = " << length
+                     << ", status = " << status.ToString();
+    }
+  }
+  */
+
+  return CheckStatus(status);
 }
 
 Status LocalFileSystem::AioWrite(ContextSPtr ctx, int fd, IOBuffer* buffer,
@@ -273,11 +282,59 @@ Status LocalFileSystem::AioWrite(ContextSPtr ctx, int fd, IOBuffer* buffer,
 Status LocalFileSystem::AioRead(ContextSPtr ctx, int fd, off_t offset,
                                 size_t length, IOBuffer* buffer,
                                 ReadOption option) {
-  auto aio = Aio(ctx, fd, offset, length, buffer, true);
-  aio_queue_->Submit(&aio);
-  aio.Wait();
+  Status status;
 
-  auto status = aio.status();
+  if (length == 128 * kKiB || length == 1 * kMiB) {
+    auto aio = Aio(ctx, fd, offset, length, buffer, true);
+    aio_queue_->Submit(&aio);
+
+    aio.Wait();
+    status = aio.status();
+  } else if (length == 1 * kMiB) {
+    IOBuffer buffer1, buffer2, buffer3, buffer4, buffer5, buffer6, buffer7,
+        buffer8;
+
+    Aio aio1(ctx, fd, 0, 128 * kKiB, &buffer1, true);
+    Aio aio2(ctx, fd, 1 * 128 * kKiB, 128 * kKiB, &buffer2, true);
+    Aio aio3(ctx, fd, 2 * 128 * kKiB, 128 * kKiB, &buffer3, true);
+    Aio aio4(ctx, fd, 3 * 128 * kKiB, 128 * kKiB, &buffer4, true);
+    Aio aio5(ctx, fd, 4 * 128 * kKiB, 128 * kKiB, &buffer5, true);
+    Aio aio6(ctx, fd, 5 * 128 * kKiB, 128 * kKiB, &buffer6, true);
+    Aio aio7(ctx, fd, 6 * 128 * kKiB, 128 * kKiB, &buffer7, true);
+    Aio aio8(ctx, fd, 7 * 128 * kKiB, 128 * kKiB, &buffer8, true);
+
+    aio_queue_->Submit(&aio1);
+    aio_queue_->Submit(&aio2);
+    aio_queue_->Submit(&aio3);
+    aio_queue_->Submit(&aio4);
+    aio_queue_->Submit(&aio5);
+    aio_queue_->Submit(&aio6);
+    aio_queue_->Submit(&aio7);
+    aio_queue_->Submit(&aio8);
+
+    aio1.Wait();
+    aio2.Wait();
+    aio3.Wait();
+    aio4.Wait();
+    aio5.Wait();
+    aio6.Wait();
+    aio7.Wait();
+    aio8.Wait();
+
+    buffer1.AppendTo(buffer);
+    buffer2.AppendTo(buffer);
+    buffer3.AppendTo(buffer);
+    buffer4.AppendTo(buffer);
+    buffer5.AppendTo(buffer);
+    buffer6.AppendTo(buffer);
+    buffer7.AppendTo(buffer);
+    buffer8.AppendTo(buffer);
+
+    status = Status::OK();
+  } else {
+    CHECK(false) << "unknown length";
+  }
+
   if (!status.ok()) {
     CloseFd(ctx, fd);
     return status;
@@ -286,6 +343,8 @@ Status LocalFileSystem::AioRead(ContextSPtr ctx, int fd, off_t offset,
   if (option.drop_page_cache) {
     // page_cache_manager_->AsyncDropPageCache(ctx, fd, offset, length);
   }
+
+  CloseFd(ctx, fd);
   return status;
 }
 
