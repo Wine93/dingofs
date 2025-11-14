@@ -109,7 +109,7 @@ Status BlockCacheImpl::Start() {
 
   auto status = store_->Start([this](ContextSPtr ctx, const BlockKey& key,
                                      size_t length, BlockContext block_ctx) {
-    uploader_->AddStagingBlock(StagingBlock(ctx, key, length, block_ctx));
+    // uploader_->AddStagingBlock(StagingBlock(ctx, key, length, block_ctx));
   });
   if (!status.ok()) {
     LOG(ERROR) << "Init cache store failed: " << status.ToString();
