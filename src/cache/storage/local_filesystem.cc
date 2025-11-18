@@ -40,6 +40,7 @@
 #include "cache/utils/helper.h"
 #include "cache/utils/offload_thread_pool.h"
 #include "cache/utils/posix.h"
+#include "common/const.h"
 #include "common/io_buffer.h"
 #include "common/options/cache.h"
 #include "common/status.h"
@@ -284,7 +285,9 @@ Status LocalFileSystem::AioRead(ContextSPtr ctx, int fd, off_t offset,
                                 ReadOption option) {
   Status status;
 
-  if (length == 128 * kKiB || length == 1 * kMiB) {
+  // if (length == 128 * kKiB) {
+  if (length == 128 * kKiB || length == 1 * kMiB || length == 512 * kKiB ||
+      length == 256 * kKiB || length == 64 * kKiB) {
     auto aio = Aio(ctx, fd, offset, length, buffer, true);
     aio_queue_->Submit(&aio);
 

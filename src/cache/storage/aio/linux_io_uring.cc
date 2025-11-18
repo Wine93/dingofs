@@ -70,7 +70,21 @@ Status LinuxIOUring::Start() {
     return Status::NotSupport("not support io_uring");
   }
 
-  int rc = io_uring_queue_init(iodepth_, &io_uring_, 0);
+  /*
+  struct io_uring_params params;
+  params.flags = IORING_SETUP_SQPOLL;
+  // params.sq_thread_cpu = 3;
+
+  int rc = io_uring_queue_init_params(iodepth_, &io_uring_, &params);
+  if (rc != 0) {
+    LOG_SYSERR(-rc, "io_uring_queue_init_params(%d)", iodepth_);
+    return Status::Internal("io_uring_queue_init_params() failed");
+  }
+  */
+
+  unsigned flags = IORING_SETUP_SQPOLL;
+  // unsigned flags = 0;
+  int rc = io_uring_queue_init(iodepth_, &io_uring_, flags);
   if (rc != 0) {
     LOG_SYSERR(-rc, "io_uring_queue_init(%d)", iodepth_);
     return Status::Internal("io_uring_queue_init() failed");

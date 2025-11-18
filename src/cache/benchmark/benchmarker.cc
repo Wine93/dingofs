@@ -22,6 +22,8 @@
 
 #include "cache/benchmark/benchmarker.h"
 
+#include <gflags/gflags_declare.h>
+
 #include <memory>
 
 #include "cache/benchmark/option.h"
@@ -30,6 +32,16 @@
 #include "cache/storage/storage_pool.h"
 #include "cache/tiercache/tier_block_cache.h"
 #include "common/options/cache.h"
+#include "common/options/client.h"
+
+namespace brpc {
+
+DECLARE_int32(max_connection_pool_size);
+DECLARE_int32(idle_timeout_second);
+DECLARE_int32(defer_close_second);
+DECLARE_bool(log_idle_connection_close);
+
+}  // namespace brpc
 
 namespace dingofs {
 namespace cache {
@@ -43,6 +55,10 @@ Benchmarker::Benchmarker()
   if (FLAGS_offset + FLAGS_length > FLAGS_blksize) {
     FLAGS_length = FLAGS_blksize - FLAGS_offset;
   }
+
+  brpc::FLAGS_max_connection_pool_size = 512;
+  brpc::FLAGS_idle_timeout_second = 600;
+  brpc::FLAGS_log_idle_connection_close = true;
 }
 
 Status Benchmarker::Start() { return InitAll(); }
