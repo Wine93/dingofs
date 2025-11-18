@@ -13,21 +13,9 @@
 # limitations under the License.
 # Define the BASE_FLAGS and DINGO_DEFAULT_COPTS variables
 
-SET(BENCHMARK_LIB_SRCS
-    "benchmarker.cc"
-    "collector.cc"
-    "factory.cc"
-    "option.cc"
-    "reporter.cc"
-    "worker.cc"
+add_executable(block_reader block_reader.cc)
+target_link_libraries(block_reader
+    cache_lib
+    unwind::unwind
+    gperftools::gperftools
 )
-
-add_library(cache_benchmark ${BENCHMARK_LIB_SRCS})
-target_link_libraries(cache_benchmark
-    cache_utils
-    cache_common
-    cache_storage
-)
-
-add_executable(cache-bench main.cc)
-target_link_libraries(cache-bench cache_benchmark)
