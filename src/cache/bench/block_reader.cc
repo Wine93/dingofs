@@ -1,6 +1,7 @@
 
 #include "cache/bench/block_reader.h"
 
+#include <absl/strings/str_format.h>
 #include <butil/time.h>
 #include <fcntl.h>
 
@@ -82,7 +83,8 @@ Status BlockReader::Read(const std::string& filepath, int stripe_size) {
   std::vector<Aio*> aios;
   std::vector<IOBuffer*> io_buffers;
 
-  int stripe_count = 4 * kMiB / stripe_size;
+  // int stripe_count = 1 * kMiB / stripe_size;
+  int stripe_count = 128 * kKiB / stripe_size;
   for (int i = 0; i < stripe_count; i++) {
     auto* buffer = new IOBuffer();
     auto* aio =
@@ -107,7 +109,8 @@ Status BlockReader::Read(const std::string& filepath, int stripe_size) {
 
   LOG(INFO) << "Read block success, strip_size=" << stripe_size
             << ", stripe_count=" << stripe_count << ", total cost "
-            << timer.u_elapsed(1.0) / 1e6 << " seconds.";
+            << absl::StrFormat("%.6lf", timer.u_elapsed(1.0) / 1e6)
+            << " seconds.";
   return Status::OK();
 }
 
