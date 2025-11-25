@@ -138,7 +138,12 @@ static std::string RenderPartitionPolicy(pb::mds::PartitionPolicy partition_poli
       result += fmt::format("expect_mds_num: {}", parent_hash.expect_mds_num());
       result += "<br>";
       result += "mds: ";
+
+      std::map<uint64_t, BucketSetEntry> sorted_distributions;
       for (const auto& [mds_id, bucket_set] : parent_hash.distributions()) {
+        sorted_distributions[mds_id] = bucket_set;
+      }
+      for (const auto& [mds_id, bucket_set] : sorted_distributions) {
         result += fmt::format("{}[{}],", mds_id, bucket_set.bucket_ids_size());
       }
       result.resize(result.size() - 1);
@@ -1438,16 +1443,12 @@ static void RenderInodePage(const AttrEntry& attr, butil::IOBufBuilder& os) {
   RenderJsonPage("dingofs inode details", header, json, os);
 }
 
-static void RenderChunk(uint64_t& count, uint64_t chunk_size, ChunkEntry chunk, butil::IOBufBuilder& os) {
+static void RenderChunk(uint64_t& count, uint64_t chunk_size, const ChunkEntry& chunk, butil::IOBufBuilder& os) {
   struct OffsetRange {
     uint64_t start;
     uint64_t end;
     std::vector<SliceEntry> slices;
   };
-
-  // sort by offset
-  std::stable_sort(chunk.mutable_slices()->begin(), chunk.mutable_slices()->end(),
-                   [](const SliceEntry& a, const SliceEntry& b) { return a.offset() < b.offset(); });
 
   // get offset ranges
   std::set<uint64_t> offsets;
@@ -1732,7 +1733,8 @@ void FsStatServiceImpl::default_method(::google::protobuf::RpcController* contro
     auto file_system = file_system_set->GetFileSystem(fs_id);
     if (file_system != nullptr) {
       InodeSPtr inode;
-      auto status = file_system->GetInodeFromStore(ino, "Stat", false, inode);
+      Context ctx("11111111111111", "fsstatservice");
+      auto status = file_system->GetInodeFromStore(ctx, ino, "Stat", false, inode);
       if (status.ok()) {
         RenderInodePage(inode->Copy(), os);
 

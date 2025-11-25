@@ -30,6 +30,7 @@
 #include "client/vfs/common/helper.h"
 #include "client/vfs/components/warmup_manager.h"
 #include "client/vfs/data/file.h"
+#include "client/vfs/data_buffer.h"
 #include "client/vfs/handle/handle_manager.h"
 #include "client/vfs/vfs_fh.h"
 #include "client/vfs/vfs_xattr.h"
@@ -59,7 +60,6 @@ Status VFSImpl::Start(const VFSConfig& vfs_conf) {  // NOLINT
 
   meta_system_ = vfs_hub_->GetMetaSystem();
   handle_manager_ = vfs_hub_->GetHandleManager();
-  vfs_hub_->GetWarmupManager()->SetVFS(this);
 
   DINGOFS_RETURN_NOT_OK(StartBrpcServer());
 
@@ -90,9 +90,13 @@ bool VFSImpl::Load(ContextSPtr ctx, const Json::Value& value) {
   return meta_system_->Load(ctx, value);
 }
 
-double VFSImpl::GetAttrTimeout(const FileType& type) { return 1; }  // NOLINT
+double VFSImpl::GetAttrTimeout(const FileType& type) {  // NOLINT
+  return FLAGS_client_fuse_attr_cache_timeout_s;
+}
 
-double VFSImpl::GetEntryTimeout(const FileType& type) { return 1; }  // NOLINT
+double VFSImpl::GetEntryTimeout(const FileType& type) {  // NOLINT
+  return FLAGS_client_fuse_entry_cache_timeout_s;
+}
 
 Status VFSImpl::Lookup(ContextSPtr ctx, Ino parent, const std::string& name,
                        Attr* attr) {
@@ -276,8 +280,9 @@ Status VFSImpl::Create(ContextSPtr ctx, Ino parent, const std::string& name,
   return s;
 }
 
-Status VFSImpl::Read(ContextSPtr ctx, Ino ino, char* buf, uint64_t size,
-                     uint64_t offset, uint64_t fh, uint64_t* out_rsize) {
+Status VFSImpl::Read(ContextSPtr ctx, Ino ino, DataBuffer* data_buffer,
+                     uint64_t size, uint64_t offset, uint64_t fh,
+                     uint64_t* out_rsize) {
   Status s;
   auto handle = handle_manager_->FindHandler(fh);
   VFS_CHECK_HANDLE(handle, ino, fh);
@@ -290,7 +295,8 @@ Status VFSImpl::Read(ContextSPtr ctx, Ino ino, char* buf, uint64_t size,
     size_t read_size =
         std::min(size, file_size > offset ? file_size - offset : 0);
     if (read_size > 0) {
-      std::memcpy(buf, handle->file_buffer.data.get() + offset, read_size);
+      data_buffer->RawIOBuffer()->AppendUserData(
+          handle->file_buffer.data.get() + offset, read_size, [](void*) {});
     }
     *out_rsize = read_size;
 
@@ -313,7 +319,8 @@ Status VFSImpl::Read(ContextSPtr ctx, Ino ino, char* buf, uint64_t size,
     }
   }
 
-  s = handle->file->Read(span->GetContext(), buf, size, offset, out_rsize);
+  s = handle->file->Read(span->GetContext(), data_buffer, size, offset,
+                         out_rsize);
 
   return s;
 }
@@ -417,9 +424,9 @@ Status VFSImpl::SetXattr(ContextSPtr ctx, Ino ino, const std::string& name,
   }
 
   if (IsWarmupXAttr(name)) {
-    WarmupInfo info(ino, value);
-
-    vfs_hub_->GetWarmupManager()->AsyncWarmupProcess(info);
+    LOG(INFO) << fmt::format(
+        "Set warmup task context: [key: {}, inodes: ({})].", ino, value);
+    vfs_hub_->GetWarmupManager()->SubmitTask(WarmupTaskContext{ino, value});
 
     return Status::OK();
   }
@@ -434,8 +441,8 @@ Status VFSImpl::GetXattr(ContextSPtr ctx, Ino ino, const std::string& name,
   }
 
   if (IsWarmupXAttr(name)) {
-    vfs_hub_->GetWarmupManager()->GetWarmupStatus(ino, *value);
-
+    *value = vfs_hub_->GetWarmupManager()->GetWarmupTaskStatus(ino);
+    LOG(INFO) << "Get warmup task status value: " << *value;
     return Status::OK();
   }
 
@@ -479,14 +486,7 @@ Status VFSImpl::ReadDir(ContextSPtr ctx, Ino ino, uint64_t fh, uint64_t offset,
     handler(stats_entry, 1);  // pos 0 is the offset for .stats entry
   }
 
-  uint64_t to_meta = (offset > 0) ? (offset - 1) : 0;
-
-  return meta_system_->ReadDir(
-      ctx, ino, fh, to_meta, with_attr,
-      [handler](const DirEntry& entry, uint64_t meta_offset) {
-        uint64_t return_off = meta_offset + 1;
-        return handler(entry, return_off);
-      });
+  return meta_system_->ReadDir(ctx, ino, fh, offset, with_attr, handler);
 }
 
 Status VFSImpl::ReleaseDir(ContextSPtr ctx, Ino ino, uint64_t fh) {

@@ -19,6 +19,7 @@
 #include <memory>
 #include <string>
 
+#include "client/vfs/metasystem/mds/chunk_memo.h"
 #include "client/vfs/metasystem/mds/client_id.h"
 #include "client/vfs/metasystem/mds/dir_iterator.h"
 #include "client/vfs/metasystem/mds/file_session.h"
@@ -26,6 +27,7 @@
 #include "client/vfs/metasystem/mds/inode_cache.h"
 #include "client/vfs/metasystem/mds/mds_client.h"
 #include "client/vfs/metasystem/mds/mds_discovery.h"
+#include "client/vfs/metasystem/mds/modify_time_memo.h"
 #include "client/vfs/metasystem/mds/write_slice_processor.h"
 #include "client/vfs/metasystem/meta_system.h"
 #include "client/vfs/vfs_meta.h"
@@ -97,7 +99,7 @@ class MDSFileSystem : public vfs::MetaSystem {
   Status Close(ContextSPtr ctx, Ino ino, uint64_t fh) override;
 
   Status ReadSlice(ContextSPtr ctx, Ino ino, uint64_t index, uint64_t fh,
-                   std::vector<Slice>* slices) override;
+                   std::vector<Slice>* slices, uint64_t& version) override;
   Status NewSliceId(ContextSPtr ctx, Ino ino, uint64_t* id) override;
   Status WriteSlice(ContextSPtr ctx, Ino ino, uint64_t index, uint64_t fh,
                     const std::vector<Slice>& slices) override;
@@ -151,6 +153,8 @@ class MDSFileSystem : public vfs::MetaSystem {
   bool UnmountFs();
 
   void Heartbeat();
+  void CleanExpiredModifyTimeMemo();
+  void CleanExpiredChunkMemo();
 
   bool InitCrontab();
 
@@ -175,6 +179,11 @@ class MDSFileSystem : public vfs::MetaSystem {
   void ClearChunkCache(Ino ino, uint64_t fh, uint64_t index);
   // Status SyncDeltaSlice(ContextSPtr ctx, Ino ino, uint64_t fh);
 
+  Status CorrectAttr(ContextSPtr ctx, uint64_t time_ns, Attr& attr,
+                     const std::string& caller);
+  void CorrectAttrLength(ContextSPtr ctx, Attr& attr,
+                         const std::string& caller);
+
   const std::string name_;
   const ClientId client_id_;
 
@@ -183,6 +192,10 @@ class MDSFileSystem : public vfs::MetaSystem {
   MDSDiscoverySPtr mds_discovery_;
 
   MDSClientSPtr mds_client_;
+
+  ChunkMemo chunk_memo_;
+
+  ModifyTimeMemo modify_time_memo_;
 
   FileSessionMap file_session_map_;
 

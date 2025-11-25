@@ -105,7 +105,7 @@ class FileSystem : public std::enable_shared_from_this<FileSystem> {
   bool IsMonoPartition() const;
   bool IsParentHashPartition() const;
 
-  bool CanServe() const { return can_serve_.load(std::memory_order_acquire); };
+  bool CanServe(Context& ctx);
 
   // create root directory
   Status CreateRoot();
@@ -151,7 +151,7 @@ class FileSystem : public std::enable_shared_from_this<FileSystem> {
   // create hard link
   Status Link(Context& ctx, Ino ino, Ino new_parent, const std::string& new_name, EntryOut& entry_out);
   // delete link
-  Status UnLink(Context& ctx, Ino parent, const std::string& name);
+  Status UnLink(Context& ctx, Ino parent, const std::string& name, EntryOut& entry_out);
   // create symbolic link
   Status Symlink(Context& ctx, const std::string& symlink, Ino new_parent, const std::string& new_name, uint32_t uid,
                  uint32_t gid, EntryOut& entry_out);
@@ -188,8 +188,10 @@ class FileSystem : public std::enable_shared_from_this<FileSystem> {
                       uint64_t& new_parent_version);
 
   // slice
-  Status WriteSlice(Context& ctx, Ino parent, Ino ino, const std::vector<DeltaSliceEntry>& delta_slices);
-  Status ReadSlice(Context& ctx, Ino ino, const std::vector<uint64_t>& chunk_indexes, std::vector<ChunkEntry>& chunks);
+  Status WriteSlice(Context& ctx, Ino parent, Ino ino, const std::vector<DeltaSliceEntry>& delta_slices,
+                    std::vector<ChunkDescriptor>& chunk_descriptors);
+  Status ReadSlice(Context& ctx, Ino ino, const std::vector<ChunkDescriptor>& chunk_descriptors,
+                   std::vector<ChunkEntry>& chunks);
 
   // fallocate
   Status Fallocate(Context& ctx, Ino ino, int32_t mode, uint64_t offset, uint64_t len, EntryOut& entry_out);
@@ -205,7 +207,6 @@ class FileSystem : public std::enable_shared_from_this<FileSystem> {
   Status BatchGetInode(Context& ctx, const std::vector<uint64_t>& inoes, std::vector<EntryOut>& out_entries);
   Status BatchGetXAttr(Context& ctx, const std::vector<uint64_t>& inoes, std::vector<pb::mds::XAttr>& out_xattrs);
 
-  Status RefreshInode(const std::vector<uint64_t>& inoes);
   void RefreshInode(AttrEntry& attr);
 
   Status RefreshFsInfo(const std::string& reason);
@@ -242,12 +243,16 @@ class FileSystem : public std::enable_shared_from_this<FileSystem> {
   Status GenFileIno(Ino& ino);
   bool CanServe(uint64_t self_mds_id);
 
+  Status GetPartitionParentInode(Context& ctx, PartitionPtr& partition, InodeSPtr& out_inode);
+  void AddDentryToPartition(Ino parent, const Dentry& dentry, uint64_t version);
+  void DeleteDentryFromPartition(Ino parent, const std::string& name, uint64_t version);
+
   // get partition
   Status GetPartition(Context& ctx, Ino parent, PartitionPtr& out_partition);
   Status GetPartition(Context& ctx, uint64_t version, Ino parent, PartitionPtr& out_partition);
   PartitionPtr GetPartitionFromCache(Ino parent);
   std::map<uint64_t, PartitionPtr> GetAllPartitionsFromCache();
-  Status GetPartitionFromStore(Ino parent, const std::string& reason, PartitionPtr& out_partition);
+  Status GetPartitionFromStore(Context& ctx, Ino parent, const std::string& reason, PartitionPtr& out_partition);
 
   // get dentry
   Status GetDentryFromStore(Ino parent, const std::string& name, Dentry& dentry);
@@ -255,20 +260,24 @@ class FileSystem : public std::enable_shared_from_this<FileSystem> {
                              std::vector<Dentry>& dentries);
 
   // get inode
-  Status GetInode(Context& ctx, Dentry& dentry, PartitionPtr partition, InodeSPtr& out_inode);
-  Status GetInode(Context& ctx, uint64_t version, Dentry& dentry, PartitionPtr partition, InodeSPtr& out_inode);
+  Status GetInode(Context& ctx, const Dentry& dentry, PartitionPtr partition, InodeSPtr& out_inode);
+  Status GetInode(Context& ctx, uint64_t version, const Dentry& dentry, PartitionPtr partition, InodeSPtr& out_inode);
   Status GetInode(Context& ctx, Ino ino, InodeSPtr& out_inode);
   Status GetInode(Context& ctx, uint64_t version, Ino ino, InodeSPtr& out_inode);
-  InodeSPtr GetInodeFromCache(Ino ino);
-  std::map<uint64_t, InodeSPtr> GetAllInodesFromCache();
-  Status GetInodeFromStore(Ino ino, const std::string& reason, bool is_cache, InodeSPtr& out_inode);
+
+  Status GetInodeFromStore(Context& ctx, Ino ino, const std::string& reason, bool is_cache, InodeSPtr& out_inode);
   Status BatchGetInodeFromStore(std::vector<uint64_t> inoes, std::vector<InodeSPtr>& out_inodes);
 
   Status GetDelFileFromStore(Ino ino, AttrEntry& out_attr);
 
   Status GetChunksFromStore(Ino ino, std::vector<ChunkEntry>& chunks, uint32_t max_slice_num = 0);
 
-  // delete inode from cache
+  // inode cache
+  InodeSPtr GetInodeFromCache(Ino ino);
+  std::map<uint64_t, InodeSPtr> GetAllInodesFromCache();
+  void UpsertInodeCache(Ino ino, InodeSPtr inode);
+  void UpsertInodeCache(InodeSPtr inode);
+  void UpsertInodeCache(AttrEntry& attr);
   void DeleteInodeFromCache(Ino ino);
 
   void ClearCache();

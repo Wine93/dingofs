@@ -37,6 +37,7 @@
 #include "client/vfs/vfs_meta.h"
 #include "common/blockaccess/block_access_log.h"
 #include "common/define.h"
+#include "common/io_buffer.h"
 #include "common/metrics/client/client.h"
 #include "common/metrics/metric_guard.h"
 #include "common/options/client.h"
@@ -522,14 +523,13 @@ Status VFSWrapper::Create(Ino parent, const std::string& name, uint32_t uid,
   return s;
 }
 
-Status VFSWrapper::Read(Ino ino, char* buf, uint64_t size, uint64_t offset,
-                        uint64_t fh, uint64_t* out_rsize) {
+Status VFSWrapper::Read(Ino ino, DataBuffer* data_buffer, uint64_t size,
+                        uint64_t offset, uint64_t fh, uint64_t* out_rsize) {
   auto span = vfs_->GetTracer()->StartSpan(kVFSWrapperMoudule, METHOD_NAME());
 
   std::string trace_id = span->GetContext()->TraceId();
-  VLOG(1) << fmt::format(
-      "[{}] VFSRead ino: {}, buf: {}, size: {}, offset: {}, fh: {}", trace_id,
-      ino, Char2Addr(buf), size, offset, fh);
+  VLOG(1) << fmt::format("[{}] VFSRead ino: {},  size: {}, offset: {}, fh: {}",
+                         trace_id, ino, size, offset, fh);
 
   Status s;
   AccessLogGuard log(
@@ -545,13 +545,13 @@ Status VFSWrapper::Read(Ino ino, char* buf, uint64_t size, uint64_t offset,
   VFSRWMetricGuard guard(&s, &g_rw_metric.read, out_rsize,
                          !IsInternalNode(ino));
 
-  s = vfs_->Read(span->GetContext(), ino, buf, size, offset, fh, out_rsize);
+  s = vfs_->Read(span->GetContext(), ino, data_buffer, size, offset, fh,
+                 out_rsize);
 
   VLOG(1) << fmt::format(
-      "[{}] VFSRead end ino: {}, buf: {}, size: {}, offset: {}, fh: {}, "
+      "[{}] VFSRead end ino: {},  size: {}, offset: {}, fh: {}, "
       "read_size: {}, status: {}",
-      trace_id, ino, Char2Addr(buf), size, offset, fh, *out_rsize,
-      s.ToString());
+      trace_id, ino, size, offset, fh, *out_rsize, s.ToString());
 
   if (!s.ok()) {
     op_metric.FailOp();
@@ -661,6 +661,10 @@ Status VFSWrapper::SetXattr(Ino ino, const std::string& name,
     return absl::StrFormat("setxattr (%d,%s): %s", ino, name, s.ToString());
   });
 
+  ClientOpMetricGuard op_metric(
+      {&client_op_metric_->opSetAttr, &client_op_metric_->opAll},
+      !IsInternalNode(ino));
+
   if (name.length() > vfs_->GetMaxNameLength()) {
     s = Status::NameTooLong(fmt::format("name({}) too long", name.length()));
     return s;
@@ -715,6 +719,10 @@ Status VFSWrapper::RemoveXattr(Ino ino, const std::string& name) {
   AccessLogGuard log([&]() {
     return absl::StrFormat("removexattr (%d,%s): %s", ino, name, s.ToString());
   });
+
+  ClientOpMetricGuard op_metric(
+      {&client_op_metric_->opRemoveXattr, &client_op_metric_->opAll},
+      !IsInternalNode(ino));
 
   if (name.length() > vfs_->GetMaxNameLength()) {
     s = Status::NameTooLong(fmt::format("name({}) too long", name.length()));
@@ -804,7 +812,7 @@ Status VFSWrapper::ReadDir(Ino ino, uint64_t fh, uint64_t offset,
           << " with_attr: " << (with_attr ? "true" : "false");
   Status s;
   AccessLogGuard log([&]() {
-    return absl::StrFormat("readdir %d: %s (%d) [fh:%d]", ino, s.ToString(),
+    return absl::StrFormat("readdir (%d): %s (%d) [fh:%d]", ino, s.ToString(),
                            offset, fh);
   });
 
@@ -812,7 +820,9 @@ Status VFSWrapper::ReadDir(Ino ino, uint64_t fh, uint64_t offset,
       {&client_op_metric_->opReadDir, &client_op_metric_->opAll});
 
   s = vfs_->ReadDir(span->GetContext(), ino, fh, offset, with_attr, handler);
+
   VLOG(1) << "VFSReaddir end, status: " << s.ToString();
+
   if (!s.ok()) {
     op_metric.FailOp();
   }
@@ -824,7 +834,8 @@ Status VFSWrapper::ReleaseDir(Ino ino, uint64_t fh) {
   VLOG(1) << "VFSReleaseDir ino: " << ino << " fh: " << fh;
   Status s;
   AccessLogGuard log([&]() {
-    return absl::StrFormat("releasedir %d: %s [fh:%d]", ino, s.ToString(), fh);
+    return absl::StrFormat("releasedir (%d): %s [fh:%d]", ino, s.ToString(),
+                           fh);
   });
 
   ClientOpMetricGuard op_metric(
@@ -889,6 +900,9 @@ Status VFSWrapper::StatFs(Ino ino, FsStat* fs_stat) {
   Status s;
   AccessLogGuard log(
       [&]() { return absl::StrFormat("statfs (%d): %s", ino, s.ToString()); });
+
+  ClientOpMetricGuard op_metric(
+      {&client_op_metric_->opStatfs, &client_op_metric_->opAll});
 
   s = vfs_->StatFs(span->GetContext(), ino, fs_stat);
   VLOG(1) << "VFSStatFs end, status: " << s.ToString()

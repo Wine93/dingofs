@@ -17,18 +17,22 @@
 #include "client/vfs/data/reader/file_reader.h"
 
 #include <absl/synchronization/blocking_counter.h>
+#include <butil/time.h>
 #include <glog/logging.h>
 
 #include <algorithm>
 #include <cmath>
 #include <vector>
 
+#include "cache/utils/helper.h"
 #include "client/common/const.h"
+#include "client/vfs/components/prefetch_manager.h"
 #include "client/vfs/components/warmup_manager.h"
 #include "client/vfs/data/reader/chunk_reader.h"
 #include "client/vfs/data/reader/reader_common.h"
 #include "client/vfs/hub/vfs_hub.h"
 #include "client/vfs/vfs_meta.h"
+#include "common/io_buffer.h"
 #include "common/options/client.h"
 #include "common/status.h"
 #include "common/trace/context.h"
@@ -62,6 +66,7 @@ static void ChunkReadCallback(const ChunkReadReq& req,
     }
 
     shared.num_done++;
+    CHECK_GE(shared.total, shared.num_done);
     if (shared.num_done >= shared.total) {
       shared.cv.notify_all();
     }
@@ -86,7 +91,7 @@ ChunkReader* FileReader::GetOrCreateChunkReader(uint64_t chunk_index) {
   }
 }
 
-Status FileReader::Read(ContextSPtr ctx, char* buf, uint64_t size,
+Status FileReader::Read(ContextSPtr ctx, DataBuffer* data_buffer, uint64_t size,
                         uint64_t offset, uint64_t* out_rsize) {
   auto span = vfs_hub_->GetTracer()->StartSpanWithContext(kVFSDataMoudule,
                                                           METHOD_NAME(), ctx);
@@ -99,16 +104,17 @@ Status FileReader::Read(ContextSPtr ctx, char* buf, uint64_t size,
     return Status::OK();
   }
 
-  uint64_t time_now = WarmupHelper::GetTimeSecs();
+  uint64_t time_now = cache::Helper::Timestamp();
   if (FLAGS_client_vfs_intime_warmup_enable &&
       ((time_now - last_intime_warmup_trigger_) >
            FLAGS_client_vfs_warmup_trigger_restart_interval_secs ||
        (attr.mtime - last_intime_warmup_mtime_) >
-           fLI64::FLAGS_client_vfs_warmup_mtime_restart_interval_secs)) {
-    WarmupInfo info(ino_);
+           FLAGS_client_vfs_warmup_mtime_restart_interval_secs)) {
+    LOG(INFO) << "Trigger intime warmup for ino: " << ino_ << ".";
     last_intime_warmup_trigger_ = time_now;
     last_intime_warmup_mtime_ = attr.mtime;
-    vfs_hub_->GetWarmupManager()->AsyncWarmupProcess(info);
+
+    vfs_hub_->GetWarmupManager()->SubmitTask(WarmupTaskContext{ino_});
   }
 
   uint64_t chunk_size = GetChunkSize();
@@ -118,28 +124,29 @@ Status FileReader::Read(ContextSPtr ctx, char* buf, uint64_t size,
 
   uint64_t total_read_size = std::min(size, attr.length - offset);
 
-  if (FLAGS_client_vfs_file_prefetch_block_cnt > 0 &&
-      vfs_hub_->GetBlockCache()->HasCacheStore()) {
-    vfs_hub_->GetPrefetchManager()->AsyncPrefetch(ino_, attr.length, offset,
-                                                  total_read_size);
+  // Prefetch blocks if enabled
+  if (FLAGS_client_vfs_prefetch_blocks > 0 &&
+      vfs_hub_->GetBlockCache()->EnableCache()) {
+    vfs_hub_->GetPrefetchManager()->SubmitTask(PrefetchContext{
+        ino_, offset, attr.length, FLAGS_client_vfs_prefetch_blocks});
   }
 
   std::vector<ChunkReadReq> read_reqs;
-
+  uint32_t req_index = 0;
   while (total_read_size > 0) {
     uint64_t read_size = std::min(total_read_size, chunk_size - chunk_offset);
 
     ChunkReadReq req{
+        .req_index = req_index++,
         .ino = ino_,
         .index = chunk_index,
         .offset = chunk_offset,
         .to_read_size = read_size,
-        .buf = buf,
+        .buf = IOBuffer(),
     };
 
     read_reqs.push_back(req);
 
-    buf += read_size;
     total_read_size -= read_size;
 
     offset += read_size;
@@ -171,40 +178,30 @@ Status FileReader::Read(ContextSPtr ctx, char* buf, uint64_t size,
 
     ret = shared.status;
     if (ret.ok()) {
+      auto iobuf_span = vfs_hub_->GetTracer()->StartSpanWithParent(
+          kVFSDataMoudule, "FileReader::Read.AppendIOBuf", *span);
       *out_rsize = shared.read_size;
+
+      // append all read chunk iobufs
+      for (auto& req : read_reqs) {
+        VLOG(3) << fmt::format(
+            "IOBuffer: Append chunk iobuf to file iobuf, chunk_req_index: {}, "
+            "chunk_info: {}",
+            req.req_index, req.ToString());
+        data_buffer->RawIOBuffer()->Append(&req.buf);
+      }
     }
   }
 
   return ret;
 }
 
-void FileReader::Invalidate() {
-  VLOG(1) << fmt::format("FileReader::Invalidate, ino: {}", ino_);
-
-  std::lock_guard<std::mutex> lock(mutex_);
-  validated_ = false;
-  for (auto& [index, reader] : chunk_readers_) {
-    reader->Invalidate();
-  }
-}
-
 Status FileReader::GetAttr(ContextSPtr ctx, Attr* attr) {
   auto span = vfs_hub_->GetTracer()->StartSpanWithContext(kVFSDataMoudule,
                                                           METHOD_NAME(), ctx);
 
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (validated_) {
-    *attr = attr_;
-    return Status::OK();
-  }
-
-  Status s =
-      vfs_hub_->GetMetaSystem()->GetAttr(span->GetContext(), ino_, &attr_);
-
-  if (s.ok()) {
-    validated_ = true;
-    *attr = attr_;
-  } else {
+  Status s = vfs_hub_->GetMetaSystem()->GetAttr(span->GetContext(), ino_, attr);
+  if (!s.ok()) {
     LOG(WARNING) << fmt::format(
         "FileReader::GetAttr failed, ino: {}, status: {}", ino_, s.ToString());
   }

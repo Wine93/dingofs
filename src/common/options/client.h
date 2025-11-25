@@ -67,6 +67,10 @@ DECLARE_int64(client_access_log_threshold_us);
 // fuse module
 DECLARE_bool(client_fuse_file_info_direct_io);
 DECLARE_bool(client_fuse_file_info_keep_cache);
+DECLARE_bool(client_fuse_enable_readdir_cache);
+
+DECLARE_uint32(client_fuse_entry_cache_timeout_s);
+DECLARE_uint32(client_fuse_attr_cache_timeout_s);
 
 // smooth upgrade
 DECLARE_uint32(client_fuse_fd_get_max_retries);
@@ -77,6 +81,7 @@ DECLARE_uint32(client_fuse_check_alive_retry_interval_ms);
 // vfs meta system log
 DECLARE_bool(client_vfs_meta_logging);
 DECLARE_int64(client_vfs_meta_log_threshold_us);
+DECLARE_uint64(client_vfs_meta_memo_expired_s);
 
 // vfs read
 DECLARE_int32(client_vfs_read_executor_thread);
@@ -88,11 +93,11 @@ DECLARE_int32(client_vfs_periodic_flush_interval_ms);
 DECLARE_double(client_vfs_trigger_flush_free_page_ratio);
 
 // vfs prefetch
-DECLARE_uint32(client_vfs_file_prefetch_block_cnt);
-DECLARE_uint32(client_vfs_file_prefetch_executor_num);
+DECLARE_uint32(client_vfs_prefetch_blocks);
+DECLARE_uint32(client_vfs_prefetch_threads);
 
 // vfs warmup
-DECLARE_int32(client_vfs_warmup_executor_thread);
+DECLARE_int32(client_vfs_warmup_threads);
 DECLARE_bool(client_vfs_intime_warmup_enable);
 DECLARE_int64(client_vfs_warmup_mtime_restart_interval_secs);
 DECLARE_int64(client_vfs_warmup_trigger_restart_interval_secs);
@@ -136,17 +141,19 @@ static void InitUdsOption(utils::Configuration* conf, UdsOption* uds_opt) {
 }
 
 static void InitPrefetchOption(utils::Configuration* c) {
-  c->GetValue("vfs.data.prefetch.block_cnt",
-              &FLAGS_client_vfs_file_prefetch_block_cnt);
-  c->GetValue("vfs.data.prefetch.executor_cnt",
-              &FLAGS_client_vfs_file_prefetch_executor_num);
+  c->GetValue("vfs.prefetch.blocks", &FLAGS_client_vfs_prefetch_blocks);
+  c->GetValue("vfs.prefetch.threads", &FLAGS_client_vfs_prefetch_threads);
   c->GetValue("vfs.data.warmup.intime_warmup_enbale",
               &FLAGS_client_vfs_intime_warmup_enable);
-  c->GetValue("vfs.data.warmup.executor_num",
-              &FLAGS_client_vfs_warmup_executor_thread);
-  c->GetValue("vfs.data.warmup.restart_mtime_interval_secs",
+}
+
+static void InitWarmupOption(utils::Configuration* c) {
+  c->GetValue("vfs.warmup.threads", &FLAGS_client_vfs_warmup_threads);
+  c->GetValue("vfs.intime_warmup.enbale",
+              &FLAGS_client_vfs_intime_warmup_enable);
+  c->GetValue("vfs.intime_warmup.restart_mtime_interval_secs",
               &FLAGS_client_vfs_warmup_mtime_restart_interval_secs);
-  c->GetValue("vfs.data.warmup.restart_trigger_interval_secs",
+  c->GetValue("vfs.intime_warmup.restart_trigger_interval_secs",
               &FLAGS_client_vfs_warmup_trigger_restart_interval_secs);
 }
 
@@ -166,6 +173,8 @@ static void InitBlockCacheOption(utils::Configuration* c) {
                 &cache::FLAGS_upload_stage_max_inflights);
     c->GetValue("block_cache.prefetch_max_inflights",
                 &cache::FLAGS_prefetch_max_inflights);
+    c->GetValue("block_cache.storage_upload_retry_timeout_s",
+                &cache::FLAGS_storage_upload_retry_timeout_s);
     c->GetValue("block_cache.storage_download_retry_timeout_s",
                 &cache::FLAGS_storage_download_retry_timeout_s);
   }

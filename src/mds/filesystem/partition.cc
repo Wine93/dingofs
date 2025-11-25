@@ -14,10 +14,13 @@
 
 #include "mds/filesystem/partition.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 
 #include "fmt/format.h"
+#include "glog/logging.h"
+#include "mds/common/helper.h"
 #include "mds/common/logging.h"
 
 namespace dingofs {
@@ -27,16 +30,38 @@ static const std::string kPartitionMetricsPrefix = "dingofs_{}_partition_cache_"
 
 // 0: no limit
 DEFINE_uint32(mds_partition_cache_max_count, 4 * 1024 * 1024, "partition cache max count");
+DEFINE_uint32(mds_partition_dentry_op_expire_interval_s, 600, "partition dentry op expire interval seconds");
 
 const uint32_t kDentryDefaultNum = 1024;
 
-InodeSPtr Partition::ParentInode() {
-  CHECK(parent_inode_ != nullptr) << "parent inode is null.";
+uint64_t Partition::BaseVersion() {
+  utils::ReadLockGuard lk(lock_);
 
-  return parent_inode_;
+  return base_version_;
 }
 
-void Partition::PutChild(const Dentry& dentry) {
+uint64_t Partition::DeltaVersion() {
+  utils::ReadLockGuard lk(lock_);
+
+  return delta_version_;
+}
+
+InodeSPtr Partition::ParentInode() {
+  utils::ReadLockGuard lk(lock_);
+
+  return inode_.lock();
+}
+
+void Partition::SetParentInode(InodeSPtr parent_inode) {
+  utils::WriteLockGuard lk(lock_);
+
+  inode_ = parent_inode;
+}
+
+void Partition::PutChild(const Dentry& dentry, uint64_t version) {
+  DINGO_LOG(DEBUG) << fmt::format("[partition.{}] put child, name({}), version({}) this({}).", ino_, dentry.Name(),
+                                  version, (void*)this);
+
   utils::WriteLockGuard lk(lock_);
 
   auto it = children_.find(dentry.Name());
@@ -44,22 +69,47 @@ void Partition::PutChild(const Dentry& dentry) {
     it->second = dentry;
   } else {
     children_[dentry.Name()] = dentry;
+
+    AddDeltaDentryOp(DentryOp{DentryOpType::ADD, version, dentry});
+  }
+
+  delta_version_ = std::max(version, delta_version_);
+}
+
+void Partition::PutChildForInode(const Dentry& dentry) {
+  utils::WriteLockGuard lk(lock_);
+
+  auto it = children_.find(dentry.Name());
+  if (it != children_.end()) {
+    it->second = dentry;
   }
 }
 
-void Partition::DeleteChild(const std::string& name) {
+void Partition::DeleteChild(const std::string& name, uint64_t version) {
   utils::WriteLockGuard lk(lock_);
 
-  children_.erase(name);
+  Dentry detry(name);
+  auto it = children_.find(name);
+  if (it != children_.end()) {
+    detry = it->second;
+    children_.erase(it);
+  }
+
+  AddDeltaDentryOp(DentryOp{DentryOpType::DELETE, version, detry});
+
+  delta_version_ = std::max(version, delta_version_);
 }
 
-void Partition::DeleteChildIf(const std::string& name, Ino ino) {
+void Partition::DeleteChildIf(const std::string& name, Ino ino, uint64_t version) {
   utils::WriteLockGuard lk(lock_);
 
   auto it = children_.find(name);
   if (it != children_.end() && it->second.INo() == ino) {
+    AddDeltaDentryOp(DentryOp{DentryOpType::DELETE, version, it->second});
     children_.erase(it);
   }
+
+  delta_version_ = std::max(version, delta_version_);
 }
 
 bool Partition::HasChild() {
@@ -112,13 +162,74 @@ std::vector<Dentry> Partition::GetAllChildren() {
   return dentries;
 }
 
+bool Partition::Merge(PartitionPtr& other_partition) {
+  CHECK(other_partition->ino_ == ino_) << "merge partition error, ino not match.";
+
+  utils::WriteLockGuard lk(lock_);
+
+  if (other_partition->BaseVersion() <= base_version_) return false;
+
+  DINGO_LOG(DEBUG) << fmt::format("[partition.{}] merge, self({},{},{},{}) other({},{}).", ino_, base_version_,
+                                  delta_version_, children_.size(), delta_dentry_ops_.size(),
+                                  other_partition->BaseVersion(), other_partition->children_.size());
+
+  base_version_ = other_partition->BaseVersion();
+  children_.swap(other_partition->children_);
+
+  // apply delta ops
+  delta_dentry_ops_.sort([](const DentryOp& a, const DentryOp& b) -> bool { return a.version < b.version; });
+
+  delta_version_ = base_version_;
+  for (const auto& op : delta_dentry_ops_) {
+    if (op.version <= base_version_) continue;
+
+    if (op.op_type == DentryOpType::ADD) {
+      children_[op.dentry.Name()] = op.dentry;
+
+    } else if (op.op_type == DentryOpType::DELETE) {
+      children_.erase(op.dentry.Name());
+    }
+
+    delta_version_ = std::max(delta_version_, op.version);
+  }
+
+  delta_dentry_ops_.clear();
+
+  return true;
+}
+
+void Partition::AddDeltaDentryOp(DentryOp&& op) {
+  op.time_s = Helper::Timestamp();
+  delta_dentry_ops_.push_back(std::move(op));
+
+  // clean expired ops
+  uint64_t now_s = Helper::Timestamp();
+  for (auto it = delta_dentry_ops_.begin(); it != delta_dentry_ops_.end();) {
+    if (it->time_s + FLAGS_mds_partition_dentry_op_expire_interval_s < now_s) {
+      it = delta_dentry_ops_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
 PartitionCache::PartitionCache(uint32_t fs_id)
     : fs_id_(fs_id),
       cache_(FLAGS_mds_partition_cache_max_count,
              std::make_shared<utils::CacheMetrics>(fmt::format(kPartitionMetricsPrefix, fs_id))) {}
 PartitionCache::~PartitionCache() {}  // NOLINT
 
-void PartitionCache::Put(Ino ino, PartitionPtr partition) { cache_.Put(ino, partition); }
+PartitionPtr PartitionCache::PutIf(Ino ino, PartitionPtr partition) {
+  PartitionPtr new_partition = partition;
+  cache_.PutInplaceIf(ino, partition, [&](PartitionPtr& old_partition) {
+    old_partition->Merge(partition);
+    new_partition = old_partition;
+  });
+
+  DINGO_LOG(DEBUG) << fmt::format("[cache.partition.{}.{}] putif, this({}).", fs_id_, ino, (void*)new_partition.get());
+
+  return new_partition;
+}
 
 void PartitionCache::Delete(Ino ino) {
   DINGO_LOG(INFO) << fmt::format("[cache.partition.{}] delete partition ino({}).", fs_id_, ino);

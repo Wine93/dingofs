@@ -54,6 +54,17 @@ DEFINE_validator(client_fuse_file_info_direct_io, brpc::PassValidate);
 DEFINE_bool(client_fuse_file_info_keep_cache, false, "keep file page cache");
 DEFINE_validator(client_fuse_file_info_keep_cache, brpc::PassValidate);
 
+DEFINE_bool(client_fuse_enable_readdir_cache, false, "enable readdir cache");
+DEFINE_validator(client_fuse_enable_readdir_cache, brpc::PassValidate);
+
+DEFINE_uint32(client_fuse_entry_cache_timeout_s, 1,
+              "fuse entry cache timeout in seconds");
+DEFINE_validator(client_fuse_entry_cache_timeout_s, brpc::PassValidate);
+
+DEFINE_uint32(client_fuse_attr_cache_timeout_s, 1,
+              "fuse attr cache timeout in seconds");
+DEFINE_validator(client_fuse_attr_cache_timeout_s, brpc::PassValidate);
+
 // smooth upgrade
 DEFINE_uint32(client_fuse_fd_get_max_retries, 100,
               "the max retries that get fuse fd from old dingo-fuse during "
@@ -80,6 +91,10 @@ DEFINE_validator(client_vfs_meta_logging, brpc::PassValidate);
 DEFINE_int64(client_vfs_meta_log_threshold_us, 1000, "access log threshold");
 DEFINE_validator(client_vfs_meta_log_threshold_us, brpc::PassValidate);
 
+DEFINE_uint64(client_vfs_meta_memo_expired_s, 3600,
+              "modify time memo expired time");
+DEFINE_validator(client_vfs_meta_memo_expired_s, brpc::PassValidate);
+
 DEFINE_int32(client_vfs_flush_bg_thread, 16,
              "number of background flush threads");
 DEFINE_validator(client_vfs_flush_bg_thread, brpc::PassValidate);
@@ -101,16 +116,13 @@ DEFINE_int32(client_vfs_read_max_retry_block_not_found, 10,
 DEFINE_validator(client_vfs_read_max_retry_block_not_found, brpc::PassValidate);
 
 // prefetch
-DEFINE_uint32(client_vfs_file_prefetch_block_cnt, 1,
-              "number of blocks to prefetch for file read");
-DEFINE_validator(client_vfs_file_prefetch_block_cnt, brpc::PassValidate);
+DEFINE_uint32(client_vfs_prefetch_blocks, 1, "number of blocks to prefetch");
+DEFINE_validator(client_vfs_prefetch_blocks, brpc::PassValidate);
 
-DEFINE_uint32(client_vfs_file_prefetch_executor_num, 4,
-              "number of prefetch executor");
+DEFINE_uint32(client_vfs_prefetch_threads, 8, "number of prefetch threads");
 
-// begin warmp params
-DEFINE_int32(client_vfs_warmup_executor_thread, 2,
-             "number of warmup executor threads");
+// warmup
+DEFINE_int32(client_vfs_warmup_threads, 4, "number of warmup threads");
 
 DEFINE_bool(client_vfs_intime_warmup_enable, false,
             "enable intime warmup, default is false");
@@ -120,12 +132,10 @@ DEFINE_int64(client_vfs_warmup_mtime_restart_interval_secs, 120,
              "intime warmup restart interval");
 DEFINE_validator(client_vfs_warmup_mtime_restart_interval_secs,
                  brpc::PassValidate);
-
 DEFINE_int64(client_vfs_warmup_trigger_restart_interval_secs, 1800,
              "passive warmup restart interval");
 DEFINE_validator(client_vfs_warmup_trigger_restart_interval_secs,
                  brpc::PassValidate);
-// end warmp params
 
 // ## vfs meta
 DEFINE_uint32(client_vfs_read_dir_batch_size, 1024, "read dir batch size.");
@@ -213,6 +223,7 @@ void InitVFSOption(utils::Configuration* conf, VFSOption* option) {
 
   InitFuseOption(conf, &option->fuse_option);
   InitPrefetchOption(conf);
+  InitWarmupOption(conf);
 
   // vfs data related
   if (!conf->GetBoolValue("vfs.data.writeback",

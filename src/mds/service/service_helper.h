@@ -179,6 +179,7 @@ void ServiceClosure<T, U>::Run() {
                                 request_->ShortDebugString().substr(0, FLAGS_mds_service_log_print_max_length),
                                 response_->ShortDebugString().substr(0, FLAGS_mds_service_log_print_max_length));
     }
+
   } else {
     if (BAIDU_UNLIKELY(elapsed_time_us >= FLAGS_mds_service_log_threshold_time_us)) {
       LOG(INFO) << fmt::format("[service.{}][request_id({})][{}us] Request finish, request({}) response({})",

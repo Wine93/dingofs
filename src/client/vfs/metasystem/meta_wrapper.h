@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "client/vfs/metasystem/meta_system.h"
+#include "common/metrics/client/vfs/slice_metric.h"
 #include "common/trace/context.h"
 
 namespace dingofs {
@@ -32,7 +33,9 @@ namespace vfs {
 
 class MetaWrapper : public MetaSystem {
  public:
-  MetaWrapper(MetaSystemUPtr meta_system) : target_(std::move(meta_system)){};
+  MetaWrapper(MetaSystemUPtr meta_system) : target_(std::move(meta_system)) {
+    slice_metric_ = std::make_unique<metrics::client::SliceMetric>();
+  };
 
   ~MetaWrapper() override = default;
 
@@ -105,7 +108,7 @@ class MetaWrapper : public MetaSystem {
                 Ino new_parent, const std::string& new_name) override;
 
   Status ReadSlice(ContextSPtr ctx, Ino ino, uint64_t index, uint64_t fh,
-                   std::vector<Slice>* slices) override;
+                   std::vector<Slice>* slices, uint64_t& version) override;
 
   Status NewSliceId(ContextSPtr ctx, Ino ino, uint64_t* id) override;
 
@@ -127,6 +130,7 @@ class MetaWrapper : public MetaSystem {
 
  private:
   MetaSystemUPtr target_;
+  std::unique_ptr<metrics::client::SliceMetric> slice_metric_;
 };
 
 }  // namespace vfs

@@ -35,6 +35,8 @@ struct DumpOption {
   bool file_session{false};
   bool handler{false};
   bool parent_memo{false};
+  bool modify_time_memo{false};
+  bool chunk_memo{false};
   bool mds_router{false};
   bool inode_cache{false};
   bool rpc{false};
@@ -79,7 +81,8 @@ class MetaSystem {
    * @param slices output
    */
   virtual Status ReadSlice(ContextSPtr ctx, Ino ino, uint64_t index,
-                           uint64_t fh, std::vector<Slice>* slices) = 0;
+                           uint64_t fh, std::vector<Slice>* slices,
+                           uint64_t& version) = 0;
 
   virtual Status NewSliceId(ContextSPtr ctx, Ino ino, uint64_t* id) = 0;
 

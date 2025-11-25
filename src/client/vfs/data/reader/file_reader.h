@@ -23,6 +23,7 @@
 #include <unordered_map>
 
 #include "client/vfs/data/reader/chunk_reader.h"
+#include "client/vfs/data_buffer.h"
 #include "common/status.h"
 
 namespace dingofs {
@@ -38,10 +39,8 @@ class FileReader {
 
   ~FileReader() = default;
 
-  Status Read(ContextSPtr ctx, char* buf, uint64_t size, uint64_t offset,
-              uint64_t* out_rsize);
-
-  void Invalidate();
+  Status Read(ContextSPtr ctx, DataBuffer* data_buffer, uint64_t size,
+              uint64_t offset, uint64_t* out_rsize);
 
  private:
   Status GetAttr(ContextSPtr ctx, Attr* attr);
@@ -58,8 +57,6 @@ class FileReader {
   uint64_t last_intime_warmup_trigger_{0};
 
   std::mutex mutex_;
-  bool validated_{false};
-  Attr attr_;
   // chunk index -> chunk reader
   std::unordered_map<uint64_t, ChunkReaderUptr> chunk_readers_;
 };

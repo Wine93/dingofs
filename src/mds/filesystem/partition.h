@@ -16,8 +16,12 @@
 #define DINGOFS_MDS_FILESYSTEM_PARTITION_H_
 
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <string>
+#include <vector>
 
+#include "absl/container/btree_map.h"
 #include "json/value.h"
 #include "mds/filesystem/dentry.h"
 #include "mds/filesystem/inode.h"
@@ -32,29 +36,56 @@ using PartitionPtr = std::shared_ptr<Partition>;
 // consider locality
 class Partition {
  public:
-  Partition(InodeSPtr parent_inode) : parent_inode_(parent_inode) {};
+  Partition(InodeSPtr inode) : ino_(inode->Ino()), inode_(inode), base_version_(inode->Version()) {};
   ~Partition() = default;
 
-  static PartitionPtr New(InodeSPtr parent_inode) { return std::make_shared<Partition>(parent_inode); }
+  static PartitionPtr New(InodeSPtr inode) { return std::make_shared<Partition>(inode); }
+
+  Ino INo() const { return ino_; }
+
+  uint64_t BaseVersion();
+  uint64_t DeltaVersion();
 
   InodeSPtr ParentInode();
+  void SetParentInode(InodeSPtr parent_inode);
 
-  void PutChild(const Dentry& dentry);
-  void DeleteChild(const std::string& name);
-  void DeleteChildIf(const std::string& name, Ino ino);
+  void PutChild(const Dentry& dentry, uint64_t version);
+  void PutChildForInode(const Dentry& dentry);
+  void DeleteChild(const std::string& name, uint64_t version);
+  void DeleteChildIf(const std::string& name, Ino ino, uint64_t version);
 
   bool HasChild();
   bool GetChild(const std::string& name, Dentry& dentry);
   std::vector<Dentry> GetChildren(const std::string& start_name, uint32_t limit, bool is_only_dir);
   std::vector<Dentry> GetAllChildren();
 
+  bool Merge(PartitionPtr& other_partition);
+
  private:
-  InodeSPtr parent_inode_;
+  const Ino ino_;
 
   utils::RWLock lock_;
 
+  uint64_t base_version_{0};
+  uint64_t delta_version_{0};
+
+  InodeWPtr inode_;
+
   // name -> dentry
-  std::map<std::string, Dentry> children_;
+  absl::btree_map<std::string, Dentry> children_;
+
+  // version -> dentry
+  enum class DentryOpType : uint8_t { ADD = 0, DELETE = 1 };
+
+  struct DentryOp {
+    DentryOpType op_type;
+    uint64_t version;
+    Dentry dentry;
+    uint64_t time_s;
+  };
+  void AddDeltaDentryOp(DentryOp&& op);
+
+  std::list<DentryOp> delta_dentry_ops_;
 };
 
 // use lru cache to store partition
@@ -68,7 +99,7 @@ class PartitionCache {
   PartitionCache(PartitionCache&&) = delete;
   PartitionCache& operator=(PartitionCache&&) = delete;
 
-  void Put(Ino ino, PartitionPtr partition);
+  PartitionPtr PutIf(Ino ino, PartitionPtr partition);
   void Delete(Ino ino);
   void BatchDeleteInodeIf(const std::function<bool(const Ino&)>& f);
   void Clear();

@@ -42,10 +42,10 @@ class VFSHub;
 static uint32_t kInvalidVersion = 0;
 
 struct BlockCacheReadReq {
+  uint32_t req_index;
   cache::BlockKey key;
   cache::RangeOption option;
   IOBuffer io_buffer;
-  char* buf_pos;
   const BlockReadReq& block_req;
 };
 
@@ -60,21 +60,19 @@ class ChunkReader {
 
   ~ChunkReader() = default;
 
-  void ReadAsync(ContextSPtr ctx, const ChunkReadReq& req, StatusCallback cb);
-
-  void Invalidate();
+  void ReadAsync(ContextSPtr ctx, ChunkReadReq& req, StatusCallback cb);
 
  private:
-  void DoRead(ContextSPtr ctx, const ChunkReadReq& req, StatusCallback cb);
+  void DoRead(ContextSPtr ctx, ChunkReadReq& req, StatusCallback cb);
 
   Status GetSlices(ContextSPtr ctx, ChunkSlices* chunk_slices);
-
-  void InvalidateSlices(uint32_t version);
 
   static void BlockReadCallback(ContextSPtr ctx, ChunkReader* reader,
                                 const BlockCacheReadReq& req,
                                 ReaderSharedState& shared, Status s);
   uint64_t GetChunkSize() const;
+
+  uint64_t GetBlockSize() const;
 
   std::string UUID() const {
     return fmt::format("chunk_reader-{}", chunk_.UUID());
@@ -83,12 +81,7 @@ class ChunkReader {
   VFSHub* hub_;
   const uint64_t fh_;
   const Chunk chunk_;
-
-  std::mutex mutex_;
-  // maybe version from mds
-  uint32_t next_version_{1};  // Start from 1, 0 is invalid version
-  std::atomic<uint32_t> cversion_{kInvalidVersion};
-  std::vector<Slice> slices_;
+  const uint64_t block_size_;
 };
 
 using ChunkReaderUptr = std::shared_ptr<ChunkReader>;

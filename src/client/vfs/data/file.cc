@@ -72,17 +72,13 @@ Status File::PreCheck() {
 Status File::Write(ContextSPtr ctx, const char* buf, uint64_t size,
                    uint64_t offset, uint64_t* out_wsize) {
   DINGOFS_RETURN_NOT_OK(PreCheck());
-  Status s = file_writer_->Write(ctx, buf, size, offset, out_wsize);
-  if (s.ok()) {
-    file_reader_->Invalidate();
-  }
-  return s;
+  return  file_writer_->Write(ctx, buf, size, offset, out_wsize);
 }
 
-Status File::Read(ContextSPtr ctx, char* buf, uint64_t size, uint64_t offset,
-                  uint64_t* out_rsize) {
+Status File::Read(ContextSPtr ctx, DataBuffer* data_buffer, uint64_t size,
+                  uint64_t offset, uint64_t* out_rsize) {
   DINGOFS_RETURN_NOT_OK(PreCheck());
-  return file_reader_->Read(ctx, buf, size, offset, out_rsize);
+  return file_reader_->Read(ctx, data_buffer, size, offset, out_rsize);
 }
 
 void File::FileFlushed(StatusCallback cb, Status status) {

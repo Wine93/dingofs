@@ -14,60 +14,83 @@
 
 #include "client/vfs/metasystem/mds/dir_iterator.h"
 
+#include <cstdint>
+
 #include "client/vfs/common/helper.h"
 #include "common/options/client.h"
 #include "fmt/format.h"
+#include "glog/logging.h"
 
 namespace dingofs {
 namespace client {
 namespace vfs {
 namespace v2 {
 
-Status DirIterator::Seek() {
+DirIterator::~DirIterator() {
+  std::string str;
+  for (auto offset : offset_stats_) {
+    str += fmt::format("{},", offset);
+  }
+
+  VLOG(1) << fmt::format("[dir_iterator.{}.{}] offset stats: {} {}.", ino_, fh_,
+                         offset_stats_.size(), str);
+}
+
+void DirIterator::Remember(uint64_t off) { offset_stats_.push_back(off); }
+
+Status DirIterator::PreFetch() {
+  last_fetch_time_ns_ = utils::TimestampNs();
+
+  // return Next();
+  return Status::OK();
+}
+
+Status DirIterator::GetValue(uint64_t off, bool with_attr,
+                             DirEntry& dir_entry) {
+  CHECK(off >= offset_) << fmt::format(
+      "[dir_iterator.{}.{}] off out of range, {} {}.", ino_, fh_, offset_, off);
+
+  with_attr_ = with_attr;
+
+  do {
+    if (off < offset_ + entries_.size()) {
+      dir_entry = entries_[off - offset_];
+      return Status::OK();
+    }
+
+    if (is_fetch_ && entries_.size() < FLAGS_client_vfs_read_dir_batch_size) {
+      return Status::NoData("not more dentry");
+    }
+
+    auto status = Next();
+    if (!status.ok()) return status;
+
+  } while (true);
+
+  return Status::OK();
+}
+
+Status DirIterator::Next() {
   std::vector<DirEntry> entries;
-  auto status =
-      mds_client_->ReadDir(ctx_, ino_, last_name_,
-                           FLAGS_client_vfs_read_dir_batch_size, true, entries);
+  auto status = mds_client_->ReadDir(ctx_, ino_, fh_, last_name_,
+                                     FLAGS_client_vfs_read_dir_batch_size,
+                                     with_attr_, entries);
   if (!status.ok()) {
+    LOG(ERROR) << fmt::format(
+        "[dir_iterator.{}.{}] readdir fail, offset({}) last_name({}).", ino_,
+        fh_, offset_, last_name_);
     return status;
   }
 
-  offset_ = 0;
+  is_fetch_ = true;
+
+  offset_ += entries_.size();
   entries_ = std::move(entries);
   if (!entries_.empty()) {
     last_name_ = entries_.back().name;
   }
 
   return Status::OK();
-}
-
-bool DirIterator::Valid() { return offset_ < entries_.size(); }
-
-DirEntry DirIterator::GetValue(bool with_attr) {
-  CHECK(offset_ < entries_.size()) << "offset out of range";
-
-  with_attr_ = with_attr;
-  return entries_[offset_];
-}
-
-void DirIterator::Next() {
-  if (++offset_ < entries_.size()) {
-    return;
-  }
-
-  std::vector<DirEntry> entries;
-  auto status = mds_client_->ReadDir(ctx_, ino_, last_name_,
-                                     FLAGS_client_vfs_read_dir_batch_size,
-                                     with_attr_, entries);
-  if (!status.ok()) {
-    return;
-  }
-
-  offset_ = 0;
-  entries_ = std::move(entries);
-  if (!entries_.empty()) {
-    last_name_ = entries_.back().name;
-  }
 }
 
 bool DirIterator::Dump(Json::Value& value) {
@@ -171,7 +194,8 @@ bool DirIteratorManager::Load(MDSClientSPtr mds_client,
 
   for (const auto& item : items) {
     Ino ino = item["ino"].asUInt64();
-    auto dir_iterator = DirIterator::New(nullptr, mds_client, ino);
+    uint64_t fh = item["fh"].asUInt64();
+    auto dir_iterator = DirIterator::New(nullptr, mds_client, ino, fh);
     if (!dir_iterator->Load(item)) {
       LOG(ERROR) << fmt::format(
           "[meta.dir_iterator] load dir({}) iterator fail.", ino);

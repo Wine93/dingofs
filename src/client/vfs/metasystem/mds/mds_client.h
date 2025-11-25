@@ -45,9 +45,10 @@ class MDSClient;
 using MDSClientSPtr = std::shared_ptr<MDSClient>;
 
 using mds::AttrEntry;
+using mds::ChunkDescriptor;
 using mds::MDSMeta;
 
-using GetMdsFn = std::function<MDSMeta()>;
+using GetMdsFn = std::function<MDSMeta(bool& is_primary_mds)>;
 
 class MDSClient {
  public:
@@ -101,8 +102,8 @@ class MDSClient {
                Attr& out_attr);
   Status RmDir(ContextSPtr ctx, Ino parent, const std::string& name);
 
-  Status ReadDir(ContextSPtr ctx, Ino ino, const std::string& last_name,
-                 uint32_t limit, bool with_attr,
+  Status ReadDir(ContextSPtr ctx, Ino ino, uint64_t fh,
+                 const std::string& last_name, uint32_t limit, bool with_attr,
                  std::vector<DirEntry>& entries);
 
   Status Open(ContextSPtr ctx, Ino ino, int flags, bool is_prefetch_chunk,
@@ -134,28 +135,30 @@ class MDSClient {
                 Ino new_parent, const std::string& new_name);
 
   Status NewSliceId(ContextSPtr ctx, uint32_t num, uint64_t* id);
+
   Status ReadSlice(ContextSPtr ctx, Ino ino,
-                   const std::vector<uint64_t>& chunk_indexes,
+                   const std::vector<ChunkDescriptor>& chunk_descriptors,
                    std::vector<mds::ChunkEntry>& chunks);
+
   Status WriteSlice(ContextSPtr ctx, Ino ino,
-                    const std::vector<mds::DeltaSliceEntry>& delta_slices);
+                    const std::vector<mds::DeltaSliceEntry>& delta_slices,
+                    std::vector<ChunkDescriptor>& chunk_descriptors);
 
   Status Fallocate(ContextSPtr ctx, Ino ino, int32_t mode, uint64_t offset,
                    uint64_t length);
 
   Status GetFsQuota(ContextSPtr ctx, FsStat& fs_stat);
+  Status GetDirQuota(ContextSPtr ctx, Ino ino, FsStat& fs_stat);
 
  private:
   static Status DoGetFsInfo(RPCPtr rpc, pb::mds::GetFsInfoRequest& request,
                             mds::FsInfoEntry& fs_info);
 
-  MDSMeta GetMds(Ino ino);
-  MDSMeta GetMdsByParent(int64_t parent);
-
-  MDSMeta GetMdsWithFallback(Ino ino, bool& is_fallback);
-  MDSMeta GetMdsByParentWithFallback(int64_t parent, bool& is_fallback);
+  MDSMeta GetMds(Ino ino, bool& is_primary_mds);
+  MDSMeta GetMdsByParent(int64_t parent, bool& is_primary_mds);
 
   uint64_t GetInodeVersion(Ino ino);
+  int32_t GetInodeRenameRefCount(Ino ino);
 
   bool UpdateRouter();
 
@@ -205,6 +208,8 @@ Status MDSClient::SendRequest(ContextSPtr ctx, GetMdsFn get_mds_fn,
                               const std::string& api_name, Request& request,
                               Response& response) {
   MDSMeta mds_meta;
+  bool is_primary_mds = true;
+  uint64_t primary_mds_id{0};
   bool is_refresh_mds = true;
 
   request.mutable_info()->set_request_id(
@@ -216,7 +221,11 @@ Status MDSClient::SendRequest(ContextSPtr ctx, GetMdsFn get_mds_fn,
   do {
     request.mutable_context()->set_epoch(epoch_);
 
-    if (is_refresh_mds) mds_meta = get_mds_fn();
+    if (is_refresh_mds) {
+      mds_meta = get_mds_fn(is_primary_mds);
+      primary_mds_id = is_primary_mds ? mds_meta.ID() : 0;
+      request.mutable_context()->set_is_bypass_cache(!is_primary_mds);
+    }
     auto endpoint = StrToEndpoint(mds_meta.Host(), mds_meta.Port());
 
     status =
@@ -224,9 +233,9 @@ Status MDSClient::SendRequest(ContextSPtr ctx, GetMdsFn get_mds_fn,
     if (!status.ok()) {
       LOG(INFO) << fmt::format(
           "[meta.client] send request fail, {} reqid({}) mds({}) retry({}) "
-          "status({}).",
+          "is_primary({}) status({}).",
           api_name, request.info().request_id(), mds_meta.ID(), retry,
-          status.ToString());
+          is_primary_mds, status.ToString());
 
       if (status.Errno() == pb::error::EROUTER_EPOCH_CHANGE) {
         ProcessEpochChange();
@@ -240,6 +249,11 @@ Status MDSClient::SendRequest(ContextSPtr ctx, GetMdsFn get_mds_fn,
 
       } else if (status.IsNetError()) {
         ProcessNetError(mds_meta);
+
+        is_primary_mds =
+            (primary_mds_id != 0 && mds_meta.ID() == primary_mds_id);
+        request.mutable_context()->set_is_bypass_cache(!is_primary_mds);
+
         is_refresh_mds = false;
         continue;
       }

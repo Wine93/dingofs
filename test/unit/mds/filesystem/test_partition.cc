@@ -66,19 +66,25 @@ TEST_F(PartitionCacheTest, Put) {
 
   uint64_t parent_ino = 1;
   partition->PutChild(Dentry(kFsId, "dir01", parent_ino, 100000,
-                             pb::mds::FileType::DIRECTORY, 0));
+                             pb::mds::FileType::DIRECTORY, 0),
+                      1);
   partition->PutChild(Dentry(kFsId, "dir02", parent_ino, 100001,
-                             pb::mds::FileType::DIRECTORY, 0));
+                             pb::mds::FileType::DIRECTORY, 0),
+                      2);
   partition->PutChild(Dentry(kFsId, "dir03", parent_ino, 100002,
-                             pb::mds::FileType::DIRECTORY, 0));
+                             pb::mds::FileType::DIRECTORY, 0),
+                      3);
   partition->PutChild(Dentry(kFsId, "dir04", parent_ino, 100003,
-                             pb::mds::FileType::DIRECTORY, 0));
+                             pb::mds::FileType::DIRECTORY, 0),
+                      4);
   partition->PutChild(
-      Dentry(kFsId, "file01", parent_ino, 100004, pb::mds::FileType::FILE, 0));
+      Dentry(kFsId, "file01", parent_ino, 100004, pb::mds::FileType::FILE, 0),
+      5);
   partition->PutChild(
-      Dentry(kFsId, "file01", parent_ino, 100005, pb::mds::FileType::FILE, 0));
+      Dentry(kFsId, "file01", parent_ino, 100005, pb::mds::FileType::FILE, 0),
+      6);
 
-  partition_cache.Put(inode->Ino(), partition);
+  partition_cache.PutIf(inode->Ino(), partition);
 
   ASSERT_TRUE(partition_cache.Get(inode->Ino()) != nullptr);
 }
@@ -92,24 +98,58 @@ TEST_F(PartitionCacheTest, Delete) {
 
   uint64_t parent_ino = 1;
   partition->PutChild(Dentry(kFsId, "dir01", parent_ino, 100000,
-                             pb::mds::FileType::DIRECTORY, 0));
+                             pb::mds::FileType::DIRECTORY, 0),
+                      1);
   partition->PutChild(Dentry(kFsId, "dir02", parent_ino, 100001,
-                             pb::mds::FileType::DIRECTORY, 0));
+                             pb::mds::FileType::DIRECTORY, 0),
+                      2);
   partition->PutChild(Dentry(kFsId, "dir03", parent_ino, 100002,
-                             pb::mds::FileType::DIRECTORY, 0));
+                             pb::mds::FileType::DIRECTORY, 0),
+                      3);
   partition->PutChild(Dentry(kFsId, "dir04", parent_ino, 100003,
-                             pb::mds::FileType::DIRECTORY, 0));
+                             pb::mds::FileType::DIRECTORY, 0),
+                      4);
   partition->PutChild(
-      Dentry(kFsId, "file01", parent_ino, 100004, pb::mds::FileType::FILE, 0));
+      Dentry(kFsId, "file01", parent_ino, 100004, pb::mds::FileType::FILE, 0),
+      5);
   partition->PutChild(
-      Dentry(kFsId, "file01", parent_ino, 100005, pb::mds::FileType::FILE, 0));
+      Dentry(kFsId, "file01", parent_ino, 100005, pb::mds::FileType::FILE, 0),
+      6);
 
-  partition_cache.Put(inode->Ino(), partition);
+  partition_cache.PutIf(inode->Ino(), partition);
 
   ASSERT_TRUE(partition_cache.Get(inode->Ino()) != nullptr);
 
   partition_cache.Delete(inode->Ino());
   ASSERT_TRUE(partition_cache.Get(inode->Ino()) == nullptr);
+}
+
+TEST_F(PartitionCacheTest, PutIf) {
+  PartitionCache partition_cache(kFsId);
+
+  InodeSPtr inode =
+      Inode::New(GenInode(kFsId, 1, pb::mds::FileType::DIRECTORY));
+  auto partition = Partition::New(inode);
+
+  {
+    auto resp_partition = partition_cache.PutIf(inode->Ino(), partition);
+    ASSERT_TRUE(resp_partition.get() == partition.get());
+  }
+
+  {
+    InodeSPtr inode =
+        Inode::New(GenInode(kFsId, 1, pb::mds::FileType::DIRECTORY));
+    auto temp_partition = Partition::New(inode);
+
+    Dentry dentry(kFsId, "file1", 1, 1000, pb::mds::FileType::FILE, 1212,
+                  nullptr);
+    temp_partition->PutChild(dentry, 2);
+
+    auto resp_partition = partition_cache.PutIf(inode->Ino(), temp_partition);
+    ASSERT_TRUE(resp_partition.get() == partition.get());
+    Dentry temp_dentry;
+    ASSERT_TRUE(resp_partition->GetChild("file1", temp_dentry));
+  }
 }
 
 }  // namespace unit_test
