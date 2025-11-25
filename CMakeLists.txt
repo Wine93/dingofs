@@ -20,6 +20,12 @@ project(dingofs C CXX)
 option(BUILD_UNIT_TESTS "Build unit test" OFF)
 option(BUILD_INTEGRATION_TESTS "Build integration test" OFF)
 option(USE_TCMALLOC "Use tcmalloc" ON)
+option(BRPC_ENABLE_CPU_PROFILER "Enable brpc cpu profiler" OFF)
+
+if(BRPC_ENABLE_CPU_PROFILER)
+  message(STATUS "Enable BRPC_ENABLE_CPU_PROFILER")
+  add_definitions(-DBRPC_ENABLE_CPU_PROFILER=ON)
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 if(NOT CMAKE_BUILD_TYPE)
@@ -187,6 +193,12 @@ message("Using glog ${glog_VERSION}")
 
 find_package(GTest CONFIG REQUIRED)
 message("Using GTest ${GTest_VERSION}")
+
+find_package(unwind REQUIRED)
+message("Using unwind ${unwind_VERSION}")
+
+find_package(gperftools REQUIRED)
+message("Using gperftools ${gperftools_VERSION}")
 
 set(protobuf_MODULE_COMPATIBLE TRUE)
 find_package(Protobuf CONFIG REQUIRED)

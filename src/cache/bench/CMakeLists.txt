@@ -11,37 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Define the BASE_FLAGS and DINGO_DEFAULT_COPTS variables
 
-add_subdirectory(common)
-add_subdirectory(utils)
-add_subdirectory(metric)
-add_subdirectory(storage)
-add_subdirectory(blockcache)
-add_subdirectory(cachegroup)
-add_subdirectory(remotecache)
-add_subdirectory(tiercache)
-add_subdirectory(benchmark)
-add_subdirectory(bench)
-
-file(GLOB CACHE_LIB_SRCS
-    "dingo_cache.cc"
-)
-add_library(cache_lib ${CACHE_LIB_SRCS})
-target_link_libraries(cache_lib
-    cache_utils
-    cache_common
-    cache_metric
-    cache_storage
-    cache_blockcache
-    cache_cachegroup
-    cache_remotecache
-    cache_tiercache
-    unwind::unwind
-    gperftools::gperftools
-)
-
-add_executable(dingo-cache main.cc)
-target_link_libraries(dingo-cache
+add_executable(block_reader block_reader.cc)
+target_link_libraries(block_reader
     cache_lib
     unwind::unwind
     gperftools::gperftools

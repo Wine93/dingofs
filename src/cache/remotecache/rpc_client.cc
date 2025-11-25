@@ -268,6 +268,8 @@ Status RPCClient::SendRequest(ContextSPtr ctx, const std::string& api_name,
   auto connection_type = (api_name == "Range") ? brpc::CONNECTION_TYPE_POOLED
                                                : brpc::CONNECTION_TYPE_SINGLE;
 
+  // auto connection_type = brpc::CONNECTION_TYPE_SINGLE;
+
   butil::Timer timer;
   timer.start();
 

@@ -39,7 +39,8 @@
 namespace dingofs {
 namespace cache {
 
-DEFINE_uint32(ioring_iodepth, 128, "Aio queue maximum iodepth");
+// DEFINE_uint32(ioring_iodepth, 128, "Aio queue maximum iodepth");
+DEFINE_uint32(ioring_iodepth, 1024, "Aio queue maximum iodepth");
 
 const std::string kModule = "aio";
 
@@ -110,10 +111,10 @@ void AioQueueImpl::Submit(Aio* aio) {
 
   // TODO: pls consider all waiting inflight bthread wakeup at the same time,
   // it will leads all bthread fight for locks. any performance skew?
-  NextStep(aio, "throttle");
-  infights_->Increment(1);
+  // NextStep(aio, "throttle");
+  // infights_->Increment(1);
 
-  NextStep(aio, "check");
+  // NextStep(aio, "check");
   CheckIO(aio);
 }
 
@@ -123,7 +124,7 @@ void AioQueueImpl::CheckIO(Aio* aio) {
     return;
   }
 
-  NextStep(aio, "enqueue");
+  // NextStep(aio, "enqueue");
   CHECK_EQ(0, bthread::execution_queue_execute(prep_io_queue_id_, aio));
 }
 
@@ -138,7 +139,7 @@ int AioQueueImpl::PrepareIO(void* meta, bthread::TaskIterator<Aio*>& iter) {
   auto ioring = self->ioring_;
   for (; iter; iter++) {
     auto* aio = *iter;
-    NextStep(aio, "prepare");
+    // NextStep(aio, "prepare");
     Status status = ioring->PrepareIO(aio);
     if (!status.ok()) {
       self->OnError(aio, status);
@@ -147,14 +148,14 @@ int AioQueueImpl::PrepareIO(void* meta, bthread::TaskIterator<Aio*>& iter) {
 
     prep_aios.emplace_back(aio);
     if (prep_aios.size() == kSubmitBatchSize) {
-      BatchNextStep(prep_aios, "execute");
+      // BatchNextStep(prep_aios, "execute");
       self->BatchSubmitIO(prep_aios);
       prep_aios.clear();
     }
   }
 
   if (!prep_aios.empty()) {
-    BatchNextStep(prep_aios, "execute");
+    // BatchNextStep(prep_aios, "execute");
     self->BatchSubmitIO(prep_aios);
   }
   return 0;
@@ -169,8 +170,12 @@ void AioQueueImpl::BatchSubmitIO(const std::vector<Aio*>& aios) {
     return;
   }
 
-  VLOG(9) << aios.size()
-          << " aio[s] submitted: total length = " << GetTotalLength(aios);
+  // VLOG(9) << aios.size()
+  //         << " aio[s] submitted: total length = " << GetTotalLength(aios);
+
+  // LOG(WARNING) << aios.size()
+  //              << " aio[s] submitted: total length = " <<
+  //              GetTotalLength(aios);
 }
 
 void AioQueueImpl::BackgroundWait() {
@@ -181,8 +186,12 @@ void AioQueueImpl::BackgroundWait() {
       continue;
     }
 
-    VLOG(9) << completed_aios.size() << " aio[s] compelted : total length = "
-            << GetTotalLength(completed_aios);
+    // VLOG(9) << completed_aios.size() << " aio[s] compelted : total length = "
+    //         << GetTotalLength(completed_aios);
+
+    // LOG(WARNING) << completed_aios.size()
+    //              << " aio[s] compelted : total length = "
+    //              << GetTotalLength(completed_aios);
 
     for (auto* aio : completed_aios) {
       OnCompleted(aio);
@@ -192,10 +201,10 @@ void AioQueueImpl::BackgroundWait() {
 
 void AioQueueImpl::OnError(Aio* aio, Status status) {
   const auto& ctx = aio->ctx;
-  CHECK_NE(LastStep(aio), "execute")
-      << ctx->StrTraceId() << " Aio " << aio->ToString()
-      << " is not on expected phase: got(" << LastStep(aio)
-      << ") != expect(execute)";
+  // CHECK_NE(LastStep(aio), "execute")
+  //     << ctx->StrTraceId() << " Aio " << aio->ToString()
+  //     << " is not on expected phase: got(" << LastStep(aio)
+  //     << ") != expect(execute)";
 
   LOG_CTX(ERROR) << "Aio encountered an error in " << LastStep(aio)
                  << " step: aio = " << aio->ToString()
@@ -208,10 +217,10 @@ void AioQueueImpl::OnError(Aio* aio, Status status) {
 void AioQueueImpl::OnCompleted(Aio* aio) {
   const auto& ctx = aio->ctx;
 
-  CHECK_EQ(LastStep(aio), "execute")
-      << ctx->StrTraceId() << " Aio " << aio->ToString()
-      << " is not on expected phase: got(" << LastStep(aio)
-      << ") != expect(execute)";
+  // CHECK_EQ(LastStep(aio), "execute")
+  //     << ctx->StrTraceId() << " Aio " << aio->ToString()
+  //     << " is not on expected phase: got(" << LastStep(aio)
+  //     << ") != expect(execute)";
 
   if (!aio->status().ok()) {
     LOG_CTX(ERROR) << "Aio failed: aio = " << aio->ToString()
@@ -227,10 +236,10 @@ void AioQueueImpl::RunClosure(Aio* aio) {
   auto timer = aio->timer;
   TraceLogGuard log(aio->ctx, status, timer, kModule, "%s", aio->ToString());
 
-  NextStep(aio, "closure");
+  // NextStep(aio, "closure");
   aio->Run();
 
-  infights_->Decrement(1);
+  // infights_->Decrement(1);
 
   timer.Stop();
 }

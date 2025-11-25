@@ -45,7 +45,8 @@ struct Aio : public Closure {
         length(length),
         buffer(buffer),
         for_read(for_read),
-        fixed_buffer_index(fixed_buffer_index) {
+        fixed_buffer_index(fixed_buffer_index),
+        inflight_(1) {
     CHECK_GT(fd, 0);
     CHECK_GE(offset, 0);
     CHECK_GT(length, 0);
@@ -85,6 +86,7 @@ struct Aio : public Closure {
   bool finish{false};
   BthreadMutex mutex;
   BthreadConditionVariable cond;
+  std::atomic<uint32_t> inflight_;
 };
 
 class IORing {

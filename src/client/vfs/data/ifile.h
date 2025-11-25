@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#ifndef DINGODB_CLIENT_VFS_DATA_IFILE_H_
-#define DINGODB_CLIENT_VFS_DATA_IFILE_H_
+#ifndef DINGOFS_SRC_CLIENT_VFS_DATA_IFILE_H_
+#define DINGOFS_SRC_CLIENT_VFS_DATA_IFILE_H_
 
 #include <cstdint>
 
@@ -49,4 +49,4 @@ using IFileUPtr = std::unique_ptr<IFile>;
 }  // namespace client
 }  // namespace dingofs
 
-#endif  // DINGODB_CLIENT_VFS_DATA_IFILE_H_
+#endif  // DINGOFS_SRC_CLIENT_VFS_DATA_IFILE_H_

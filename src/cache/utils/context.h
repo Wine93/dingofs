@@ -88,10 +88,10 @@ struct TraceLogGuard {
 
   // [1920391111] <0.003361> service::put(...): OK (...)
   ~TraceLogGuard() {
-    auto message = absl::StrFormat(
-        "[%s] <%.6lf> %s::%s: %s (%s)", ctx->TraceId(), timer.UElapsed() / 1e6,
-        module_name, func, status.ToString(), timer.ToString());
-    LogTrace(message);
+    // auto message = absl::StrFormat(
+    //     "[%s] <%.6lf> %s::%s: %s (%s)", ctx->TraceId(), timer.UElapsed() /
+    //     1e6, module_name, func, status.ToString(), timer.ToString());
+    // LogTrace(message);
   }
 
   ContextSPtr ctx;

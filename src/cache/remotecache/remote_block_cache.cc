@@ -187,9 +187,9 @@ Status RemoteBlockCacheImpl::Range(ContextSPtr ctx, const BlockKey& key,
 
   Status status;
   StepTimer timer;
-  TraceLogGuard log(ctx, status, timer, kModule, "range(%s,%lld,%zu)",
-                    key.Filename(), offset, length);
-  StepTimerGuard guard(timer);
+  // TraceLogGuard log(ctx, status, timer, kModule, "range(%s,%lld,%zu)",
+  //                   key.Filename(), offset, length);
+  // StepTimerGuard guard(timer);
 
   SCOPE_EXIT {
     if (ctx->GetCacheHit()) {
@@ -204,10 +204,10 @@ Status RemoteBlockCacheImpl::Range(ContextSPtr ctx, const BlockKey& key,
   }
 
   NEXT_STEP("memcache");
-  Block block;
+  Block* block;
   status = memcache_->Get(key, &block);
   if (status.ok()) {
-    block.buffer.AppendTo(buffer, length, offset);
+    block->buffer.AppendTo(buffer, length, offset);
     ctx->SetCacheHit(true);
     return status;
   }
