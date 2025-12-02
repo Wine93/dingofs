@@ -12,20 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+add_subdirectory(echo)
 
-file(GLOB TEST_DINGOFS_MDS_COMMON_SRCS
-  "*.cc"
-)
 
-add_library(test_mds_common
-  ${TEST_DINGOFS_MDS_COMMON_SRCS}
-)
-
-target_link_libraries(test_mds_common
-  PROTO_OBJS
-
-  mds_common
-
-  protobuf::libprotobuf
-  ${TEST_DEPS_WITHOUT_MAIN}
-)
+#file(GLOB TEST_DINGOFS_MDS_COMMON_SRCS
+#  "*.cc"
+#)
+#
+#add_library(test_mds_common
+#  ${TEST_DINGOFS_MDS_COMMON_SRCS}
+#)
+#
+#target_link_libraries(test_mds_common
+#  PROTO_OBJS
+#
+#  mds_common
+#
+#  protobuf::libprotobuf
+#  ${TEST_DEPS_WITHOUT_MAIN}
+#)

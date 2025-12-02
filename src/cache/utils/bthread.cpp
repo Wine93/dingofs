@@ -44,7 +44,7 @@ bthread_t RunInBthread(std::function<void()> func) {
   int rc = bthread_start_background(  // It costs about 100~200 ns
       &tid, &attr,
       [](void* arg) -> void* {
-        FuncArg* func_arg = reinterpret_cast<FuncArg*>(arg);
+        FuncArg* func_arg = static_cast<FuncArg*>(arg);
         func_arg->func();
 
         delete func_arg;
