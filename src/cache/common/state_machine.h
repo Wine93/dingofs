@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef DINGOFS_SRC_CACHE_UTILS_STATE_MACHINE_H_
-#define DINGOFS_SRC_CACHE_UTILS_STATE_MACHINE_H_
+#ifndef DINGOFS_SRC_CACHE_COMMON_STATE_MACHINE_H_
+#define DINGOFS_SRC_CACHE_COMMON_STATE_MACHINE_H_
 
 #include <glog/logging.h>
 
@@ -100,4 +100,4 @@ using StateMachineUPtr = std::unique_ptr<StateMachine>;
 }  // namespace cache
 }  // namespace dingofs
 
-#endif  // DINGOFS_SRC_CACHE_UTILS_STATE_MACHINE_H_
+#endif  // DINGOFS_SRC_CACHE_COMMON_STATE_MACHINE_H_
