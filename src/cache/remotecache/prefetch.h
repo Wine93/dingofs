@@ -53,72 +53,52 @@ class LRUCache {
 using LRUCacheUPtr = std::unique_ptr<LRUCache>;
 
 // block will be sliced into multiple segments, each segment is 128KB
-struct Segment {
-  //
-};
-
-// struct Slice {
-//   bthread::Mutex mutex;
-//   bthread::ConditionVariable conv;
-// };
-
-struct BlockStat {};
-
-class BlockBitMap {
+class BlockStat {
  public:
-  explicit BlockBitMap(size_t segment_num);
-
-  void Set(int segment_index, bool exist);
-
-  void ToHash(butil::FlatMap<uint32_t, bool>* hash);
+  BlockStat() = default;
 
   bool Contain(int segment_index);
-
-  // void
 
  private:
   static constexpr size_t kSegmentNum = 32;  // 4MB/128KB
 
-  std::atomic<bool> status_[32];
+  std::atomic<bool> st_[kSegmentNum];  // status: true iff exist
 };
 
-using BlockBitMapSPtr = std::shared_ptr<BlockBitMap>;
+using BlockStatSPtr = std::shared_ptr<BlockStat>;
 
-// fsid_ino_sliceid_blockindex_version
-class BlocksBitMap {
+class BlockMap {
  public:
-  virtual ~BlocksBitMap() = default;
-
   using BlockStatSPtr = std::shared_ptr<BlockStat>;
-  // virtual
 
-  virtual BlockBitMapSPtr GetBlockBitMap(const BlockKey& key);
+  BlockMap() = default;
+  virtual ~BlockMap() = default;
+
+  virtual BlockStatSPtr GetBlockStat(const BlockKey& key);
 
  private:
-  BlockStatSPtr GetOrCreate();
-
   static constexpr size_t kBlockNum = 16;  // 64MB/4MB
 
+  BlockStatSPtr GetOrCreate();
+
   bthread::RWLock rwlock_;
-  //  hash by block index
-  // key: slice_id, value: block stat
-  butil::FlatMap<uint64_t, BlockStat> blocks_[kBlockNum];
+  butil::FlatMap<uint64_t, BlockStat> blocks_[kBlockNum];  // key: slice_id
 };
 
-using BlockBitMapUPtr = std::unique_ptr<BlockBitMap>;
+using BlockMapUPtr = std::unique_ptr<BlockMap>;
 
-class SharedBlockMap : public BlockBitMap {
+class SharedBlockMap : public BlockMap {
  public:
   SharedBlockMap() = default;
 
-  BlockBitMapSPtr Get(const BlockKey& key) override {
-    shard_[key.id % kShardNum].Set(key);
+  BlockStatSPtr GetBlockStat(const BlockKey& key) override {
+    return shard_[key.id % kShardNum].GetBlockStat(key);
   }
 
  private:
   static constexpr size_t kShardNum = 16;
 
-  BlockBitMap shard_[kShardNum];  // hash by slice id
+  BlockMap shard_[kShardNum];  // hash by slice id
 };
 
 class PrefetchClosure : public Closure {
