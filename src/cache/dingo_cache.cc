@@ -22,6 +22,8 @@
 
 #include "cache/dingo_cache.h"
 
+#include <brpc/server.h>
+
 #include <iostream>
 
 #include "cache/cachegroup/cache_group_node_server.h"
@@ -82,6 +84,8 @@ void DingoCache::GlobalInitOrDie() {
 }
 
 int DingoCache::StartServer() {
+  brpc::StartDummyServerAt(FLAGS_listen_port + 10000);
+
   CacheGroupNodeServerImpl server;
   auto status = server.Start();
   if (!status.ok()) {
