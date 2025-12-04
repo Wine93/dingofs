@@ -33,10 +33,13 @@
 #include <sys/types.h>
 
 #include <atomic>
+#include <cstddef>
 
 #include "cache/blockcache/cache_store.h"
 #include "cache/blockcache/lru_cache.h"
+#include "cache/remotecache/remote_cache_node.h"
 #include "cache/storage/closure.h"
+#include "cache/storage/storage.h"
 #include "common/io_buffer.h"
 #include "common/status.h"
 
@@ -51,18 +54,41 @@ class LRUCache {
 };
 
 using LRUCacheUPtr = std::unique_ptr<LRUCache>;
+using LRUCacheSPtr = std::shared_ptr<LRUCache>;
 
 // block will be sliced into multiple segments, each segment is 128KB
 class BlockStat {
  public:
   BlockStat() = default;
 
-  bool Contain(int segment_index);
+  bool SegmentPrefetching(int index) {
+    return st_[index % kSegmentNum].load(std::memory_order_relaxed) == 1;
+  }
+
+  bool SegmentExists(int index) {
+    return st_[index % kSegmentNum].load(std::memory_order_relaxed) == 2;
+  }
+
+  void SetSegmentPrefetching(int index) {
+    // TODO
+  }
+
+  void SetSegmentExist(int index) {
+    // TODO
+  }
+
+  void RemoveSegment() {
+    //
+  }
 
  private:
   static constexpr size_t kSegmentNum = 32;  // 4MB/128KB
 
-  std::atomic<bool> st_[kSegmentNum];  // status: true iff exist
+  // status:
+  //   0: not exist
+  //   1: prefecting
+  //   2: cached
+  std::atomic<uint8_t> st_[kSegmentNum]{};
 };
 
 using BlockStatSPtr = std::shared_ptr<BlockStat>;
@@ -74,15 +100,17 @@ class BlockMap {
   BlockMap() = default;
   virtual ~BlockMap() = default;
 
-  virtual BlockStatSPtr GetBlockStat(const BlockKey& key);
+  virtual BlockStatSPtr GetBlockStat(const BlockKey& key) {
+    return GetOrCreateBlockStat(key);
+  }
 
  private:
   static constexpr size_t kBlockNum = 16;  // 64MB/4MB
 
-  BlockStatSPtr GetOrCreate();
+  BlockStatSPtr GetOrCreateBlockStat(const BlockKey& key);
 
   bthread::RWLock rwlock_;
-  butil::FlatMap<uint64_t, BlockStat> blocks_[kBlockNum];  // key: slice_id
+  butil::FlatMap<uint64_t, BlockStatSPtr> blocks_[kBlockNum];  // key: slice_id
 };
 
 using BlockMapUPtr = std::unique_ptr<BlockMap>;
@@ -101,31 +129,32 @@ class SharedBlockMap : public BlockMap {
   BlockMap shard_[kShardNum];  // hash by slice id
 };
 
-class PrefetchClosure : public Closure {
- public:
-  //
-};
-
-class PrefetchBatcher {
- public:
-  void Add(Closure*);
-
- private:
-};
-
 class BlockPrefetcher {
  public:
+  struct Task {
+    BlockKey key;
+    off_t offset;
+    size_t length;
+    int segment_index;
+    BlockStatSPtr stat;
+    Closure* done;
+  };
+
   BlockPrefetcher();
 
-  Status Start();
+  void Start();
+  void Shutdown();
 
-  void Submit(const BlockKey& key, off_t offset);
+  void Submit(const std::vector<Task>& tasks);
 
  private:
-  static int HandleTask(void* meta,
-                        bthread::TaskIterator<PrefetchBatcher*>& iter);
+  static int HandleTasks(void* meta,
+                         bthread::TaskIterator<std::vector<Task>*>& iter);
+  void HandleTask(const Task& task);
 
-  bthread::ExecutionQueue<PrefetchBatcher*> queue_id_;
+  LRUCacheSPtr cache_;
+  RemoteCacheNodeSPtr remote_node_;
+  bthread::ExecutionQueue<std::vector<Task>*> queue_id_;
 };
 
 using BlockPrefetcherUPtr = std::unique_ptr<BlockPrefetcher>;
@@ -133,17 +162,55 @@ using BlockPrefetcherUPtr = std::unique_ptr<BlockPrefetcher>;
 // It will trigger prefetch
 class CacheRetriever {
  public:
+  CacheRetriever();
+
+  // 这里需要做一个 batch 操作，对同一个 key 的做合并
   Status Range(const BlockKey& key, off_t offset, size_t length,
                size_t total_length, IOBuffer* buffer);
 
  private:
   off_t SegmentIndex(off_t offset) { return offset / kSegmentSize; }
 
-  Status RetrieveMemory();
-  Status RetrieveRemote();
-
-  BlockPrefetcherUPtr prefetcher_;
+  BlockMapUPtr block_map_;
   LRUCacheUPtr cache_;
+  BlockPrefetcherUPtr prefetcher_;
+  StorageSPtr storage_;
+};
+
+class SegmentHandler {
+ public:
+  virtual ~SegmentHandler() = default;
+
+  virtual Status Execute() = 0;
+  virtual Status Retry() = 0;
+};
+
+class CacheHandler : public SegmentHandler {
+ public:
+  CacheHandler(LRUCache* cache);
+
+  Status Execute() override;
+  Status Retry() override;
+
+ private:
+  off_t offset_;
+  size_t length_;
+  IOBuffer* buffer_;
+  LRUCache* cache_;
+  StorageUPtr storage_;
+};
+
+class PrefetchHandler : public SegmentHandler {
+ public:
+  Status Execute() override;
+  Status Retry() override;
+
+ private:
+  off_t offset_;
+  size_t length_;
+  IOBuffer* buffer_;
+  BlockPrefetcher::Task* task;
+  StorageUPtr storage_;
 };
 
 }  // namespace cache

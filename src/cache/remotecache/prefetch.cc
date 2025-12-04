@@ -22,128 +22,164 @@
 
 #include "cache/remotecache/prefetch.h"
 
+#include <bthread/execution_queue.h>
+#include <bthread/execution_queue_inl.h>
 #include <glog/logging.h>
 
 #include <atomic>
 #include <cstdio>
+#include <memory>
 
 #include "cache/blockcache/cache_store.h"
 #include "cache/remotecache/prefetcher.h"
+#include "common/status.h"
 
 namespace dingofs {
 namespace cache {
 
-void BlockBitMap::Set(uint64_t segment_index, bool exist) {
-  auto& s = status_[segment_index];
-  s.compare_exchange_strong(!exist, exist, std::memory_order_relaxed);
-}
-
-BlockStatSPtr BlockBitMap::GetOrCreate(const BlockKey& key) {
+BlockStatSPtr BlockMap::GetOrCreateBlockStat(const BlockKey& key) {
   uint64_t slice_id = key.id;
   uint64_t block_index = key.index;
-  auto& map = blocks_[block_index % kBlockNum];
-  //
+  auto& m = blocks_[block_index % kBlockNum];
+
   {
     bthread::RWLockRdGuard guard(rwlock_);
-    auto* block_map = map.seek(slice_id);
-    if (block_map != nullptr) {
-      return *block_map;
+    auto* stat = m.seek(slice_id);
+    if (stat != nullptr) {
+      return *stat;
     }
   }
 
-  {
-    bthread::RWLockWrGuard guard(rwlock_);
-    auto* block_map = map.seek(slice_id);
-    if (block_map != nullptr) {
-      return *block_map;
-    }
-
-    BlockStatSPtr stat = std::make_shared<BlockStat>();
-    map.insert(slice_id, stat);
-
-    return stat;
+  bthread::RWLockWrGuard guard(rwlock_);
+  auto* stat = m.seek(slice_id);
+  if (stat != nullptr) {
+    return *stat;
   }
+
+  return *m.insert(slice_id, std::make_shared<BlockStat>());
 }
 
-Status BlockPrefetcher::Start() {
+void BlockPrefetcher::Start() {
   bthread::ExecutionQueueOptions options;
   options.use_pthread = true;
 
-  CHECK_EQ(0, bthread::execution_queue_start(&queue_id_, &options, HandleTask,
-                                             this));
-
-  return Status::OK();
+  // auto rc =
+  //     bthread::execution_queue_start(&queue_id_, &options, HandleTask, this);
+  // CHECK_EQ(rc, 0);
 }
 
-int BlockPrefetcher::HandleTask(void* meta,
-                                bthread::TaskIterator<PrefetchBatcher*>& iter) {
+void BlockPrefetcher::Shutdown() {
+  // bthread::execution_queue_stop(queue_id_);
+  // bthread::execution_queue_join(queue_id_);
+}
+
+int BlockPrefetcher::HandleTasks(
+    void* meta, bthread::TaskIterator<std::vector<Task>*>& iter) {
   if (iter.is_queue_stopped()) {
     return 0;
   }
 
   auto* self = static_cast<BlockPrefetcher*>(meta);
   for (; iter; iter++) {
-    auto* task = *iter;
-    //
+    auto* tasks = *iter;
+    for (const auto& task : *tasks) {
+      self->HandleTask(task);
+    }
   }
 
   return 0;
 }
 
+void BlockPrefetcher::HandleTask(const Task& task) {
+  auto segment_index = task.segment_index;
+  if (task.stat->SegmentExists(segment_index)) {
+  } else if (task.stat->SegmentPrefetching(segment_index)) {
+  }
+
+  //
+}
+
+CacheRetriever::CacheRetriever()
+    : block_map_(std::make_unique<SharedBlockMap>()),
+      prefetcher_(std::make_unique<BlockPrefetcher>()) {}
+
+// NOTE: must gurantee takes less 50us per 128KB request
 Status CacheRetriever::Range(const BlockKey& key, off_t offset, size_t length,
                              size_t total_length, IOBuffer* buffer) {
   CHECK_GT(total_length, 0);
 
-  //
-  uint64_t slice_id = key.id;
-  uint64_t block_index = key.index;
-
-  const auto& bmap = GetBlockBitMap(key);
-
-  butil::FlatMap<uint32_t, bool> hash;
-  bmap->ToHash(&hash);
-
-  size_t size = hash.size();
-  for (int i = 0; i < size; ++i) {
-    //
-  }
-
-  std::vector<off_t> caching;
-  std::vector<off_t> batch_prefetch;
+  const auto& stat = block_map_->GetBlockStat(key);
 
   auto lindex = SegmentIndex(offset);
   auto rindex = SegmentIndex(offset + length);
   auto tindex = SegmentIndex(offset + total_length);
+
+  std::vector<off_t> caching;
+  std::vector<BlockPrefetcher::Task*> to_prefetch;
+  std::vector<SegmentHandler> handlers;
+
   for (off_t index = lindex; index <= tindex; ++index) {
-    // 如果不存在，就触发预取
+    bool exist = stat->SegmentExists(index);
+    bool prefetching = stat->SegmentPrefetching(index);
+    bool care = (index <= rindex);
 
-    // 如果是存在的，就加入缓存列表
-
-    if (!bmap->Contain(index)) {
-      TriggerPrefetch(key, offset, length, total_length);
-    } else {
+    if (exist) {
+      if (care) {
+        caching.push_back(index);
+        VLOG(3) << "Pick cache segment (" << index << ")";
+      }
+      continue;
     }
-    //
+
+    auto* task = new BlockPrefetcher::Task();
+    task->key = key;
+    task->segment_index = index;
+    to_prefetch.emplace_back(task);
+
+    // not exist
   }
 
-  // auto
+  // Submit prefetch task
+  prefetcher_->Submit(to_prefetch);
+
+  for (auto& handler : handlers) {
+    auto status = handler.Execute();
+    if (!status.ok()) {
+      status = handler.Retry();
+    }
+  }
 
   //
 
   return Status::OK();
 }
 
-Status CacheRetriever::RetrieveMemory() {
-  //
+Status CacheHandler::Execute() {
+  // 从 lrucache 里拿一下
+  return Status::OK();
 }
 
-Status CacheRetriever::RetrieveRemote() {
+Status CacheHandler::Retry() {
   //
+  return Status::OK();
 }
 
-Status CacheRetriever::TriggerPrefetch(const BlockKey& key, off_t offset,
-                                       size_t length, size_t total_length) {
-  //
+Status PrefetchHandler::Execute() {
+  CHECK_NOTNULL(task->done);
+
+  // 在这里 wait
+  // task->done->wait();
+  // 一旦这个 prefetch 任务完成，先放进 lrucache，再将 buffer 回调给所有 waiter
+  // 防止一旦 buffer 加进去就被淘汰了
+
+  return Status::OK();
+}
+
+Status PrefetchHandler::Retry() {
+  // 这里再去 retry 下 storage
+  storage_->Range(key, )
+
+      return Status::OK();
 }
 
 // BlockPrefetcher::BlockPrefetcher() {}
