@@ -27,6 +27,7 @@ target_link_libraries(cache_storage
 
     cache_utils
     cache_common
+    client_memory
 )
 
 # now we support 3fs usrbio only for ubuntu

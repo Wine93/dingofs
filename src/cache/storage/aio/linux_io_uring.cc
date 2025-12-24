@@ -138,9 +138,14 @@ void LinuxIOUring::PrepWrite(io_uring_sqe* sqe, Aio* aio) {
 }
 
 void LinuxIOUring::PrepRead(io_uring_sqe* sqe, Aio* aio) {
-  char* data = (char*)butil::AlignedAlloc(aio->length, 4096);
-  aio->buffer->AppendUserData(data, aio->length, butil::AlignedFree);
-  io_uring_prep_read(sqe, aio->fd, data, aio->length, aio->offset);
+  // char* data = (char*)butil::AlignedAlloc(aio->length, 4096);
+  // aio->buffer->AppendUserData(data, aio->length, butil::AlignedFree);
+  CHECK_GE(aio->fixed_buffer_index, 0);
+  io_uring_prep_read_fixed(sqe, aio->fd, aio->buffer->Fetch1(), aio->length,
+                           aio->offset, aio->fixed_buffer_index);
+
+  // auto* data = aio->buffer->Fetch1();
+  // io_uring_prep_read(sqe, aio->fd, data, aio->length, aio->offset);
 }
 
 Status LinuxIOUring::PrepareIO(Aio* aio) {

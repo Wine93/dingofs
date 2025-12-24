@@ -58,11 +58,12 @@ LocalFileSystem::LocalFileSystem(CheckStatusFunc check_status_func)
       running_(false),
       buffer_pool_(std::make_shared<BufferPool>(FLAGS_ioring_iodepth * kBlkSize,
                                                 Helper::GetIOAlignedBlockSize(),
-                                                kBlkSize)),
-      io_ring_(std::make_shared<LinuxIOUring>(FLAGS_ioring_iodepth,
-                                              buffer_pool_->RawBuffer())),
-      aio_queue_(std::make_unique<AioQueueImpl>(io_ring_)),
-      page_cache_manager_(std::make_unique<PageCacheManager>()) {}
+                                                kBlkSize)) {
+  io_ring_ = std::make_shared<LinuxIOUring>(FLAGS_ioring_iodepth,
+                                            buffer_pool_->RawBuffer());
+  aio_queue_ = std::make_unique<AioQueueImpl>(io_ring_);
+  page_cache_manager_ = std::make_unique<PageCacheManager>();
+}
 
 Status LocalFileSystem::Start() {
   CHECK_NOTNULL(buffer_pool_);
@@ -93,6 +94,10 @@ Status LocalFileSystem::Start() {
     LOG(ERROR) << "Start page cache manager failed: " << status.ToString();
     return status;
   }
+
+  // for (int i = 0; i < 32; i++) {
+  //   block_pool_[i].Init(4 * kMiB, 128);
+  // }
 
   running_ = true;
 
@@ -217,6 +222,12 @@ Status LocalFileSystem::WriteFile(ContextSPtr ctx, const std::string& path,
     }
   }
 
+  if (Helper::IsAligned(buffer)) {
+    LOG(INFO) << "<<< buffer is aligned.";
+  } else {
+    LOG(INFO) << "<<< buffer is not aligned.";
+  }
+
   NEXT_STEP("memcpy");
   IOBuffer wbuf;  // write buffer
   if (option.direct_io) {
@@ -309,7 +320,22 @@ Status LocalFileSystem::AioWrite(ContextSPtr ctx, int fd, IOBuffer* buffer,
 Status LocalFileSystem::AioRead(ContextSPtr ctx, int fd, off_t offset,
                                 size_t length, IOBuffer* buffer,
                                 ReadOption /*option*/) {
-  auto aio = Aio(ctx, fd, offset, length, buffer, true);
+  // char* data = (char*)butil::AlignedAlloc(length, 4096);
+  // buffer->AppendUserData(data, length, butil::AlignedFree);
+  //  std::memset(data, 0, length);
+
+  // char* data = block_pool_[ctx->slice_id_ % 32].Allocate();
+  // buffer->AppendUserData(data, length, [this, ctx](void* ptr) {
+  //   block_pool_[ctx->slice_id_ % 32].DeAllocate((char*)ptr);
+  // });
+
+  char* data = buffer_pool_->Alloc();
+  buffer->AppendUserData(
+      data, length, [this, ctx](void* ptr) { buffer_pool_->Free((char*)ptr); });
+
+  auto aio =
+      Aio(ctx, fd, offset, length, buffer, true, buffer_pool_->Index(data));
+
   aio_queue_->Submit(&aio);
   aio.Wait();
 

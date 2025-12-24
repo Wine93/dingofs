@@ -37,6 +37,8 @@
 namespace dingofs {
 namespace cache {
 
+DECLARE_bool(log_trace);
+
 class Context {
  public:
   Context() : trace_id_(NewTraceId()) {}
@@ -56,6 +58,9 @@ class Context {
 
   void SetCacheHit(bool cache_hit) { cache_hit_ = cache_hit; }
   bool GetCacheHit() const { return cache_hit_; }
+
+ public:
+  uint64_t slice_id_;
 
  private:
   std::string NewTraceId() {
@@ -88,10 +93,13 @@ struct TraceLogGuard {
 
   // [1920391111] <0.003361> service::put(...): OK (...)
   ~TraceLogGuard() {
-    auto message = absl::StrFormat(
-        "[%s] <%.6lf> %s::%s: %s (%s)", ctx->TraceId(), timer.UElapsed() / 1e6,
-        module_name, func, status.ToString(), timer.ToString());
-    LogTrace(message);
+    if (FLAGS_log_trace) {
+      auto message =
+          absl::StrFormat("[%s] <%.6lf> %s::%s: %s (%s)", ctx->TraceId(),
+                          timer.UElapsed() / 1e6, module_name, func,
+                          status.ToString(), timer.ToString());
+      LogTrace(message);
+    }
   }
 
   ContextSPtr ctx;
@@ -102,6 +110,9 @@ struct TraceLogGuard {
 };
 
 #define NEXT_STEP(step_name) timer.NextStep(step_name);
+//#define NEXT_STEP(step_name) \
+//  do {                       \
+//  } while (0);
 
 }  // namespace cache
 }  // namespace dingofs

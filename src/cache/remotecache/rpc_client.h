@@ -26,6 +26,7 @@
 #include <brpc/channel.h>
 #include <butil/iobuf.h>
 #include <fmt/format.h>
+#include <gflags/gflags_declare.h>
 
 #include "cache/blockcache/block_cache.h"
 #include "cache/blockcache/cache_store.h"
@@ -34,6 +35,8 @@
 
 namespace dingofs {
 namespace cache {
+
+DECLARE_int32(connection_per_node);
 
 class RPCClient {
  public:
@@ -82,6 +85,8 @@ class RPCClient {
   const std::string server_ip_;
   const uint32_t server_port_;
   std::unique_ptr<brpc::Channel> channel_;
+  brpc::Channel channels_[128];
+  std::atomic<int> next_id_{0};
 };
 
 using RPCClientUPtr = std::unique_ptr<RPCClient>;

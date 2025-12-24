@@ -26,6 +26,7 @@
 #include <sys/types.h>
 
 #include <cstddef>
+#include <memory>
 #include <string>
 
 #include "cache/storage/aio/aio.h"
@@ -33,6 +34,8 @@
 #include "cache/storage/filesystem.h"
 #include "cache/storage/page_cache_manager.h"
 #include "cache/utils/buffer_pool.h"
+#include "client/memory/memory_pool.h"
+#include "client/memory/page_allocator.h"
 
 namespace dingofs {
 namespace cache {

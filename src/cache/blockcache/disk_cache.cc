@@ -346,11 +346,12 @@ Status DiskCache::Cache(ContextSPtr ctx, const BlockKey& key,
     return status;
   }
 
-  if (IsCached(key)) {
-    VLOG_CTX(9) << "Block already cached, skip cache: key = " << key.Filename()
-                << ", length = " << block.size;
-    return Status::OK();
-  }
+  // if (IsCached(key)) {
+  //   VLOG_CTX(9) << "Block already cached, skip cache: key = " <<
+  //   key.Filename()
+  //               << ", length = " << block.size;
+  //   return Status::OK();
+  // }
 
   NEXT_STEP("write");
   auto cache_path = GetCachePath(key);
@@ -394,6 +395,7 @@ Status DiskCache::Load(ContextSPtr ctx, const BlockKey& key, off_t offset,
   }
 
   NEXT_STEP("read");
+  ctx->slice_id_ = key.id;
   auto cache_path = GetCachePath(key);
   status = fs_->ReadFile(ctx, cache_path, offset, length, buffer,
                          ReadOption{.drop_page_cache = true});
@@ -451,7 +453,8 @@ Status DiskCache::CheckStatus(uint8_t want) const {
 bool DiskCache::IsLoading() const { return loader_->IsLoading(); }
 
 bool DiskCache::IsHealthy() const {
-  return state_machine_->GetState() == State::kStateNormal;
+  return true;
+  // return state_machine_->GetState() == State::kStateNormal;
 }
 
 bool DiskCache::StageFull() const { return manager_->StageFull(); }

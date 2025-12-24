@@ -35,15 +35,15 @@ DataBuffer::~DataBuffer() {
 
 IOBuffer* DataBuffer::RawIOBuffer() { return io_buffer_; }
 
-std::vector<IOVec> DataBuffer::GatherIOVecs() const {
-  std::vector<IOVec> iovecs;
+std::vector<iovec> DataBuffer::GatherIOVecs() const {
+  std::vector<iovec> iovecs;
 
   const butil::IOBuf& iobuf = io_buffer_->IOBuf();
   auto tmp_iovecs = io_buffer_->Fetch();
 
   iovecs.reserve(tmp_iovecs.size());
   for (const auto& iov : tmp_iovecs) {
-    iovecs.emplace_back(IOVec{(char*)iov.iov_base, iov.iov_len});
+    iovecs.emplace_back(iovec{(char*)iov.iov_base, iov.iov_len});
   }
 
   return iovecs;

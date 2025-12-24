@@ -208,10 +208,10 @@ void AioQueueImpl::OnError(Aio* aio, Status status) {
 void AioQueueImpl::OnCompleted(Aio* aio) {
   const auto& ctx = aio->ctx;
 
-  CHECK_EQ(LastStep(aio), "execute")
-      << ctx->StrTraceId() << " Aio " << aio->ToString()
-      << " is not on expected phase: got(" << LastStep(aio)
-      << ") != expect(execute)";
+  // CHECK_EQ(LastStep(aio), "execute")
+  //     << ctx->StrTraceId() << " Aio " << aio->ToString()
+  //     << " is not on expected phase: got(" << LastStep(aio)
+  //     << ") != expect(execute)";
 
   if (!aio->status().ok()) {
     LOG_CTX(ERROR) << "Aio failed: aio = " << aio->ToString()

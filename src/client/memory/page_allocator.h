@@ -23,6 +23,8 @@
 #ifndef DINGOFS_SRC_CLIENT_MEMORY_PAGE_ALLOCATOR_H_
 #define DINGOFS_SRC_CLIENT_MEMORY_PAGE_ALLOCATOR_H_
 
+#include <bthread/condition_variable.h>
+#include <bthread/mutex.h>
 #include <sys/types.h>
 
 #include <condition_variable>
@@ -105,8 +107,9 @@ class PagePool : public PageAllocator {
  private:
   std::unique_ptr<PageAllocatorMetric> metric_;
   // TODO: use multi-slots or thread local to reduce mutex overhead
-  std::mutex mutex_;
-  std::condition_variable can_allocate_;
+  // std::mutex mutex_;
+  bthread::Mutex mutex_;
+  bthread::ConditionVariable can_allocate_;
   uint64_t total_pages_;
   uint64_t num_free_pages_;
   uint64_t page_size_;

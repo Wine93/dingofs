@@ -22,6 +22,7 @@
 
 #include "client/memory/page_allocator.h"
 
+#include <bthread/mutex.h>
 #include <fmt/format.h>
 
 #include <cassert>
@@ -102,7 +103,7 @@ bool PagePool::Init(uint64_t page_size, uint64_t num_pages) {
 }
 
 char* PagePool::Allocate() {
-  std::unique_lock<std::mutex> lk(mutex_);
+  std::unique_lock<bthread::Mutex> lk(mutex_);
   while (num_free_pages_ == 0) {
     can_allocate_.wait(lk);
   }
@@ -115,7 +116,7 @@ char* PagePool::Allocate() {
 }
 
 void PagePool::DeAllocate(char* page) {
-  std::unique_lock<std::mutex> lk(mutex_);
+  std::unique_lock<bthread::Mutex> lk(mutex_);
   mem_pool_->DeAllocate(reinterpret_cast<void*>(page));
   num_free_pages_++;
   metric_->used_bytes << -1 * page_size_;
@@ -123,12 +124,12 @@ void PagePool::DeAllocate(char* page) {
 }
 
 uint64_t PagePool::GetFreePages() {
-  std::unique_lock<std::mutex> lk(mutex_);
+  std::unique_lock<bthread::Mutex> lk(mutex_);
   return num_free_pages_;
 }
 
 PageAllocatorStat PagePool::GetStat() {
-  std::unique_lock<std::mutex> lk(mutex_);
+  std::unique_lock<bthread::Mutex> lk(mutex_);
   return PageAllocatorStat{.total_pages = total_pages_,
                            .free_pages = num_free_pages_,
                            .page_size = page_size_};

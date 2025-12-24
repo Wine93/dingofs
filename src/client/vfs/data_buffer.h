@@ -17,6 +17,7 @@
 #ifndef DINGOFS_CLIENT_VFS_DATA_BUFFER_H_
 #define DINGOFS_CLIENT_VFS_DATA_BUFFER_H_
 
+#include <bits/types/struct_iovec.h>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -43,7 +44,7 @@ class DataBuffer {
   IOBuffer* RawIOBuffer();
 
   // NOTE: DataBuffer must remain alive while using the returned iovecs
-  std::vector<IOVec> GatherIOVecs() const;
+  std::vector<iovec> GatherIOVecs() const;
 
   std::string Describe() const;
 

@@ -30,6 +30,8 @@
 namespace dingofs {
 namespace cache {
 
+DEFINE_bool(log_trace, true, "");
+
 BufferPool::BufferPool(size_t size, size_t alignment, size_t blksize)
     : blksize_(blksize) {
   CHECK_EQ(size % blksize, 0)

@@ -57,7 +57,7 @@ Status CacheGroupNodeServerImpl::Start() {
   // Start brpc server
   auto listen_ip = FLAGS_listen_ip;
   auto listen_port = FLAGS_listen_port;
-  auto status = StartRpcServer(listen_ip, listen_port);
+  auto status = StartRpcServer("0.0.0.0", listen_port);
   if (!status.ok()) {
     LOG(ERROR) << "Start cache group node server on addresss (" << listen_ip
                << ":" << listen_port << ") failed: " << status.ToString();
@@ -127,6 +127,7 @@ Status CacheGroupNodeServerImpl::StartRpcServer(const std::string& listen_ip,
   }
 
   brpc::ServerOptions options;
+  options.ignore_eovercrowded = true;
   rc = server_->Start(ep, &options);
   if (rc != 0) {
     LOG(ERROR) << "Start brpc server failed: rc = " << rc;

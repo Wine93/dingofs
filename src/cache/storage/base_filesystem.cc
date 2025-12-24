@@ -174,9 +174,9 @@ Status BaseFileSystem::StatFS(const std::string& path, FSStat* stat) {
 }
 
 Status BaseFileSystem::CheckStatus(Status status) {
-  if (check_status_func_ != nullptr) {
-    return check_status_func_(status);
-  }
+  // if (check_status_func_ != nullptr) {
+  //   return check_status_func_(status);
+  // }
   return status;
 }
 

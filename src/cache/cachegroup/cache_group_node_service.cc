@@ -24,6 +24,7 @@
 
 #include <brpc/closure_guard.h>
 #include <brpc/controller.h>
+#include <butil/memory/aligned_memory.h>
 
 #include "cache/blockcache/block_cache.h"
 #include "cache/blockcache/cache_store.h"
@@ -31,9 +32,12 @@
 #include "cache/common/const.h"
 #include "cache/utils/context.h"
 #include "cache/utils/step_timer.h"
+#include "common/status.h"
 
 namespace dingofs {
 namespace cache {
+
+DEFINE_bool(use_memory_fs, false, "");
 
 CacheGroupNodeServiceImpl::CacheGroupNodeServiceImpl(CacheGroupNodeSPtr node)
     : node_(CHECK_NOTNULL(node)) {}
@@ -62,6 +66,12 @@ DEFINE_RPC_METHOD(CacheGroupNodeServiceImpl, Put) {
   response->set_status(PBErr(status));
 }
 
+static char* AllocMemory() {
+  auto* buffer = (char*)butil::AlignedAlloc(4 * kMiB, 4 * kMiB);
+  memset(buffer, 0, 4 * kMiB);
+  return buffer;
+}
+
 DEFINE_RPC_METHOD(CacheGroupNodeServiceImpl, Range) {
   Status status;
   StepTimer timer;
@@ -74,14 +84,28 @@ DEFINE_RPC_METHOD(CacheGroupNodeServiceImpl, Range) {
   timer.Start();
 
   NEXT_STEP("node_range");
+
   IOBuffer buffer;
-  status = node_->Range(
-      ctx, BlockKey(request->block_key()), request->offset(), request->length(),
-      &buffer,
-      RangeOption{.retrive = true, .block_size = request->block_size()});
+
+  if (FLAGS_use_memory_fs) {
+     static char data[4 * kMiB];
+    //char* data = AllocMemory();
+    //buffer.AppendUserData(data, request->length(),
+    //                      [](void* ptr) { butil::AlignedFree(ptr); });
+
+    buffer.AppendUserData(data, request->length(),
+                          [](void* ptr) {});
+    status = Status::OK();
+  } else {
+    status = node_->Range(
+        ctx, BlockKey(request->block_key()), request->offset(),
+        request->length(), &buffer,
+        RangeOption{.retrive = true, .block_size = request->block_size()});
+  }
 
   if (status.ok()) {
-    cntl->response_attachment().append(buffer.IOBuf());
+    // cntl->response_attachment().append(buffer.IOBuf());
+    cntl->response_attachment() = buffer.IOBuf();
   }
   response->set_status(PBErr(status));
   response->set_cache_hit(ctx->GetCacheHit());

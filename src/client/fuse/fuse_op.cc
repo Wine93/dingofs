@@ -71,6 +71,11 @@ void InitFuseConnInfo(struct fuse_conn_info* conn) {
     fuse_unset_feature_flag(conn, FUSE_CAP_AUTO_INVAL_DATA);
     LOG(INFO) << "[disabled] FUSE_CAP_AUTO_INVAL_DATA";
   }
+ 
+  //conn->max_readahead = 16777216;
+  //conn->max_readahead = 33554432;
+  conn->max_readahead = 134217728;
+  conn->max_background = 128;
 }
 
 void Attr2Stat(const Attr& attr, struct stat* stat) {
@@ -216,26 +221,48 @@ static void ReplyData(fuse_req_t req,
     return;
   }
 
-  size_t fuse_bufvec_count = iovecs.size();
-  size_t fuse_bufvec_size = sizeof(struct fuse_bufvec) +
-                            ((fuse_bufvec_count - 1) * sizeof(struct fuse_buf));
+  //
+  //  virtual (4k) 虚拟 -> page (4k) 物理
 
-  auto tmp_fuse_bufvec = std::unique_ptr<fuse_bufvec, decltype(&std::free)>(
-      static_cast<fuse_bufvec*>(std::malloc(fuse_bufvec_size)), &std::free);
-  std::memset(tmp_fuse_bufvec.get(), 0, fuse_bufvec_size);
-
-  tmp_fuse_bufvec->count = fuse_bufvec_count;
-  tmp_fuse_bufvec->idx = 0;
-  tmp_fuse_bufvec->off = 0;
-  for (size_t i = 0; i < fuse_bufvec_count; i++) {
-    tmp_fuse_bufvec->buf[i].mem = iovecs[i].iov_base;
-    tmp_fuse_bufvec->buf[i].size = iovecs[i].iov_len;
-  }
-
-  int ret = fuse_reply_data(req, tmp_fuse_bufvec.get(), FUSE_BUF_SPLICE_MOVE);
+  //
+  // vfs -> fuse
+  // brpc
+  // 
+  //
+  // socketfd -> buffer pool [1,2,3,4]       -> fuse -> app
+  // socketfd -> brpc (< 8K * 512) -> client -> fuse -> app
+  //
+  //
+  // 3FS: RDMA: buffer pool (对齐) vmsplice + splice
+  //
+  // 
+  // 8K: 512 个
+  
+  int ret = fuse_reply_iov(req, iovecs.data(), iovecs.size());
   if (ret != 0) {
     LOG(ERROR) << fmt::format("[fuse] fuse_reply_data fail, ret({}).", errno);
   }
+
+  //size_t fuse_bufvec_count = iovecs.size();
+  //size_t fuse_bufvec_size = sizeof(struct fuse_bufvec) +
+  //                          ((fuse_bufvec_count - 1) * sizeof(struct fuse_buf));
+
+  //auto tmp_fuse_bufvec = std::unique_ptr<fuse_bufvec, decltype(&std::free)>(
+  //    static_cast<fuse_bufvec*>(std::malloc(fuse_bufvec_size)), &std::free);
+  //std::memset(tmp_fuse_bufvec.get(), 0, fuse_bufvec_size);
+
+  //tmp_fuse_bufvec->count = fuse_bufvec_count;
+  //tmp_fuse_bufvec->idx = 0;
+  //tmp_fuse_bufvec->off = 0;
+  //for (size_t i = 0; i < fuse_bufvec_count; i++) {
+  //  tmp_fuse_bufvec->buf[i].mem = iovecs[i].iov_base;
+  //  tmp_fuse_bufvec->buf[i].size = iovecs[i].iov_len;
+  //}
+
+   //int ret = fuse_reply_data(req, tmp_fuse_bufvec.get(), FUSE_BUF_NO_SPLICE);
+  //if (ret != 0) {
+  //  LOG(ERROR) << fmt::format("[fuse] fuse_reply_data fail, ret({}).", errno);
+  //}
 }
 
 static void ReplyWrite(fuse_req_t req, size_t size) {

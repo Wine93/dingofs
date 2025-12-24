@@ -23,6 +23,7 @@
 #include "cache/remotecache/remote_cache_node_impl.h"
 
 #include <absl/strings/str_format.h>
+#include <bthread/bthread.h>
 #include <butil/iobuf.h>
 #include <butil/logging.h>
 #include <gflags/gflags.h>
@@ -32,6 +33,7 @@
 #include <memory>
 
 #include "cache/blockcache/block_cache.h"
+#include "cache/common/const.h"
 #include "cache/common/macro.h"
 #include "cache/common/state_machine.h"
 #include "cache/common/state_machine_impl.h"
@@ -46,11 +48,12 @@ namespace dingofs {
 namespace cache {
 
 DEFINE_bool(subrequest_ranges, true,
-            "whether split range request into subrequests");
+            "Whether split range request into subrequests");
 DEFINE_validator(subrequest_ranges, brpc::PassValidate);
 
-DEFINE_uint32(subrequest_range_size, 1048576, "range size for each subrequest");
+DEFINE_uint32(subrequest_range_size, 1048576, "Range size for each subrequest");
 DEFINE_validator(subrequest_range_size, brpc::PassValidate);
+
 
 RemoteCacheNodeImpl::RemoteCacheNodeImpl(const CacheGroupMember& member)
     : running_(false),
@@ -142,12 +145,15 @@ Status RemoteCacheNodeImpl::Range(ContextSPtr ctx, const BlockKey& key,
   if (!status.ok()) {
     return status;
   }
+  
+   
+  
 
-  if (FLAGS_subrequest_ranges) {
-    status = SubrequestRanges(ctx, key, offset, length, buffer, option);
-  } else {
-    status = rpc_->Range(ctx, key, offset, length, buffer, option);
-  }
+  // if (FLAGS_subrequest_ranges) {
+  //   status = SubrequestRanges(ctx, key, offset, length, buffer, option);
+  // } else {
+  status = rpc_->Range(ctx, key, offset, length, buffer, option);
+  //}
   if (!status.ok()) {
     GENERIC_LOG_RANGE_ERROR("remote cache node");
   }
@@ -244,21 +250,23 @@ Status RemoteCacheNodeImpl::SubrequestRanges(ContextSPtr ctx,
 }
 
 Status RemoteCacheNodeImpl::CheckHealth(ContextSPtr ctx) const {
-  if (state_machine_->GetState() != State::kStateNormal) {
-    LOG_EVERY_SECOND_CTX(WARNING) << "Remote cache node is unhealthy: state = "
-                                  << StateToString(state_machine_->GetState())
-                                  << ", member = " << member_.ToString();
-    return Status::CacheUnhealthy("remote cache node is unhealthy");
-  }
+  // if (state_machine_->GetState() != State::kStateNormal) {
+  //   LOG_EVERY_SECOND_CTX(WARNING) << "Remote cache node is unhealthy: state =
+  //   "
+  //                                 <<
+  //                                 StateToString(state_machine_->GetState())
+  //                                 << ", member = " << member_.ToString();
+  //   return Status::CacheUnhealthy("remote cache node is unhealthy");
+  // }
   return Status::OK();
 }
 
 Status RemoteCacheNodeImpl::CheckStatus(Status status) {
-  if (status.ok() || status.IsNotFound()) {
-    state_machine_->Success();
-  } else {
-    state_machine_->Error();
-  }
+  // if (status.ok() || status.IsNotFound()) {
+  //   state_machine_->Success();
+  // } else {
+  //   state_machine_->Error();
+  // }
   return status;
 }
 

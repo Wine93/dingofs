@@ -16,6 +16,7 @@
 
 #include "client/vfs/vfs_impl.h"
 
+#include <bthread/bthread.h>
 #include <fcntl.h>
 
 #include <cstdint>
@@ -348,6 +349,7 @@ Status VFSImpl::Write(ContextSPtr ctx, Ino ino, const char* buf, uint64_t size,
     VLOG(1) << "trigger flush because low memory, page stat: "
             << stat.ToString();
     vfs_hub_->GetHandleManager()->TriggerFlushAll();
+    bthread_usleep(1000 * 1000);
   }
 
   s = handle->file->Write(ctx, buf, size, offset, out_wsize);

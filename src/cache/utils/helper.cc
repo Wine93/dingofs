@@ -198,10 +198,18 @@ bool Helper::IsAligned(const IOBuffer& buffer) {
   auto aligned_block_size = GetIOAlignedBlockSize();
   const auto& iovec = buffer.Fetch();
   for (const auto& vec : iovec) {
+    LOG(INFO) << "<<< address = "
+              << reinterpret_cast<std::uintptr_t>(vec.iov_base)
+              << ", size = " << vec.iov_len;
+
     if (!IsAligned(reinterpret_cast<std::uintptr_t>(vec.iov_base),
                    aligned_block_size)) {
+      LOG(INFO) << "<<< address = "
+                << reinterpret_cast<std::uintptr_t>(vec.iov_base) %
+                       aligned_block_size;
       return false;
     } else if (!IsAligned(vec.iov_len, aligned_block_size)) {
+      LOG(INFO) << "<<< size = " << vec.iov_len;
       return false;
     }
   }

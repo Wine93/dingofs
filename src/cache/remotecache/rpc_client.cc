@@ -33,6 +33,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <string>
 
 #include "cache/blockcache/block_cache.h"
 #include "cache/common/type.h"
@@ -71,6 +72,11 @@ DEFINE_uint32(cache_rpc_max_timeout_ms, 60000,
               "maximum timeout for rpc request in milliseconds");
 DEFINE_validator(cache_rpc_max_timeout_ms, brpc::PassValidate);
 
+DEFINE_int32(connection_per_node, 8, "");
+
+DEFINE_bool(use_mock_rpc, false, "");
+DEFINE_int32(mock_rpc_sleep_ms, 2000, "");
+
 static const std::string kModule = "rpc";
 
 RPCClient::RPCClient(const std::string& server_ip, uint32_t server_port)
@@ -107,6 +113,17 @@ Status RPCClient::Range(ContextSPtr ctx, const BlockKey& key, off_t offset,
                     option.is_subrequest ? "subrange" : "range", key.Filename(),
                     offset, length);
   StepTimerGuard guard(timer);
+
+  if (FLAGS_use_mock_rpc) {
+    if (FLAGS_mock_rpc_sleep_ms > 0) {
+      bthread_usleep(FLAGS_mock_rpc_sleep_ms * 1000);
+    }
+
+    static char data[4 * 1024 * 1024];
+    buffer->AppendUserData(data, length, [](void*) {});
+    status = Status::OK();
+    return status;
+  }
 
   pb::cache::RangeRequest request;
   pb::cache::RangeResponse response;
@@ -173,12 +190,22 @@ Status RPCClient::InitChannel(const std::string& server_ip,
 
   brpc::ChannelOptions options;
   options.connect_timeout_ms = FLAGS_cache_rpc_connect_timeout_ms;
-  options.connection_group = "common";
-  rc = channel_->Init(ep, &options);
-  if (rc != 0) {
-    LOG(ERROR) << "Init channel for " << server_ip << ":" << server_port
-               << " failed: rc = " << rc;
-    return Status::Internal("init channel failed");
+  // options.connection_group = "common";
+  // rc = channel_->Init(ep, &options);
+  // if (rc != 0) {
+  //   LOG(ERROR) << "Init channel for " << server_ip << ":" << server_port
+  //              << " failed: rc = " << rc;
+  //   return Status::Internal("init channel failed");
+  // }
+
+  for (int i = 0; i < FLAGS_connection_per_node; i++) {
+    options.connection_group = "common" + std::to_string(i);
+    rc = channels_[i].Init(ep, &options);
+    if (rc != 0) {
+      LOG(ERROR) << "Init channel for " << server_ip << ":" << server_port
+                 << " failed: rc = " << rc;
+      return Status::Internal("init channel failed");
+    }
   }
 
   LOG(INFO) << "Create channel for address (" << server_ip << ":" << server_port
@@ -190,7 +217,9 @@ Status RPCClient::InitChannel(const std::string& server_ip,
 
 brpc::Channel* RPCClient::GetChannel() {
   ReadLockGuard lock(rwlock_);
-  return inited_ ? channel_.get() : nullptr;
+  // return inited_ ? channel_.get() : nullptr;
+  auto next_id = next_id_.fetch_add(1) % FLAGS_connection_per_node;
+  return inited_ ? &channels_[next_id] : nullptr;
 }
 
 Status RPCClient::ResetChannel() {
@@ -266,8 +295,11 @@ Status RPCClient::SendRequest(ContextSPtr ctx, const std::string& api_name,
     LOG(FATAL) << "Unknown api name: " << api_name;
   }
 
-  auto connection_type = (api_name == "Range") ? brpc::CONNECTION_TYPE_POOLED
-                                               : brpc::CONNECTION_TYPE_SINGLE;
+  // auto connection_type = (api_name == "Range") ? brpc::CONNECTION_TYPE_POOLED
+  //                                              :
+  //                                              brpc::CONNECTION_TYPE_SINGLE;
+
+  auto connection_type = brpc::CONNECTION_TYPE_SINGLE;
 
   butil::Timer timer;
   timer.start();
