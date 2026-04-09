@@ -36,7 +36,7 @@ class DingoFSConnectorAdapter(ConnectorAdapter):
             A DingoFSConnector instance.
         """
         # Local import to avoid circular dependencies and allow lazy loading
-        from .connector import DingoFSConnector
+        from .client import DingoFSConnectorClient
 
         logger.info(f"Creating DingoFS connector for URL: {context.url}")
 
@@ -69,8 +69,7 @@ class DingoFSConnectorAdapter(ConnectorAdapter):
             "exists_cache_capacity": exists_cache_capacity,
         }
 
-        return DingoFSConnector(
+        return DingoFSConnectorClient(
             config=config,
             loop=context.loop,
-            local_cpu_backend=context.local_cpu_backend,
         )

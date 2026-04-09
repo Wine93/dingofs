@@ -19,7 +19,7 @@ try:
     from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 
     LMCACHE_AVAILABLE = True
-except ImportError:
+except (ImportError, SyntaxError):
     LMCACHE_AVAILABLE = False
 
 

@@ -1,44 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""DingoFS L2 Adapter configuration for LMCache MP mode.
+"""DingoFS L2 Adapter for LMCache MP mode.
 
-Provides factory function to create a NativeConnectorL2Adapter
-backed by the DingoFS CacheEngine.
+The pybind11-bound DingoFSConnector exposes event_fd(),
+submit_batch_get/set/exists(), drain_completions(), and close()
+— exactly the interface NativeConnectorL2Adapter expects.
 """
-
-from .native_engine import NativeCacheEngine
-
-
-class DingoFSNativeClient:
-    """Wrapper that adapts NativeCacheEngine to the interface
-    expected by NativeConnectorL2Adapter."""
-
-    def __init__(self, config: dict):
-        self._engine = NativeCacheEngine(config=config)
-
-    def event_fd(self) -> int:
-        return self._engine.event_fd()
-
-    def submit_batch_get(self, keys, memoryviews):
-        bufs = [memoryview(mv) for mv in memoryviews]
-        return self._engine.batch_get_submit(keys, bufs)
-
-    def submit_batch_set(self, keys, memoryviews):
-        bufs = [memoryview(mv) for mv in memoryviews]
-        return self._engine.batch_set_submit(keys, bufs)
-
-    def submit_batch_exists(self, keys):
-        return self._engine.batch_exists_submit(keys)
-
-    def drain_completions(self):
-        return self._engine.drain_raw()
-
-    def close(self):
-        self._engine.close()
 
 
 def create_dingofs_l2_adapter(config: dict):
-    """Factory function for creating a DingoFS L2 Adapter.
+    """Factory function for DingoFS L2 Adapter (MP mode).
 
     Usage in LMCache config:
         l2_config:
@@ -54,8 +25,23 @@ def create_dingofs_l2_adapter(config: dict):
         )
     except ImportError:
         raise ImportError(
-            "NativeConnectorL2Adapter requires LMCache >= 0.4.0 with MP mode support"
+            "NativeConnectorL2Adapter requires LMCache >= 0.5.0 "
+            "with MP mode support"
         )
 
-    client = DingoFSNativeClient(config)
-    return NativeConnectorL2Adapter(client)
+    from _native import DingoFSConnector
+
+    cache_dir = config["cache_dir"]
+    fs_id = int(config.get("fs_id", 1))
+    ino = int(config.get("ino", 1))
+    cache_size_mb = int(config.get("cache_size_mb", 102400))
+    exists_cache_capacity = int(
+        config.get("exists_cache_capacity", 100000)
+    )
+    num_workers = int(config.get("num_workers", 4))
+
+    connector = DingoFSConnector(
+        cache_dir, fs_id, ino, cache_size_mb,
+        exists_cache_capacity, num_workers,
+    )
+    return NativeConnectorL2Adapter(connector)

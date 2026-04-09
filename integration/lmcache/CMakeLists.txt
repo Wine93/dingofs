@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(dingofs_connector C CXX)
+project(dingofs_connector CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,50 +11,85 @@ set(DINGOFS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." CACHE PATH
 set(DINGOFS_BUILD_DIR "${DINGOFS_ROOT}/build" CACHE PATH
     "DingoFS build directory")
 
-# Main shared library
-add_library(dingofs_connector SHARED
-    src/cache_engine/cache_engine.cpp
-    src/cache_engine/cache_engine_capi.cpp
+# LMCache source root (for ConnectorBase headers)
+set(LMCACHE_ROOT "/home/wine93/workspace/LMCache" CACHE PATH
+    "LMCache source root directory")
+set(LMCACHE_CSRC_DIR "${LMCACHE_ROOT}/csrc/storage_backends")
+
+# Third-party install paths (bRPC, protobuf, abseil, etc.)
+set(THIRD_PARTY_INSTALL_PATH "$ENV{HOME}/.local/dingo-eureka" CACHE PATH
+    "Third-party libraries install path")
+set(DINGOSDK_INSTALL_PATH "$ENV{HOME}/.local/dingo-sdk" CACHE PATH
+    "DingoSDK install path")
+
+find_package(pybind11 REQUIRED)
+
+# pybind11 module
+pybind11_add_module(_native
+    src/connector/dingofs_connector.cpp
+    src/connector/pybind.cpp
 )
 
-target_include_directories(dingofs_connector PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/cache_engine>
-    $<INSTALL_INTERFACE:include>
-)
-
-target_include_directories(dingofs_connector PRIVATE
+target_include_directories(_native PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/connector
     ${DINGOFS_ROOT}/src
     ${DINGOFS_BUILD_DIR}/protos
+    ${LMCACHE_CSRC_DIR}
+    ${THIRD_PARTY_INSTALL_PATH}/include
+    ${DINGOSDK_INSTALL_PATH}/include
 )
 
-target_compile_options(dingofs_connector PRIVATE -O3 -Wall -Wextra)
+target_compile_options(_native PRIVATE -O3 -Wall -Wno-sign-compare -Wno-deprecated-declarations)
 
-# Link DingoFS cache libraries
-target_link_libraries(dingofs_connector PRIVATE
-    cache_tiercache
-    cache_blockcache
-    cache_remotecache
-    cache_common
-    cache_iutil
-    common
-    dingofs_executor
+# Library search paths
+target_link_directories(_native PRIVATE
+    ${DINGOFS_BUILD_DIR}/src/cache/tiercache
+    ${DINGOFS_BUILD_DIR}/src/cache/blockcache
+    ${DINGOFS_BUILD_DIR}/src/cache/remotecache
+    ${DINGOFS_BUILD_DIR}/src/cache/common
+    ${DINGOFS_BUILD_DIR}/src/cache/iutil
+    ${DINGOFS_BUILD_DIR}/src/cache/cachegroup
+    ${DINGOFS_BUILD_DIR}/src/common
+    ${DINGOFS_BUILD_DIR}/src/utils/executor
+    ${THIRD_PARTY_INSTALL_PATH}/lib
+    ${DINGOSDK_INSTALL_PATH}/lib
+)
+
+# Collect all DingoFS static libraries
+file(GLOB_RECURSE DINGOFS_LIBS "${DINGOFS_BUILD_DIR}/src/*.a")
+file(GLOB ABSL_LIBS "${THIRD_PARTY_INSTALL_PATH}/lib/libabsl_*.a")
+
+# Link everything with --start-group to resolve circular dependencies
+target_link_libraries(_native PRIVATE
+    -Wl,--start-group
+    ${DINGOFS_LIBS}
+    brpc
+    protobuf
+    gflags
+    glog
+    leveldb
+    jsoncpp
+    fmt
+    uring
+    utf8_range
+    utf8_validity
+    ${ABSL_LIBS}
+    ssl
+    crypto
+    -Wl,--end-group
     pthread
-)
-
-set_target_properties(dingofs_connector PROPERTIES
-    OUTPUT_NAME "dingofs_connector"
+    dl
+    z
+    uuid_static
+    resolv
 )
 
 # Install
-install(TARGETS dingofs_connector
-    LIBRARY DESTINATION dingofs_connector
-    ARCHIVE DESTINATION dingofs_connector
-)
-install(FILES src/cache_engine/cache_engine_capi.h DESTINATION include)
+install(TARGETS _native DESTINATION dingofs_connector)
 
 # Tests
 option(BUILD_TESTS "Build C++ tests" OFF)
 if(BUILD_TESTS)
     enable_testing()
-    add_subdirectory(tests/cache_engine)
+    add_subdirectory(tests/connector)
 endif()

@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#ifndef DINGOFS_INTEGRATION_LMCACHE_NOOP_BLOCK_ACCESSER_H_
-#define DINGOFS_INTEGRATION_LMCACHE_NOOP_BLOCK_ACCESSER_H_
+#pragma once
 
 #include "common/blockaccess/block_accesser.h"
 
 namespace dingofs {
+namespace connector {
 
 // NoopBlockAccesser satisfies StorageClient's constructor requirement.
 // In KVCache scenarios we only use Cache()/Range()/IsCached() which
@@ -62,6 +62,5 @@ class NoopBlockAccesser : public blockaccess::BlockAccesser {
   }
 };
 
+}  // namespace connector
 }  // namespace dingofs
-
-#endif  // DINGOFS_INTEGRATION_LMCACHE_NOOP_BLOCK_ACCESSER_H_
