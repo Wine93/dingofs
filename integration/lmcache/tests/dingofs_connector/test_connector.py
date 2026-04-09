@@ -85,15 +85,12 @@ class TestDingoFSConnectorIntegration:
     def _create_connector(self, tmp_dir, async_loop, local_cpu_backend):
         """Helper to create a DingoFSConnector instance."""
         from dingofs_connector.connector import DingoFSConnector
-        from dingofs_connector.native_engine import SYNC_ALWAYS
 
+        config = {"cache_dir": tmp_dir}
         return DingoFSConnector(
-            base_path=tmp_dir,
+            config=config,
             loop=async_loop,
             local_cpu_backend=local_cpu_backend,
-            num_workers=4,
-            use_odirect=False,
-            sync_mode=SYNC_ALWAYS,
         )
 
     def _create_memory_obj(self, connector, local_cpu_backend, key_id=0):
@@ -124,7 +121,7 @@ class TestDingoFSConnectorIntegration:
         """Create connector and verify basic attributes."""
         connector = self._create_connector(tmp_dir, async_loop, local_cpu_backend)
         try:
-            assert connector.base_path == tmp_dir
+            assert connector.config["cache_dir"] == tmp_dir
             assert connector.loop is async_loop
             assert connector.local_cpu_backend is local_cpu_backend
         finally:
@@ -162,12 +159,12 @@ class TestDingoFSConnectorIntegration:
     def test_get_nonexistent_key(
         self, tmp_dir, async_loop, local_cpu_backend
     ):
-        """GET on non-existent key should raise RuntimeError."""
+        """GET on non-existent key should return None."""
         connector = self._create_connector(tmp_dir, async_loop, local_cpu_backend)
         try:
             key = create_test_key(999)
-            with pytest.raises(Exception):
-                self._run(connector.get(key), async_loop)
+            result = self._run(connector.get(key), async_loop)
+            assert result is None
         finally:
             self._close_connector(connector, async_loop)
 

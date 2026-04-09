@@ -12,49 +12,38 @@ from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 
 # Local
-from .native_engine import SYNC_ALWAYS, NativeIOEngine
+from .native_engine import NativeCacheEngine
 
 logger = init_logger(__name__)
 
 
 class DingoFSConnector(RemoteConnector):
-    """High-performance DingoFS connector using a native C++ I/O engine.
+    """High-performance DingoFS connector using a native C++ cache engine.
 
     Stores KV cache chunks as files on a DingoFS mount point. Uses a
     multi-threaded C++ backend with eventfd-based async completion for
     maximum throughput on DingoFS's large-block, high-concurrency I/O path.
 
     Args:
-        base_path: DingoFS mount point / directory for cache files.
+        config: Configuration dict for the cache engine (cache_dir, fs_id,
+            ino, cache_size_mb, exists_cache_capacity).
         loop: Asyncio event loop.
         local_cpu_backend: Memory allocator interface.
-        num_workers: Number of I/O worker threads.
-        use_odirect: Whether to use O_DIRECT for file I/O.
-        sync_mode: Controls fdatasync behavior (SYNC_NONE or SYNC_ALWAYS).
     """
 
     def __init__(
         self,
-        base_path: str,
+        config: dict,
         loop: asyncio.AbstractEventLoop,
         local_cpu_backend: LocalCPUBackend,
-        num_workers: int = 8,
-        use_odirect: bool = False,
-        sync_mode: int = SYNC_ALWAYS,
     ) -> None:
         super().__init__(local_cpu_backend.config, local_cpu_backend.metadata)
 
-        self.base_path = base_path
+        self.config = config
         self.loop = loop
         self.local_cpu_backend = local_cpu_backend
 
-        self._engine = NativeIOEngine(
-            base_path=base_path,
-            num_workers=num_workers,
-            use_odirect=use_odirect,
-            sync_mode=sync_mode,
-            loop=loop,
-        )
+        self._engine = NativeCacheEngine(config=config, loop=loop)
 
     @staticmethod
     def _as_memoryview(buf) -> memoryview:
@@ -86,7 +75,13 @@ class DingoFSConnector(RemoteConnector):
             logger.warning("Failed to allocate memory during DingoFS get")
             return None
 
-        await self._engine.get(key_str, self._as_memoryview(memory_obj.byte_array))
+        try:
+            await self._engine.get(
+                key_str, self._as_memoryview(memory_obj.byte_array)
+            )
+        except Exception:
+            logger.warning("Failed to get key %s from DingoFS", key_str)
+            return None
         return memory_obj
 
     # ------------------------------------------------------------------
@@ -131,7 +126,13 @@ class DingoFSConnector(RemoteConnector):
             [self.meta_fmt] * len(keys),
         )
         bufs = [self._as_memoryview(m.byte_array) for m in memory_objs]
-        await self._engine.batch_get(key_strs, bufs)
+        try:
+            await self._engine.batch_get(key_strs, bufs)
+        except Exception:
+            logger.warning("Failed to batch get from DingoFS")
+            for m in memory_objs:
+                self.local_cpu_backend.free(m)
+            return [None] * len(keys)
         return memory_objs
 
     # ------------------------------------------------------------------

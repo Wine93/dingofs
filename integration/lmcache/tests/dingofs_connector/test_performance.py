@@ -13,7 +13,11 @@ import time
 import pytest
 
 # Local
-from dingofs_connector.native_engine import SYNC_ALWAYS, SYNC_NONE, NativeIOEngine
+from dingofs_connector.native_engine import NativeCacheEngine
+
+
+def _make_config(cache_dir):
+    return {"cache_dir": cache_dir}
 
 
 def _format_throughput(bytes_total: int, elapsed: float) -> str:
@@ -45,7 +49,7 @@ class TestWriteThroughput:
         """Measure write throughput for different chunk sizes."""
         num_workers = 8
         num_chunks = 32
-        client = NativeIOEngine(tmp_dir, num_workers=num_workers)
+        client = NativeCacheEngine(config=_make_config(tmp_dir))
         try:
             # Prepare data
             keys = [f"write_bench_{i}" for i in range(num_chunks)]
@@ -81,7 +85,7 @@ class TestReadThroughput:
         """Measure read throughput for different chunk sizes."""
         num_workers = 8
         num_chunks = 32
-        client = NativeIOEngine(tmp_dir, num_workers=num_workers)
+        client = NativeCacheEngine(config=_make_config(tmp_dir))
         try:
             # Write data first
             keys = [f"read_bench_{i}" for i in range(num_chunks)]
@@ -128,7 +132,7 @@ class TestConcurrencyScaling:
         try:
             chunk_size = 1024 * 1024  # 1 MB
             num_chunks = 32
-            client = NativeIOEngine(tmp_dir, num_workers=num_workers)
+            client = NativeCacheEngine(config=_make_config(tmp_dir))
 
             keys = [f"scale_w_{i}" for i in range(num_chunks)]
             bufs = [bytearray(os.urandom(chunk_size)) for _ in range(num_chunks)]
@@ -156,7 +160,7 @@ class TestConcurrencyScaling:
         try:
             chunk_size = 1024 * 1024  # 1 MB
             num_chunks = 32
-            client = NativeIOEngine(tmp_dir, num_workers=num_workers)
+            client = NativeCacheEngine(config=_make_config(tmp_dir))
 
             keys = [f"scale_r_{i}" for i in range(num_chunks)]
             bufs = [bytearray(os.urandom(chunk_size)) for _ in range(num_chunks)]
@@ -187,7 +191,7 @@ class TestExistsThroughput:
         """Measure EXISTS throughput."""
         num_workers = 8
         num_keys = 100
-        client = NativeIOEngine(tmp_dir, num_workers=num_workers)
+        client = NativeCacheEngine(config=_make_config(tmp_dir))
         try:
             # Write keys
             keys = [f"exists_bench_{i}" for i in range(num_keys)]
@@ -210,99 +214,6 @@ class TestExistsThroughput:
             client.close()
 
 
-class TestSyncModeComparison:
-    """Compare throughput between SYNC_NONE and SYNC_ALWAYS modes."""
-
-    @pytest.mark.parametrize(
-        "sync_mode",
-        [SYNC_NONE, SYNC_ALWAYS],
-        ids=["sync_none", "sync_always"],
-    )
-    @pytest.mark.parametrize(
-        "chunk_size",
-        [256 * 1024, 1024 * 1024, 4 * 1024 * 1024],
-        ids=["256KB", "1MB", "4MB"],
-    )
-    def test_write_sync_mode_comparison(self, chunk_size, sync_mode):
-        """Measure write throughput under different sync modes."""
-        tmp_dir = tempfile.mkdtemp(prefix="dingofs_bench_")
-        client = None
-        try:
-            num_workers = 8
-            num_chunks = 32
-            client = NativeIOEngine(
-                tmp_dir, num_workers=num_workers, sync_mode=sync_mode
-            )
-
-            keys = [f"sync_w_{i}" for i in range(num_chunks)]
-            bufs = [bytearray(os.urandom(chunk_size)) for _ in range(num_chunks)]
-
-            start = time.perf_counter()
-            client.batch_set_sync(keys, [memoryview(b) for b in bufs])
-            elapsed = time.perf_counter() - start
-
-            total_bytes = num_chunks * chunk_size
-            throughput = _format_throughput(total_bytes, elapsed)
-            mode_name = "SYNC_NONE" if sync_mode == SYNC_NONE else "SYNC_ALWAYS"
-            print(
-                f"\n  WRITE {_format_size(chunk_size)} x {num_chunks}, "
-                f"sync_mode={mode_name}: {throughput} ({elapsed:.3f}s)"
-            )
-        finally:
-            if client is not None:
-                client.close()
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    @pytest.mark.parametrize(
-        "sync_mode",
-        [SYNC_NONE, SYNC_ALWAYS],
-        ids=["sync_none", "sync_always"],
-    )
-    @pytest.mark.parametrize(
-        "chunk_size",
-        [256 * 1024, 1024 * 1024, 4 * 1024 * 1024],
-        ids=["256KB", "1MB", "4MB"],
-    )
-    def test_read_sync_mode_comparison(self, chunk_size, sync_mode):
-        """Measure read throughput under different sync modes."""
-        tmp_dir = tempfile.mkdtemp(prefix="dingofs_bench_")
-        client = None
-        try:
-            num_workers = 8
-            num_chunks = 32
-            client = NativeIOEngine(
-                tmp_dir, num_workers=num_workers, sync_mode=sync_mode
-            )
-
-            # Write data first
-            keys = [f"sync_r_{i}" for i in range(num_chunks)]
-            bufs = [bytearray(os.urandom(chunk_size)) for _ in range(num_chunks)]
-            client.batch_set_sync(keys, [memoryview(b) for b in bufs])
-
-            # Prepare read buffers
-            read_bufs = [bytearray(chunk_size) for _ in range(num_chunks)]
-
-            start = time.perf_counter()
-            client.batch_get_sync(keys, [memoryview(b) for b in read_bufs])
-            elapsed = time.perf_counter() - start
-
-            total_bytes = num_chunks * chunk_size
-            throughput = _format_throughput(total_bytes, elapsed)
-            mode_name = "SYNC_NONE" if sync_mode == SYNC_NONE else "SYNC_ALWAYS"
-            print(
-                f"\n  READ {_format_size(chunk_size)} x {num_chunks}, "
-                f"sync_mode={mode_name}: {throughput} ({elapsed:.3f}s)"
-            )
-
-            # Verify data integrity
-            for i in range(num_chunks):
-                assert bufs[i] == read_bufs[i], f"Data mismatch at chunk {i}"
-        finally:
-            if client is not None:
-                client.close()
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-
-
 class TestEndToEndBenchmark:
     """End-to-end benchmarks simulating real KV cache workloads."""
 
@@ -315,7 +226,7 @@ class TestEndToEndBenchmark:
             num_workers = 8
             num_rounds = 5
             num_chunks = 32
-            client = NativeIOEngine(tmp_dir, num_workers=num_workers)
+            client = NativeCacheEngine(config=_make_config(tmp_dir))
 
             round_throughputs = []
             for r in range(num_rounds):
@@ -351,7 +262,7 @@ class TestEndToEndBenchmark:
             num_workers = 8
             num_rounds = 5
             num_chunks = 32
-            client = NativeIOEngine(tmp_dir, num_workers=num_workers)
+            client = NativeCacheEngine(config=_make_config(tmp_dir))
 
             # Store data
             keys = [f"retrieve_{i}" for i in range(num_chunks)]
@@ -396,7 +307,7 @@ class TestEndToEndBenchmark:
             num_rounds = 5
             num_base_keys = 20
             num_new_per_round = 10
-            client = NativeIOEngine(tmp_dir, num_workers=num_workers)
+            client = NativeCacheEngine(config=_make_config(tmp_dir))
 
             # Write base keys
             base_keys = [f"mixed_base_{i}" for i in range(num_base_keys)]

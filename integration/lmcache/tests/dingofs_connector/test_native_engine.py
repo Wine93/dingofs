@@ -8,15 +8,19 @@ import os
 import pytest
 
 # Local
-from dingofs_connector.native_engine import SYNC_NONE, NativeIOEngine
+from dingofs_connector.native_engine import NativeCacheEngine
+
+
+def _make_config(tmp_dir):
+    return {"cache_dir": tmp_dir}
 
 
 class TestNativeClientSync:
-    """Synchronous tests for NativeIOEngine (native C++ I/O engine)."""
+    """Synchronous tests for NativeCacheEngine (native C++ cache engine)."""
 
     def test_create_and_close(self, tmp_dir):
         """Test basic lifecycle."""
-        client = NativeIOEngine(tmp_dir, num_workers=2)
+        client = NativeCacheEngine(config=_make_config(tmp_dir))
         try:
             assert client.event_fd() >= 0
         finally:
@@ -24,7 +28,7 @@ class TestNativeClientSync:
 
     def test_single_set_get(self, tmp_dir):
         """Test single key SET + GET round-trip."""
-        client = NativeIOEngine(tmp_dir, num_workers=2)
+        client = NativeCacheEngine(config=_make_config(tmp_dir))
         try:
             data = bytearray(b"hello dingofs!" * 100)
             buf = memoryview(data)
@@ -43,7 +47,7 @@ class TestNativeClientSync:
 
     def test_exists(self, tmp_dir):
         """Test EXISTS for present and absent keys."""
-        client = NativeIOEngine(tmp_dir, num_workers=2)
+        client = NativeCacheEngine(config=_make_config(tmp_dir))
         try:
             # Non-existent key
             assert client.exists_sync("no_such_key") is False
@@ -59,7 +63,7 @@ class TestNativeClientSync:
 
     def test_batch_operations(self, tmp_dir):
         """Test batch SET + GET + EXISTS."""
-        client = NativeIOEngine(tmp_dir, num_workers=4)
+        client = NativeCacheEngine(config=_make_config(tmp_dir))
         try:
             num_keys = 5
             data_size = 2048
@@ -90,7 +94,7 @@ class TestNativeClientSync:
 
     def test_large_data(self, tmp_dir):
         """Test with 1MB data (typical KV cache chunk size)."""
-        client = NativeIOEngine(tmp_dir, num_workers=4)
+        client = NativeCacheEngine(config=_make_config(tmp_dir))
         try:
             data_size = 1024 * 1024  # 1 MB
             data = bytearray(os.urandom(data_size))
@@ -106,7 +110,7 @@ class TestNativeClientSync:
 
     def test_error_on_get_nonexistent(self, tmp_dir):
         """Test that GET on non-existent key raises an error."""
-        client = NativeIOEngine(tmp_dir, num_workers=2)
+        client = NativeCacheEngine(config=_make_config(tmp_dir))
         try:
             data = bytearray(1024)
             with pytest.raises(RuntimeError, match="not found|No such file"):
@@ -116,7 +120,7 @@ class TestNativeClientSync:
 
     def test_multiple_workers(self, tmp_dir):
         """Test with many workers for concurrency."""
-        client = NativeIOEngine(tmp_dir, num_workers=8)
+        client = NativeCacheEngine(config=_make_config(tmp_dir))
         try:
             num_keys = 20
             data_size = 4096
@@ -137,9 +141,9 @@ class TestNativeClientSync:
     # New functional tests
     # ------------------------------------------------------------------
 
-    def test_sync_mode_none(self, tmp_dir):
-        """Test SET + GET correctness under SYNC_NONE mode."""
-        client = NativeIOEngine(tmp_dir, num_workers=2, sync_mode=SYNC_NONE)
+    def test_default_config(self, tmp_dir):
+        """Test SET + GET correctness with default config."""
+        client = NativeCacheEngine(config=_make_config(tmp_dir))
         try:
             data = bytearray(os.urandom(4096))
             client.set_sync("sync_none_key", memoryview(data))
@@ -153,7 +157,7 @@ class TestNativeClientSync:
 
     def test_data_overwrite(self, tmp_dir):
         """Test that writing the same key twice overwrites correctly."""
-        client = NativeIOEngine(tmp_dir, num_workers=2)
+        client = NativeCacheEngine(config=_make_config(tmp_dir))
         try:
             data_size = 2048
 
@@ -180,14 +184,14 @@ class TestNativeClientSync:
         data = bytearray(os.urandom(data_size))
 
         # Write with first engine
-        client1 = NativeIOEngine(tmp_dir, num_workers=2)
+        client1 = NativeCacheEngine(config=_make_config(tmp_dir))
         try:
             client1.set_sync("persist_key", memoryview(data))
         finally:
             client1.close()
 
         # Read with second engine
-        client2 = NativeIOEngine(tmp_dir, num_workers=2)
+        client2 = NativeCacheEngine(config=_make_config(tmp_dir))
         try:
             assert client2.exists_sync("persist_key") is True
 
@@ -199,7 +203,7 @@ class TestNativeClientSync:
 
     def test_special_key_characters(self, tmp_dir):
         """Test keys with special characters (/, ., -)."""
-        client = NativeIOEngine(tmp_dir, num_workers=2)
+        client = NativeCacheEngine(config=_make_config(tmp_dir))
         try:
             special_keys = [
                 "model/layer_0/chunk_42",
@@ -226,12 +230,12 @@ class TestNativeClientSync:
     def test_concurrent_read_write(self, tmp_dir):
         """Test concurrent read/write using batch operations.
 
-        NativeIOEngine's sync API uses a single eventfd internally, so
+        NativeCacheEngine's sync API uses a single eventfd internally, so
         concurrent calls from multiple threads can deadlock. Instead, we
         test concurrency through the C++ worker pool by issuing large
         batch operations that are tiled across workers.
         """
-        client = NativeIOEngine(tmp_dir, num_workers=8)
+        client = NativeCacheEngine(config=_make_config(tmp_dir))
         try:
             num_keys = 32
             data_size = 4096
@@ -252,7 +256,7 @@ class TestNativeClientSync:
 
     def test_batch_exists_mixed(self, tmp_dir):
         """Test batch EXISTS with mix of existing and non-existing keys."""
-        client = NativeIOEngine(tmp_dir, num_workers=4)
+        client = NativeCacheEngine(config=_make_config(tmp_dir))
         try:
             # Write only even-indexed keys
             data = bytearray(b"x" * 512)
@@ -273,13 +277,13 @@ class TestNativeClientSync:
 
 
 class TestNativeClientAsync:
-    """Async tests for NativeIOEngine (native C++ I/O engine)."""
+    """Async tests for NativeCacheEngine (native C++ I/O engine)."""
 
     @pytest.mark.asyncio
     async def test_async_set_get(self, tmp_dir):
         """Test async SET + GET."""
         loop = asyncio.get_running_loop()
-        client = NativeIOEngine(tmp_dir, num_workers=2, loop=loop)
+        client = NativeCacheEngine(config=_make_config(tmp_dir), loop=loop)
         try:
             data = bytearray(b"async hello!" * 100)
             await client.set("async_key", memoryview(data))
@@ -295,7 +299,7 @@ class TestNativeClientAsync:
     async def test_async_exists(self, tmp_dir):
         """Test async EXISTS."""
         loop = asyncio.get_running_loop()
-        client = NativeIOEngine(tmp_dir, num_workers=2, loop=loop)
+        client = NativeCacheEngine(config=_make_config(tmp_dir), loop=loop)
         try:
             assert await client.exists("no_key") is False
 
@@ -310,7 +314,7 @@ class TestNativeClientAsync:
     async def test_async_batch(self, tmp_dir):
         """Test async batch operations."""
         loop = asyncio.get_running_loop()
-        client = NativeIOEngine(tmp_dir, num_workers=4, loop=loop)
+        client = NativeCacheEngine(config=_make_config(tmp_dir), loop=loop)
         try:
             keys = [f"abatch_{i}" for i in range(5)]
             data_size = 1024
@@ -333,7 +337,7 @@ class TestNativeClientAsync:
     async def test_async_overwrite(self, tmp_dir):
         """Test async key overwrite."""
         loop = asyncio.get_running_loop()
-        client = NativeIOEngine(tmp_dir, num_workers=2, loop=loop)
+        client = NativeCacheEngine(config=_make_config(tmp_dir), loop=loop)
         try:
             data_size = 2048
 
@@ -357,7 +361,7 @@ class TestNativeClientAsync:
     async def test_async_concurrent_mixed_ops(self, tmp_dir):
         """Test concurrent async set/get/exists operations."""
         loop = asyncio.get_running_loop()
-        client = NativeIOEngine(tmp_dir, num_workers=8, loop=loop)
+        client = NativeCacheEngine(config=_make_config(tmp_dir), loop=loop)
         try:
             num_keys = 10
             data_size = 2048

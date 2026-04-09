@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from dingofs_connector.native_engine import NativeIOEngine
+from dingofs_connector.native_engine import NativeCacheEngine
 
-__all__ = ["DingoFSConnector", "NativeIOEngine"]
+# Backward compatibility alias
+NativeIOEngine = NativeCacheEngine
+
+__all__ = ["DingoFSConnector", "NativeCacheEngine"]
 
 
 def __getattr__(name: str):

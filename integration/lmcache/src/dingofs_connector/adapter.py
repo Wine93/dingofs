@@ -6,15 +6,7 @@ from lmcache.v1.storage_backend.connector import ConnectorAdapter, ConnectorCont
 from lmcache.v1.storage_backend.connector import parse_remote_url
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
 
-# Local
-from .native_engine import SYNC_ALWAYS, SYNC_NONE
-
 logger = init_logger(__name__)
-
-_SYNC_MODE_MAP = {
-    "none": SYNC_NONE,
-    "always": SYNC_ALWAYS,
-}
 
 
 class DingoFSConnectorAdapter(ConnectorAdapter):
@@ -25,11 +17,10 @@ class DingoFSConnectorAdapter(ConnectorAdapter):
     - /mount/path is the DingoFS mount point used as the storage directory
 
     Extra config options (via extra_config):
-        dingofs_num_workers (int): Number of I/O worker threads. Default: 8.
-        dingofs_use_odirect (bool): Use O_DIRECT for file I/O. Default: False.
-        dingofs_sync_mode (str): Controls fdatasync behavior.
-            "always" (default): fdatasync after every write.
-            "none": No fdatasync (rely on filesystem guarantees).
+        dingofs_cache_size_mb (int): Cache size in MB. Default: 102400.
+        dingofs_exists_cache_capacity (int): Exists cache capacity.
+            Default: 100000.
+        dingofs_fs_id (int): Filesystem ID. Default: 0.
     """
 
     def __init__(self) -> None:
@@ -59,24 +50,27 @@ class DingoFSConnectorAdapter(ConnectorAdapter):
             )
 
         # Read extra config
-        config = context.config
-        extra = config.extra_config if config and config.extra_config else {}
-        num_workers = int(extra.get("dingofs_num_workers", 8))
-        use_odirect = bool(extra.get("dingofs_use_odirect", False))
+        lmcache_config = context.config
+        extra = (
+            lmcache_config.extra_config
+            if lmcache_config and lmcache_config.extra_config
+            else {}
+        )
+        cache_size_mb = int(extra.get("dingofs_cache_size_mb", 102400))
+        exists_cache_capacity = int(
+            extra.get("dingofs_exists_cache_capacity", 100000)
+        )
+        fs_id = int(extra.get("dingofs_fs_id", 0))
 
-        sync_mode_str = str(extra.get("dingofs_sync_mode", "always")).lower()
-        if sync_mode_str not in _SYNC_MODE_MAP:
-            raise ValueError(
-                f"Invalid dingofs_sync_mode: {sync_mode_str!r}. "
-                f"Must be one of: {list(_SYNC_MODE_MAP.keys())}"
-            )
-        sync_mode = _SYNC_MODE_MAP[sync_mode_str]
+        config = {
+            "cache_dir": base_path,
+            "fs_id": fs_id,
+            "cache_size_mb": cache_size_mb,
+            "exists_cache_capacity": exists_cache_capacity,
+        }
 
         return DingoFSConnector(
-            base_path=base_path,
+            config=config,
             loop=context.loop,
             local_cpu_backend=context.local_cpu_backend,
-            num_workers=num_workers,
-            use_odirect=use_odirect,
-            sync_mode=sync_mode,
         )

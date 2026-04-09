@@ -6,16 +6,13 @@ import asyncio
 import concurrent.futures
 import ctypes
 import ctypes.util
+import json
 import os
 import pathlib
 
-# Sync mode constants (must match io_engine_capi.h)
-SYNC_NONE = 0
-SYNC_ALWAYS = 1
 
-
-# Completion struct matching io_completion_t in io_engine_capi.h
-class _IOCompletion(ctypes.Structure):
+# Completion struct matching cache_completion_t in cache_engine_capi.h
+class _CacheCompletion(ctypes.Structure):
     _fields_ = [
         ("future_id", ctypes.c_uint64),
         ("ok", ctypes.c_int),
@@ -75,25 +72,20 @@ def _load_library() -> ctypes.CDLL:
     lib_path = _find_library()
     lib = ctypes.CDLL(lib_path)
 
-    # io_engine_create
-    lib.io_engine_create.argtypes = [
-        ctypes.c_char_p,
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_int,
-    ]
-    lib.io_engine_create.restype = ctypes.c_void_p
+    # cache_engine_create
+    lib.cache_engine_create.argtypes = [ctypes.c_char_p]
+    lib.cache_engine_create.restype = ctypes.c_void_p
 
-    # io_engine_destroy
-    lib.io_engine_destroy.argtypes = [ctypes.c_void_p]
-    lib.io_engine_destroy.restype = None
+    # cache_engine_destroy
+    lib.cache_engine_destroy.argtypes = [ctypes.c_void_p]
+    lib.cache_engine_destroy.restype = None
 
-    # io_engine_event_fd
-    lib.io_engine_event_fd.argtypes = [ctypes.c_void_p]
-    lib.io_engine_event_fd.restype = ctypes.c_int
+    # cache_engine_event_fd
+    lib.cache_engine_event_fd.argtypes = [ctypes.c_void_p]
+    lib.cache_engine_event_fd.restype = ctypes.c_int
 
-    # io_engine_submit_batch_get
-    lib.io_engine_submit_batch_get.argtypes = [
+    # cache_engine_submit_batch_get
+    lib.cache_engine_submit_batch_get.argtypes = [
         ctypes.c_void_p,
         ctypes.POINTER(ctypes.c_char_p),
         ctypes.POINTER(ctypes.c_void_p),
@@ -101,10 +93,10 @@ def _load_library() -> ctypes.CDLL:
         ctypes.c_size_t,
         ctypes.c_size_t,
     ]
-    lib.io_engine_submit_batch_get.restype = ctypes.c_uint64
+    lib.cache_engine_submit_batch_get.restype = ctypes.c_uint64
 
-    # io_engine_submit_batch_set
-    lib.io_engine_submit_batch_set.argtypes = [
+    # cache_engine_submit_batch_set
+    lib.cache_engine_submit_batch_set.argtypes = [
         ctypes.c_void_p,
         ctypes.POINTER(ctypes.c_char_p),
         ctypes.POINTER(ctypes.c_void_p),
@@ -112,31 +104,31 @@ def _load_library() -> ctypes.CDLL:
         ctypes.c_size_t,
         ctypes.c_size_t,
     ]
-    lib.io_engine_submit_batch_set.restype = ctypes.c_uint64
+    lib.cache_engine_submit_batch_set.restype = ctypes.c_uint64
 
-    # io_engine_submit_batch_exists
-    lib.io_engine_submit_batch_exists.argtypes = [
+    # cache_engine_submit_batch_exists
+    lib.cache_engine_submit_batch_exists.argtypes = [
         ctypes.c_void_p,
         ctypes.POINTER(ctypes.c_char_p),
         ctypes.c_size_t,
     ]
-    lib.io_engine_submit_batch_exists.restype = ctypes.c_uint64
+    lib.cache_engine_submit_batch_exists.restype = ctypes.c_uint64
 
-    # io_engine_drain_completions
-    lib.io_engine_drain_completions.argtypes = [
+    # cache_engine_drain_completions
+    lib.cache_engine_drain_completions.argtypes = [
         ctypes.c_void_p,
-        ctypes.POINTER(_IOCompletion),
+        ctypes.POINTER(_CacheCompletion),
         ctypes.c_size_t,
     ]
-    lib.io_engine_drain_completions.restype = ctypes.c_int
+    lib.cache_engine_drain_completions.restype = ctypes.c_int
 
-    # io_engine_close
-    lib.io_engine_close.argtypes = [ctypes.c_void_p]
-    lib.io_engine_close.restype = None
+    # cache_engine_close
+    lib.cache_engine_close.argtypes = [ctypes.c_void_p]
+    lib.cache_engine_close.restype = None
 
-    # io_engine_last_error
-    lib.io_engine_last_error.argtypes = []
-    lib.io_engine_last_error.restype = ctypes.c_char_p
+    # cache_engine_last_error
+    lib.cache_engine_last_error.argtypes = []
+    lib.cache_engine_last_error.restype = ctypes.c_char_p
 
     return lib
 
@@ -152,17 +144,15 @@ def _get_lib() -> ctypes.CDLL:
     return _lib
 
 
-class NativeIOEngine:
-    """Python wrapper around the DingoFS I/O engine C library.
+class NativeCacheEngine:
+    """Python wrapper around the DingoFS cache engine C library.
 
     Provides both sync and async interfaces with eventfd-based completion
     notification for integrating with Python asyncio event loops.
 
     Args:
-        base_path: Directory where cache files are stored.
-        num_workers: Number of I/O worker threads.
-        use_odirect: Whether to use O_DIRECT for file I/O.
-        sync_mode: Controls fdatasync behavior (SYNC_NONE or SYNC_ALWAYS).
+        config: Configuration dict with keys such as cache_dir, fs_id, ino,
+            cache_size_mb, exists_cache_capacity.
         loop: Asyncio event loop (uses running loop if None).
     """
 
@@ -171,30 +161,23 @@ class NativeIOEngine:
 
     def __init__(
         self,
-        base_path: str,
-        num_workers: int = 8,
-        use_odirect: bool = False,
-        sync_mode: int = SYNC_ALWAYS,
+        config: dict,
         loop: Optional[asyncio.AbstractEventLoop] = None,
     ) -> None:
         self._lib = _get_lib()
 
-        self._handle = self._lib.io_engine_create(
-            base_path.encode("utf-8"),
-            num_workers,
-            1 if use_odirect else 0,
-            sync_mode,
-        )
+        config_json = json.dumps(config).encode("utf-8")
+        self._handle = self._lib.cache_engine_create(config_json)
         if not self._handle:
-            err = self._lib.io_engine_last_error()
+            err = self._lib.cache_engine_last_error()
             msg = err.decode("utf-8") if err else "unknown error"
-            raise RuntimeError(f"Failed to create DingoFS IOEngine: {msg}")
+            raise RuntimeError(f"Failed to create DingoFS CacheEngine: {msg}")
 
-        self._fd = int(self._lib.io_engine_event_fd(self._handle))
+        self._fd = int(self._lib.cache_engine_event_fd(self._handle))
         self._closed = False
 
         # Pre-allocate completion buffer
-        self._comp_buf = (_IOCompletion * self.MAX_DRAIN)()
+        self._comp_buf = (_CacheCompletion * self.MAX_DRAIN)()
 
         # Pending futures: future_id -> (Future, op_type, keepalive_refs)
         self._pending: Dict[
@@ -257,7 +240,7 @@ class NativeIOEngine:
         self,
     ) -> List[Tuple[int, bool, str, Optional[List[bool]]]]:
         """Drain completions from C library. Returns list of tuples."""
-        n = self._lib.io_engine_drain_completions(
+        n = self._lib.cache_engine_drain_completions(
             self._handle, self._comp_buf, self.MAX_DRAIN
         )
         if n <= 0:
@@ -342,6 +325,64 @@ class NativeIOEngine:
         return ptr_arr, len_arr
 
     # ------------------------------------------------------------------
+    # Low-level submit API (returns future_id, no asyncio.Future created)
+    # ------------------------------------------------------------------
+
+    def batch_get_submit(
+        self, keys: List[str], bufs: List[memoryview]
+    ) -> int:
+        """Submit a batch GET and return the future_id."""
+        if len(keys) != len(bufs):
+            raise ValueError("keys and bufs length mismatch")
+        key_arr, encoded = self._build_key_array(keys)
+        ptr_arr, len_arr = self._build_buf_arrays(bufs)
+        chunk_size = len(bufs[0]) if bufs else 0
+
+        fid = self._lib.cache_engine_submit_batch_get(
+            self._handle, key_arr, ptr_arr, len_arr, len(keys), chunk_size
+        )
+        if fid == 0:
+            err = self._lib.cache_engine_last_error()
+            raise RuntimeError(
+                err.decode("utf-8") if err else "submit_batch_get failed"
+            )
+        return fid
+
+    def batch_set_submit(
+        self, keys: List[str], bufs: List[memoryview]
+    ) -> int:
+        """Submit a batch SET and return the future_id."""
+        if len(keys) != len(bufs):
+            raise ValueError("keys and bufs length mismatch")
+        key_arr, encoded = self._build_key_array(keys)
+        ptr_arr, len_arr = self._build_buf_arrays(bufs)
+        chunk_size = len(bufs[0]) if bufs else 0
+
+        fid = self._lib.cache_engine_submit_batch_set(
+            self._handle, key_arr, ptr_arr, len_arr, len(keys), chunk_size
+        )
+        if fid == 0:
+            err = self._lib.cache_engine_last_error()
+            raise RuntimeError(
+                err.decode("utf-8") if err else "submit_batch_set failed"
+            )
+        return fid
+
+    def batch_exists_submit(self, keys: List[str]) -> int:
+        """Submit a batch EXISTS and return the future_id."""
+        key_arr, encoded = self._build_key_array(keys)
+
+        fid = self._lib.cache_engine_submit_batch_exists(
+            self._handle, key_arr, len(keys)
+        )
+        if fid == 0:
+            err = self._lib.cache_engine_last_error()
+            raise RuntimeError(
+                err.decode("utf-8") if err else "submit_batch_exists failed"
+            )
+        return fid
+
+    # ------------------------------------------------------------------
     # Async API
     # ------------------------------------------------------------------
 
@@ -368,11 +409,11 @@ class NativeIOEngine:
         ptr_arr, len_arr = self._build_buf_arrays(bufs)
         chunk_size = len(bufs[0]) if bufs else 0
 
-        fid = self._lib.io_engine_submit_batch_get(
+        fid = self._lib.cache_engine_submit_batch_get(
             self._handle, key_arr, ptr_arr, len_arr, len(keys), chunk_size
         )
         if fid == 0:
-            err = self._lib.io_engine_last_error()
+            err = self._lib.cache_engine_last_error()
             raise RuntimeError(
                 err.decode("utf-8") if err else "submit_batch_get failed"
             )
@@ -392,11 +433,11 @@ class NativeIOEngine:
         ptr_arr, len_arr = self._build_buf_arrays(bufs)
         chunk_size = len(bufs[0]) if bufs else 0
 
-        fid = self._lib.io_engine_submit_batch_set(
+        fid = self._lib.cache_engine_submit_batch_set(
             self._handle, key_arr, ptr_arr, len_arr, len(keys), chunk_size
         )
         if fid == 0:
-            err = self._lib.io_engine_last_error()
+            err = self._lib.cache_engine_last_error()
             raise RuntimeError(
                 err.decode("utf-8") if err else "submit_batch_set failed"
             )
@@ -410,11 +451,11 @@ class NativeIOEngine:
         """Async batch EXISTS."""
         key_arr, encoded = self._build_key_array(keys)
 
-        fid = self._lib.io_engine_submit_batch_exists(
+        fid = self._lib.cache_engine_submit_batch_exists(
             self._handle, key_arr, len(keys)
         )
         if fid == 0:
-            err = self._lib.io_engine_last_error()
+            err = self._lib.cache_engine_last_error()
             raise RuntimeError(
                 err.decode("utf-8") if err else "submit_batch_exists failed"
             )
@@ -451,11 +492,11 @@ class NativeIOEngine:
         ptr_arr, len_arr = self._build_buf_arrays(bufs)
         chunk_size = len(bufs[0]) if bufs else 0
 
-        fid = self._lib.io_engine_submit_batch_get(
+        fid = self._lib.cache_engine_submit_batch_get(
             self._handle, key_arr, ptr_arr, len_arr, len(keys), chunk_size
         )
         if fid == 0:
-            err = self._lib.io_engine_last_error()
+            err = self._lib.cache_engine_last_error()
             raise RuntimeError(
                 err.decode("utf-8") if err else "submit_batch_get failed"
             )
@@ -472,11 +513,11 @@ class NativeIOEngine:
         ptr_arr, len_arr = self._build_buf_arrays(bufs)
         chunk_size = len(bufs[0]) if bufs else 0
 
-        fid = self._lib.io_engine_submit_batch_set(
+        fid = self._lib.cache_engine_submit_batch_set(
             self._handle, key_arr, ptr_arr, len_arr, len(keys), chunk_size
         )
         if fid == 0:
-            err = self._lib.io_engine_last_error()
+            err = self._lib.cache_engine_last_error()
             raise RuntimeError(
                 err.decode("utf-8") if err else "submit_batch_set failed"
             )
@@ -487,11 +528,11 @@ class NativeIOEngine:
         """Sync batch EXISTS."""
         key_arr, encoded = self._build_key_array(keys)
 
-        fid = self._lib.io_engine_submit_batch_exists(
+        fid = self._lib.cache_engine_submit_batch_exists(
             self._handle, key_arr, len(keys)
         )
         if fid == 0:
-            err = self._lib.io_engine_last_error()
+            err = self._lib.cache_engine_last_error()
             raise RuntimeError(
                 err.decode("utf-8") if err else "submit_batch_exists failed"
             )
@@ -537,12 +578,12 @@ class NativeIOEngine:
         if not self._closed:
             self._shutdown_native(best_effort=True)
             self._fail_all(RuntimeError("Engine closed"))
-            self._lib.io_engine_destroy(self._handle)
+            self._lib.cache_engine_destroy(self._handle)
             self._handle = None
 
     def __del__(self) -> None:
         if hasattr(self, "_handle") and self._handle and not self._closed:
             try:
-                self._lib.io_engine_destroy(self._handle)
+                self._lib.cache_engine_destroy(self._handle)
             except Exception:
                 pass
