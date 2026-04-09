@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
+#include <functional>
 #include <stdexcept>
 
 #include "cache/common/context.h"
@@ -77,11 +78,24 @@ CacheEngine::CacheEngine(const CacheEngineConfig& config)
 CacheEngine::~CacheEngine() { Close(); }
 
 Status CacheEngine::Init() {
+  if (config_.cache_dir.empty()) {
+    return Status::InvalidArgument("cache_dir must not be empty");
+  }
+
+  // GFlags are process-global; only one CacheEngine per process is safe.
+  static std::atomic<int> instance_count{0};
+  if (instance_count.fetch_add(1, std::memory_order_relaxed) > 0) {
+    fprintf(stderr,
+            "WARNING: multiple CacheEngine instances share global GFlags; "
+            "only one instance per process is safe\n");
+  }
+
   // Set GFlags for TierBlockCache
   FLAGS_cache_store = "disk";
   FLAGS_cache_dir = config_.cache_dir;
   FLAGS_cache_size_mb = config_.cache_size_mb;
-  FLAGS_cache_group = "";  // Phase 1: local only
+  FLAGS_cache_group = "";             // Phase 1: local only
+  FLAGS_cache_dir_uuid = "lmcache";   // Required by BlockCacheImpl
 
   // Create NoopBlockAccesser (never actually called in KVCache path)
   block_accesser_ = std::make_unique<NoopBlockAccesser>();
@@ -121,6 +135,7 @@ uint32_t CacheEngine::ExtractChunkHash(const std::string& key) const {
   }
 
   // Parse hex to uint32 (take lower 32 bits)
+  // Fall back to std::hash if non-hex characters are detected
   uint64_t val = 0;
   for (char c : hex_str) {
     val <<= 4;
@@ -130,6 +145,9 @@ uint32_t CacheEngine::ExtractChunkHash(const std::string& key) const {
       val |= static_cast<uint64_t>(c - 'a' + 10);
     } else if (c >= 'A' && c <= 'F') {
       val |= static_cast<uint64_t>(c - 'A' + 10);
+    } else {
+      return static_cast<uint32_t>(
+          std::hash<std::string>{}(key) & 0xFFFFFFFF);
     }
   }
   return static_cast<uint32_t>(val & 0xFFFFFFFF);
@@ -150,9 +168,12 @@ cache::BlockKey CacheEngine::MapKey(const std::string& key,
 }
 
 uint16_t CacheEngine::CalcNumShards(size_t data_size) const {
-  if (data_size == 0) return 1;
-  return static_cast<uint16_t>(
-      (data_size + kMaxBlockSize - 1) / kMaxBlockSize);
+  if (data_size == 0) return 0;
+  size_t n = (data_size + kMaxBlockSize - 1) / kMaxBlockSize;
+  if (n > std::numeric_limits<uint16_t>::max()) {
+    return std::numeric_limits<uint16_t>::max();
+  }
+  return static_cast<uint16_t>(n);
 }
 
 // ---------------------------------------------------------------------------
@@ -198,8 +219,8 @@ uint64_t CacheEngine::SubmitBatchSet(
             HandleShardCompletion(fid, batch, st);
           });
     }
-    exists_cache_->Insert(keys[i]);
   }
+  batch->cache_keys.assign(keys.begin(), keys.end());
 
   return fid;
 }
@@ -303,10 +324,19 @@ void CacheEngine::HandleShardCompletion(
       batch->remaining.fetch_sub(1, std::memory_order_acq_rel) - 1;
 
   if (left == 0) {
+    bool ok = !batch->any_failed.load(std::memory_order_acquire);
+
+    // Insert into ExistsCache only after all shards succeed
+    if (ok && batch->batch_op == Op::SET) {
+      for (const auto& key : batch->cache_keys) {
+        exists_cache_->Insert(key);
+      }
+    }
+
     Completion comp;
     comp.future_id = future_id;
-    comp.ok = !batch->any_failed.load(std::memory_order_acquire);
-    if (!comp.ok) {
+    comp.ok = ok;
+    if (!ok) {
       std::lock_guard<std::mutex> lk(batch->err_mu);
       comp.error = batch->first_error;
     }
@@ -324,11 +354,6 @@ std::vector<Completion> CacheEngine::DrainCompletions() {
       std::lock_guard<std::mutex> lk(comp_mu_);
       if (completions_.empty()) {
         signaled_.store(false, std::memory_order_release);
-        if (!completions_.empty() &&
-            !signaled_.exchange(true, std::memory_order_acq_rel)) {
-          uint64_t x = 1;
-          ::write(efd_, &x, sizeof(x));
-        }
         break;
       }
       c = std::move(completions_.front());

@@ -60,7 +60,7 @@ class DingoFSConnectorAdapter(ConnectorAdapter):
         exists_cache_capacity = int(
             extra.get("dingofs_exists_cache_capacity", 100000)
         )
-        fs_id = int(extra.get("dingofs_fs_id", 0))
+        fs_id = int(extra.get("dingofs_fs_id", 1))
 
         config = {
             "cache_dir": base_path,

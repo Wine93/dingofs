@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// C/C++ tests for the DingoFS connector C API.
+// C/C++ tests for the DingoFS CacheEngine C API.
 // Uses simple assert-based testing (no external framework dependency).
 
-#include "io_engine_capi.h"
+#include "cache_engine_capi.h"
 
 #include <sys/eventfd.h>
 #include <sys/stat.h>
@@ -30,21 +30,25 @@ static void remove_dir(const std::string& path) {
   std::filesystem::remove_all(path);
 }
 
+// Helper: build a JSON config string for cache_engine_create
+static std::string make_config(const std::string& cache_dir) {
+  return "{\"cache_dir\": \"" + cache_dir + "\"}";
+}
+
 // RAII guard for temp directory + engine cleanup
 struct TestGuard {
   std::string dir;
-  io_engine_t* conn;
+  cache_engine_t* conn;
 
-  TestGuard(int num_workers = 2, int use_odirect = 0,
-            int sync_mode = IO_ENGINE_SYNC_ALWAYS)
-      : dir(make_temp_dir()) {
-    conn = io_engine_create(dir.c_str(), num_workers, use_odirect, sync_mode);
+  explicit TestGuard() : dir(make_temp_dir()) {
+    std::string cfg = make_config(dir);
+    conn = cache_engine_create(cfg.c_str());
     assert(conn != nullptr);
   }
 
   ~TestGuard() {
     if (conn) {
-      io_engine_destroy(conn);
+      cache_engine_destroy(conn);
     }
     remove_dir(dir);
   }
@@ -54,13 +58,13 @@ struct TestGuard {
 };
 
 // Helper: drain completions with retry (wait for eventfd)
-static std::vector<io_completion_t> drain_with_wait(
-    io_engine_t* conn, int timeout_ms = 5000) {
-  int efd = io_engine_event_fd(conn);
+static std::vector<cache_completion_t> drain_with_wait(
+    cache_engine_t* conn, int timeout_ms = 5000) {
+  int efd = cache_engine_event_fd(conn);
   assert(efd >= 0);
 
-  std::vector<io_completion_t> all_completions;
-  io_completion_t buf[64];
+  std::vector<cache_completion_t> all_completions;
+  cache_completion_t buf[64];
 
   // Poll eventfd with timeout
   fd_set fds;
@@ -79,7 +83,7 @@ static std::vector<io_completion_t> drain_with_wait(
     }
     if (ret == 0) break;  // timeout
 
-    int n = io_engine_drain_completions(conn, buf, 64);
+    int n = cache_engine_drain_completions(conn, buf, 64);
     for (int i = 0; i < n; ++i) {
       all_completions.push_back(buf[i]);
     }
@@ -90,31 +94,47 @@ static std::vector<io_completion_t> drain_with_wait(
   return all_completions;
 }
 
-// ==========================================================================
+// ========================================================================
 // Test: create and destroy
-// ==========================================================================
+// ========================================================================
 static void test_create_destroy() {
   printf("  test_create_destroy...");
   std::string dir = make_temp_dir();
 
-  io_engine_t* conn =
-      io_engine_create(dir.c_str(), 2, 0, IO_ENGINE_SYNC_ALWAYS);
+  std::string cfg = make_config(dir);
+  cache_engine_t* conn = cache_engine_create(cfg.c_str());
   assert(conn != nullptr);
 
-  int efd = io_engine_event_fd(conn);
+  int efd = cache_engine_event_fd(conn);
   assert(efd >= 0);
 
-  io_engine_destroy(conn);
+  cache_engine_destroy(conn);
   remove_dir(dir);
   printf(" OK\n");
 }
 
-// ==========================================================================
+// ========================================================================
+// Test: invalid config returns NULL
+// ========================================================================
+static void test_invalid_config() {
+  printf("  test_invalid_config...");
+
+  // Empty string is not valid JSON
+  cache_engine_t* conn = cache_engine_create("");
+  assert(conn == nullptr);
+  const char* err = cache_engine_last_error();
+  assert(err != nullptr);
+  assert(strlen(err) > 0);
+
+  printf(" OK\n");
+}
+
+// ========================================================================
 // Test: single SET + GET round-trip
-// ==========================================================================
+// ========================================================================
 static void test_single_set_get() {
   printf("  test_single_set_get...");
-  TestGuard g(2);
+  TestGuard g;
 
   // Prepare data
   const size_t data_size = 4096;
@@ -129,8 +149,8 @@ static void test_single_set_get() {
   const void* wbufs[] = {write_buf.data()};
   size_t lens[] = {data_size};
 
-  uint64_t fid =
-      io_engine_submit_batch_set(g.conn, keys, wbufs, lens, 1, data_size);
+  uint64_t fid = cache_engine_submit_batch_set(
+      g.conn, keys, wbufs, lens, 1, data_size);
   assert(fid != 0);
 
   auto completions = drain_with_wait(g.conn);
@@ -143,7 +163,8 @@ static void test_single_set_get() {
   std::vector<uint8_t> read_buf(data_size, 0);
   void* rbufs[] = {read_buf.data()};
 
-  fid = io_engine_submit_batch_get(g.conn, keys, rbufs, lens, 1, data_size);
+  fid = cache_engine_submit_batch_get(
+      g.conn, keys, rbufs, lens, 1, data_size);
   assert(fid != 0);
 
   completions = drain_with_wait(g.conn);
@@ -158,12 +179,12 @@ static void test_single_set_get() {
   printf(" OK\n");
 }
 
-// ==========================================================================
+// ========================================================================
 // Test: EXISTS
-// ==========================================================================
+// ========================================================================
 static void test_exists() {
   printf("  test_exists...");
-  TestGuard g(2);
+  TestGuard g;
 
   // Write a key
   const size_t data_size = 1024;
@@ -174,15 +195,15 @@ static void test_exists() {
   const void* wbufs[] = {buf.data()};
   size_t lens[] = {data_size};
 
-  uint64_t fid =
-      io_engine_submit_batch_set(g.conn, keys, wbufs, lens, 1, data_size);
+  uint64_t fid = cache_engine_submit_batch_set(
+      g.conn, keys, wbufs, lens, 1, data_size);
   assert(fid != 0);
   auto completions = drain_with_wait(g.conn);
   assert(completions.size() == 1);
   assert(completions[0].ok == 1);
 
   // Check EXISTS for existing key
-  fid = io_engine_submit_batch_exists(g.conn, keys, 1);
+  fid = cache_engine_submit_batch_exists(g.conn, keys, 1);
   completions = drain_with_wait(g.conn);
   assert(completions.size() == 1);
   assert(completions[0].ok == 1);
@@ -194,7 +215,7 @@ static void test_exists() {
   const char* missing_key = "no_such_key";
   const char* missing_keys[] = {missing_key};
 
-  fid = io_engine_submit_batch_exists(g.conn, missing_keys, 1);
+  fid = cache_engine_submit_batch_exists(g.conn, missing_keys, 1);
   completions = drain_with_wait(g.conn);
   assert(completions.size() == 1);
   assert(completions[0].ok == 1);
@@ -205,12 +226,12 @@ static void test_exists() {
   printf(" OK\n");
 }
 
-// ==========================================================================
+// ========================================================================
 // Test: batch operations
-// ==========================================================================
+// ========================================================================
 static void test_batch_operations() {
   printf("  test_batch_operations...");
-  TestGuard g(4);
+  TestGuard g;
 
   const size_t num_keys = 10;
   const size_t data_size = 2048;
@@ -233,9 +254,9 @@ static void test_batch_operations() {
   }
 
   // Batch SET
-  uint64_t fid = io_engine_submit_batch_set(
-      g.conn, key_ptrs.data(), wbuf_ptrs.data(), lens.data(), num_keys,
-      data_size);
+  uint64_t fid = cache_engine_submit_batch_set(
+      g.conn, key_ptrs.data(), wbuf_ptrs.data(), lens.data(),
+      num_keys, data_size);
   assert(fid != 0);
 
   auto completions = drain_with_wait(g.conn);
@@ -243,7 +264,8 @@ static void test_batch_operations() {
   assert(completions[0].ok == 1);
 
   // Batch EXISTS
-  fid = io_engine_submit_batch_exists(g.conn, key_ptrs.data(), num_keys);
+  fid = cache_engine_submit_batch_exists(
+      g.conn, key_ptrs.data(), num_keys);
   completions = drain_with_wait(g.conn);
   assert(completions.size() == 1);
   assert(completions[0].ok == 1);
@@ -260,27 +282,29 @@ static void test_batch_operations() {
     rbuf_ptrs[i] = read_bufs[i].data();
   }
 
-  fid = io_engine_submit_batch_get(
-      g.conn, key_ptrs.data(), rbuf_ptrs.data(), lens.data(), num_keys,
-      data_size);
+  fid = cache_engine_submit_batch_get(
+      g.conn, key_ptrs.data(), rbuf_ptrs.data(), lens.data(),
+      num_keys, data_size);
   completions = drain_with_wait(g.conn);
   assert(completions.size() == 1);
   assert(completions[0].ok == 1);
 
   // Verify all data
   for (size_t i = 0; i < num_keys; ++i) {
-    assert(memcmp(write_bufs[i].data(), read_bufs[i].data(), data_size) == 0);
+    assert(
+        memcmp(write_bufs[i].data(), read_bufs[i].data(), data_size)
+        == 0);
   }
 
   printf(" OK\n");
 }
 
-// ==========================================================================
+// ========================================================================
 // Test: concurrent operations (multiple batches in-flight)
-// ==========================================================================
+// ========================================================================
 static void test_concurrent_batches() {
   printf("  test_concurrent_batches...");
-  TestGuard g(8);
+  TestGuard g;
 
   const size_t data_size = 4096;
   const int num_batches = 5;
@@ -304,8 +328,8 @@ static void test_concurrent_batches() {
     const void* wbufs[] = {all_bufs.back().data()};
     size_t lens[] = {data_size};
 
-    uint64_t fid = io_engine_submit_batch_set(g.conn, keys, wbufs, lens,
-                                                       1, data_size);
+    uint64_t fid = cache_engine_submit_batch_set(
+        g.conn, keys, wbufs, lens, 1, data_size);
     assert(fid != 0);
     fids.push_back(fid);
   }
@@ -330,56 +354,58 @@ static void test_concurrent_batches() {
     void* rbufs[] = {read_buf.data()};
     size_t lens[] = {data_size};
 
-    uint64_t fid = io_engine_submit_batch_get(g.conn, keys, rbufs, lens,
-                                              1, data_size);
+    uint64_t fid = cache_engine_submit_batch_get(
+        g.conn, keys, rbufs, lens, 1, data_size);
     assert(fid != 0);
 
     auto completions = drain_with_wait(g.conn);
     assert(completions.size() == 1);
     assert(completions[0].ok == 1);
-    assert(memcmp(all_bufs[b].data(), read_buf.data(), data_size) == 0);
+    assert(
+        memcmp(all_bufs[b].data(), read_buf.data(), data_size)
+        == 0);
   }
 
   printf(" OK\n");
 }
 
-// ==========================================================================
+// ========================================================================
 // Test: close idempotency
-// ==========================================================================
+// ========================================================================
 static void test_close_idempotent() {
   printf("  test_close_idempotent...");
   std::string dir = make_temp_dir();
 
-  io_engine_t* conn =
-      io_engine_create(dir.c_str(), 2, 0, IO_ENGINE_SYNC_ALWAYS);
+  std::string cfg = make_config(dir);
+  cache_engine_t* conn = cache_engine_create(cfg.c_str());
   assert(conn != nullptr);
 
   // Close multiple times
-  io_engine_close(conn);
-  io_engine_close(conn);
-  io_engine_close(conn);
+  cache_engine_close(conn);
+  cache_engine_close(conn);
+  cache_engine_close(conn);
 
-  io_engine_destroy(conn);
+  cache_engine_destroy(conn);
   remove_dir(dir);
   printf(" OK\n");
 }
 
-// ==========================================================================
+// ========================================================================
 // Test: error handling
-// ==========================================================================
+// ========================================================================
 static void test_error_handling() {
   printf("  test_error_handling...");
 
   // NULL engine arguments
-  uint64_t fid = io_engine_submit_batch_get(nullptr, nullptr, nullptr,
-                                                     nullptr, 0, 0);
+  uint64_t fid = cache_engine_submit_batch_get(
+      nullptr, nullptr, nullptr, nullptr, 0, 0);
   assert(fid == 0);
-  const char* err = io_engine_last_error();
+  const char* err = cache_engine_last_error();
   assert(err != nullptr);
   assert(strlen(err) > 0);
 
   // GET on non-existent key should fail
-  TestGuard g(2);
+  TestGuard g;
 
   const size_t data_size = 1024;
   std::vector<uint8_t> buf(data_size, 0);
@@ -388,8 +414,8 @@ static void test_error_handling() {
   void* rbufs[] = {buf.data()};
   size_t lens[] = {data_size};
 
-  fid = io_engine_submit_batch_get(g.conn, keys, rbufs, lens, 1,
-                                            data_size);
+  fid = cache_engine_submit_batch_get(
+      g.conn, keys, rbufs, lens, 1, data_size);
   assert(fid != 0);
 
   auto completions = drain_with_wait(g.conn);
@@ -401,12 +427,12 @@ static void test_error_handling() {
   printf(" OK\n");
 }
 
-// ==========================================================================
+// ========================================================================
 // Test: large data (simulating KV cache chunks)
-// ==========================================================================
+// ========================================================================
 static void test_large_data() {
   printf("  test_large_data...");
-  TestGuard g(4);
+  TestGuard g;
 
   // 1 MB chunk (typical KV cache size)
   const size_t data_size = 1024 * 1024;
@@ -421,8 +447,8 @@ static void test_large_data() {
   size_t lens[] = {data_size};
 
   // SET
-  uint64_t fid =
-      io_engine_submit_batch_set(g.conn, keys, wbufs, lens, 1, data_size);
+  uint64_t fid = cache_engine_submit_batch_set(
+      g.conn, keys, wbufs, lens, 1, data_size);
   assert(fid != 0);
   auto completions = drain_with_wait(g.conn);
   assert(completions.size() == 1);
@@ -433,8 +459,8 @@ static void test_large_data() {
   std::vector<uint8_t> read_buf(data_size, 0);
   void* rbufs[] = {read_buf.data()};
 
-  fid = io_engine_submit_batch_get(g.conn, keys, rbufs, lens, 1,
-                                           data_size);
+  fid = cache_engine_submit_batch_get(
+      g.conn, keys, rbufs, lens, 1, data_size);
   assert(fid != 0);
   completions = drain_with_wait(g.conn);
   assert(completions.size() == 1);
@@ -446,50 +472,12 @@ static void test_large_data() {
   printf(" OK\n");
 }
 
-// ==========================================================================
-// Test: SYNC_NONE mode still produces correct data
-// ==========================================================================
-static void test_sync_mode_none() {
-  printf("  test_sync_mode_none...");
-  TestGuard g(2, 0, IO_ENGINE_SYNC_NONE);
-
-  const size_t data_size = 4096;
-  std::vector<uint8_t> write_buf(data_size, 0x5A);
-
-  const char* key = "sync_none_key";
-  const char* keys[] = {key};
-  const void* wbufs[] = {write_buf.data()};
-  size_t lens[] = {data_size};
-
-  // SET
-  uint64_t fid =
-      io_engine_submit_batch_set(g.conn, keys, wbufs, lens, 1, data_size);
-  assert(fid != 0);
-  auto completions = drain_with_wait(g.conn);
-  assert(completions.size() == 1);
-  assert(completions[0].ok == 1);
-
-  // GET
-  std::vector<uint8_t> read_buf(data_size, 0);
-  void* rbufs[] = {read_buf.data()};
-
-  fid = io_engine_submit_batch_get(g.conn, keys, rbufs, lens, 1, data_size);
-  assert(fid != 0);
-  completions = drain_with_wait(g.conn);
-  assert(completions.size() == 1);
-  assert(completions[0].ok == 1);
-
-  assert(memcmp(write_buf.data(), read_buf.data(), data_size) == 0);
-
-  printf(" OK\n");
-}
-
-// ==========================================================================
+// ========================================================================
 // Test: overwriting an existing key returns the latest value
-// ==========================================================================
+// ========================================================================
 static void test_data_overwrite() {
   printf("  test_data_overwrite...");
-  TestGuard g(2);
+  TestGuard g;
 
   const size_t data_size = 2048;
   const char* key = "ow_key";
@@ -500,8 +488,8 @@ static void test_data_overwrite() {
   std::vector<uint8_t> buf_aa(data_size, 0xAA);
   const void* wbufs_aa[] = {buf_aa.data()};
 
-  uint64_t fid =
-      io_engine_submit_batch_set(g.conn, keys, wbufs_aa, lens, 1, data_size);
+  uint64_t fid = cache_engine_submit_batch_set(
+      g.conn, keys, wbufs_aa, lens, 1, data_size);
   assert(fid != 0);
   auto completions = drain_with_wait(g.conn);
   assert(completions.size() == 1);
@@ -511,8 +499,8 @@ static void test_data_overwrite() {
   std::vector<uint8_t> buf_bb(data_size, 0xBB);
   const void* wbufs_bb[] = {buf_bb.data()};
 
-  fid =
-      io_engine_submit_batch_set(g.conn, keys, wbufs_bb, lens, 1, data_size);
+  fid = cache_engine_submit_batch_set(
+      g.conn, keys, wbufs_bb, lens, 1, data_size);
   completions = drain_with_wait(g.conn);
   assert(completions.size() == 1);
   assert(completions[0].ok == 1);
@@ -521,7 +509,8 @@ static void test_data_overwrite() {
   std::vector<uint8_t> read_buf(data_size, 0);
   void* rbufs[] = {read_buf.data()};
 
-  fid = io_engine_submit_batch_get(g.conn, keys, rbufs, lens, 1, data_size);
+  fid = cache_engine_submit_batch_get(
+      g.conn, keys, rbufs, lens, 1, data_size);
   completions = drain_with_wait(g.conn);
   assert(completions.size() == 1);
   assert(completions[0].ok == 1);
@@ -531,12 +520,12 @@ static void test_data_overwrite() {
   printf(" OK\n");
 }
 
-// ==========================================================================
-// Test: key containing slashes (tests -SEP- replacement in key_to_path)
-// ==========================================================================
+// ========================================================================
+// Test: key containing slashes (tests separator replacement)
+// ========================================================================
 static void test_key_with_slashes() {
   printf("  test_key_with_slashes...");
-  TestGuard g(2);
+  TestGuard g;
 
   const size_t data_size = 1024;
   std::vector<uint8_t> write_buf(data_size, 0xCD);
@@ -547,8 +536,8 @@ static void test_key_with_slashes() {
   size_t lens[] = {data_size};
 
   // SET
-  uint64_t fid =
-      io_engine_submit_batch_set(g.conn, keys, wbufs, lens, 1, data_size);
+  uint64_t fid = cache_engine_submit_batch_set(
+      g.conn, keys, wbufs, lens, 1, data_size);
   assert(fid != 0);
   auto completions = drain_with_wait(g.conn);
   assert(completions.size() == 1);
@@ -558,7 +547,8 @@ static void test_key_with_slashes() {
   std::vector<uint8_t> read_buf(data_size, 0);
   void* rbufs[] = {read_buf.data()};
 
-  fid = io_engine_submit_batch_get(g.conn, keys, rbufs, lens, 1, data_size);
+  fid = cache_engine_submit_batch_get(
+      g.conn, keys, rbufs, lens, 1, data_size);
   completions = drain_with_wait(g.conn);
   assert(completions.size() == 1);
   assert(completions[0].ok == 1);
@@ -568,18 +558,19 @@ static void test_key_with_slashes() {
   printf(" OK\n");
 }
 
-// ==========================================================================
+// ========================================================================
 // Test: batch_exists with a mix of existing and non-existing keys
-// ==========================================================================
+// ========================================================================
 static void test_batch_exists_mixed() {
   printf("  test_batch_exists_mixed...");
-  TestGuard g(2);
+  TestGuard g;
 
   const size_t data_size = 512;
 
   // Write only even-indexed keys: exist_0, exist_2, exist_4
   const size_t num_write = 3;
-  std::string write_key_strs[] = {"exist_0", "exist_2", "exist_4"};
+  std::string write_key_strs[] = {
+      "exist_0", "exist_2", "exist_4"};
   const char* write_key_ptrs[] = {write_key_strs[0].c_str(),
                                   write_key_strs[1].c_str(),
                                   write_key_strs[2].c_str()};
@@ -587,8 +578,8 @@ static void test_batch_exists_mixed() {
   const void* wbufs[] = {buf.data(), buf.data(), buf.data()};
   size_t lens[] = {data_size, data_size, data_size};
 
-  uint64_t fid = io_engine_submit_batch_set(g.conn, write_key_ptrs, wbufs,
-                                            lens, num_write, data_size);
+  uint64_t fid = cache_engine_submit_batch_set(
+      g.conn, write_key_ptrs, wbufs, lens, num_write, data_size);
   assert(fid != 0);
   auto completions = drain_with_wait(g.conn);
   assert(completions.size() == 1);
@@ -603,7 +594,8 @@ static void test_batch_exists_mixed() {
       check_key_strs[2].c_str(), check_key_strs[3].c_str(),
       check_key_strs[4].c_str()};
 
-  fid = io_engine_submit_batch_exists(g.conn, check_key_ptrs, num_check);
+  fid = cache_engine_submit_batch_exists(
+      g.conn, check_key_ptrs, num_check);
   completions = drain_with_wait(g.conn);
   assert(completions.size() == 1);
   assert(completions[0].ok == 1);
@@ -618,12 +610,12 @@ static void test_batch_exists_mixed() {
   printf(" OK\n");
 }
 
-// ==========================================================================
+// ========================================================================
 // Test: multiple drain calls do not return duplicate completions
-// ==========================================================================
+// ========================================================================
 static void test_multiple_drain_calls() {
   printf("  test_multiple_drain_calls...");
-  TestGuard g(2);
+  TestGuard g;
 
   const size_t data_size = 1024;
   std::vector<uint8_t> buf(data_size, 0x77);
@@ -634,8 +626,8 @@ static void test_multiple_drain_calls() {
   size_t lens[] = {data_size};
 
   // Submit one SET
-  uint64_t fid =
-      io_engine_submit_batch_set(g.conn, keys, wbufs, lens, 1, data_size);
+  uint64_t fid = cache_engine_submit_batch_set(
+      g.conn, keys, wbufs, lens, 1, data_size);
   assert(fid != 0);
 
   // First drain: should get 1 completion
@@ -645,20 +637,21 @@ static void test_multiple_drain_calls() {
   assert(completions[0].future_id == fid);
 
   // Second drain immediately: should get 0 (no new completions)
-  io_completion_t extra[16];
-  int n = io_engine_drain_completions(g.conn, extra, 16);
+  cache_completion_t extra[16];
+  int n = cache_engine_drain_completions(g.conn, extra, 16);
   assert(n == 0);
 
   printf(" OK\n");
 }
 
-// ==========================================================================
+// ========================================================================
 // Main
-// ==========================================================================
+// ========================================================================
 int main() {
-  printf("Running DingoFS IOEngine C API tests:\n");
+  printf("Running DingoFS CacheEngine C API tests:\n");
 
   test_create_destroy();
+  test_invalid_config();
   test_single_set_get();
   test_exists();
   test_batch_operations();
@@ -666,7 +659,6 @@ int main() {
   test_close_idempotent();
   test_error_handling();
   test_large_data();
-  test_sync_mode_none();
   test_data_overwrite();
   test_key_with_slashes();
   test_batch_exists_mixed();

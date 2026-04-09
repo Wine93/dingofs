@@ -31,7 +31,7 @@ class DingoFSNativeClient:
         return self._engine.batch_exists_submit(keys)
 
     def drain_completions(self):
-        return self._engine._drain_raw()
+        return self._engine.drain_raw()
 
     def close(self):
         self._engine.close()

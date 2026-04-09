@@ -79,7 +79,7 @@ class DingoFSConnector(RemoteConnector):
             await self._engine.get(
                 key_str, self._as_memoryview(memory_obj.byte_array)
             )
-        except Exception:
+        except RuntimeError:
             logger.warning("Failed to get key %s from DingoFS", key_str)
             return None
         return memory_obj
@@ -128,7 +128,7 @@ class DingoFSConnector(RemoteConnector):
         bufs = [self._as_memoryview(m.byte_array) for m in memory_objs]
         try:
             await self._engine.batch_get(key_strs, bufs)
-        except Exception:
+        except RuntimeError:
             logger.warning("Failed to batch get from DingoFS")
             for m in memory_objs:
                 self.local_cpu_backend.free(m)

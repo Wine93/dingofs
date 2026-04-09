@@ -33,6 +33,7 @@ struct BatchState {
 
   std::vector<uint8_t> exists_results;
   Op batch_op;
+  std::vector<std::string> cache_keys;  // Keys to cache on success
 };
 
 struct Completion {

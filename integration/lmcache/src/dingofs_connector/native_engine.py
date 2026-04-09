@@ -208,7 +208,7 @@ class NativeCacheEngine:
             return
         try:
             while True:
-                items = self._drain_raw()
+                items = self.drain_raw()
                 if not items:
                     return
                 for future_id, ok, error, result_bools in items:
@@ -236,7 +236,7 @@ class NativeCacheEngine:
             self._fail_all(RuntimeError(f"drain_completions failed: {e}"))
             self._shutdown_native(best_effort=True)
 
-    def _drain_raw(
+    def drain_raw(
         self,
     ) -> List[Tuple[int, bool, str, Optional[List[bool]]]]:
         """Drain completions from C library. Returns list of tuples."""
@@ -540,32 +540,54 @@ class NativeCacheEngine:
         return self._wait_for_completion(fid, is_exists=True)
 
     def _wait_for_completion(
-        self, target_fid: int, is_exists: bool = False
+        self, target_fid: int, is_exists: bool = False,
+        timeout: float = 60.0,
     ) -> Any:
         """Block until the target future_id completes (for sync API).
 
         Returns None for GET/SET, or List[bool] for EXISTS.
+        Raises TimeoutError if overall timeout is exceeded.
         """
         import select
+        import time
+
+        deadline = time.monotonic() + timeout
 
         while True:
-            r, _, _ = select.select([self._fd], [], [], 5.0)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"sync wait for fid={target_fid} timed out "
+                    f"after {timeout}s"
+                )
+
+            poll_timeout = min(5.0, remaining)
+            r, _, _ = select.select([self._fd], [], [], poll_timeout)
             if not r:
                 continue  # Timeout, retry
 
-            items = self._drain_raw()
+            items = self.drain_raw()
             for fid, ok, error, bools in items:
                 if fid == target_fid:
                     if not ok:
                         raise RuntimeError(error)
                     return (bools if bools else []) if is_exists else None
-                # Resolve other pending futures if any
+                # Resolve other pending futures with correct result types
                 entry = self._pending.pop(fid, None)
                 if entry:
-                    fut, _, _ = entry
+                    fut, op, _ = entry
                     if not fut.done():
                         if ok:
-                            fut.set_result(None)
+                            if op == "exists":
+                                fut.set_result(
+                                    bool(bools[0]) if bools else False
+                                )
+                            elif op == "batch_exists":
+                                fut.set_result(
+                                    list(bools) if bools else []
+                                )
+                            else:
+                                fut.set_result(None)
                         else:
                             fut.set_exception(RuntimeError(error))
 
