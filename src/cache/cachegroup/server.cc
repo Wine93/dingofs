@@ -55,6 +55,7 @@ Server::Server()
       node_(std::make_shared<CacheNode>()),
       service_(std::make_unique<BlockCacheServiceImpl>(node_)),
       server_(std::make_unique<::brpc::Server>()) {}
+// 这里添加一个 rdma_server();
 
 Status Server::Start() {
   if (running_.load(std::memory_order_relaxed)) {
@@ -65,6 +66,8 @@ Status Server::Start() {
   LOG(INFO) << "Server is starting...";
 
   InstallSignal();
+
+  // TODO: 先启动 rdma server，再启动 bthread server
 
   std::string listen_ip = FLAGS_wide_access ? "0.0.0.0" : FLAGS_listen_ip;
   auto status = StartRpcServer(FLAGS_listen_ip, FLAGS_listen_port);
@@ -130,6 +133,19 @@ Status Server::Shutdown() {
 
 void Server::InstallSignal() { CHECK(SIG_ERR != signal(SIGPIPE, SIG_IGN)); }
 
+// TODO: 这里添加一个 StartIBServer();
+// Status Server::StartIBServer() {
+/*
+1. 把各个 handler 都注册进去（都需要以 node 位参数）
+ rdma_server_->RegisterHandler([](){
+  node_->HandleXXX();
+
+ });
+
+ rdma_server->Start();
+ */
+// }
+
 Status Server::StartRpcServer(const std::string& listen_ip,
                               uint32_t listen_port) {
   butil::EndPoint ep;
@@ -145,6 +161,11 @@ Status Server::StartRpcServer(const std::string& listen_ip,
     LOG(ERROR) << "Fail to add BlockCacheService to brpc server";
     return Status::Internal("add service failed");
   }
+
+  // TODO(wine93): 注册 InfinibandServiceImpl —— 接口尚未与 CacheNode 串起来。
+  // rc = server_->AddService(
+  //     std::make_unique<InfinibandServiceImpl>(...).release(),
+  //     brpc::SERVER_DOESNT_OWN_SERVICE);
 
   brpc::ServerOptions options;
   options.ignore_eovercrowded = true;

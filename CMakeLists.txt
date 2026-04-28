@@ -247,6 +247,9 @@ message("Using opentelemetry-cpp ${opentelemetry-cpp_VERSION}")
 find_package(uring REQUIRED)
 message("Using uring ${uring_VERSION}")
 
+find_package(ibverbs REQUIRED)
+message("Using ibverbs, lib:${ibverbs_LIBRARIES}, include_dir:${ibverbs_INCLUDE_DIR}")
+
 
 find_package(jsoncpp REQUIRED)
 message("Using jsoncpp ${jsoncpp_VERSION}")

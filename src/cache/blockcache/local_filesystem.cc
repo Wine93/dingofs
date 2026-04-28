@@ -198,6 +198,8 @@ Status LocalFileSystem::ReadFile(const std::string& path, off_t offset,
 
   off_t aligned_offset = AlignOffset(offset);
   size_t aligned_length = AlignLength(length + offset - aligned_offset);
+  // TODO: 这里的内存需要根据 option 提供 2 个路径，一个是普通的内存池，一个是
+  // RDMA 注册的内存池
   int buf_index = AllocateAlignedMemory(buffer, aligned_length, true);
   status =
       AioRead(fd, aligned_offset, aligned_length, buffer->Fetch1(), buf_index);

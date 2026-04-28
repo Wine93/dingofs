@@ -27,6 +27,7 @@
 
 #include "cache/cachegroup/node.h"
 #include "dingofs/blockcache.pb.h"
+#include "dingofs/infiniband.pb.h"
 
 namespace dingofs {
 namespace cache {

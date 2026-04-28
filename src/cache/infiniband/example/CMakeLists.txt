@@ -12,15 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-file(GLOB TEST_CACHE_COMMON_SRCS "*.cc")
-
-add_library(test_cache_common OBJECT
-    ${TEST_CACHE_COMMON_SRCS}
-    ${CMAKE_SOURCE_DIR}/src/cache/infiniband/device.cpp
+add_executable(rdma_server rdma_server.cc)
+target_link_libraries(rdma_server
+    cache_infiniband
 )
 
-target_link_libraries(test_cache_common
-    cache_lib
-    ibverbs::ibverbs
-    ${TEST_DEPS_WITHOUT_MAIN}
+add_executable(rdma_client rdma_client.cc)
+target_link_libraries(rdma_client
+    cache_infiniband
+)
+
+# brpc/TCP counterparts for latency comparison against the RDMA path.
+add_executable(brpc_server brpc_server.cc)
+target_link_libraries(brpc_server
+    cache_infiniband
+)
+
+add_executable(brpc_client brpc_client.cc)
+target_link_libraries(brpc_client
+    cache_infiniband
 )

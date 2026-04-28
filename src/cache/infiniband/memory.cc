@@ -1,0 +1,100 @@
+/*
+ * Copyright (c) 2026 dingodb.com, Inc. All Rights Reserved
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/*
+ * Project: DingoFS
+ * Created Date: 2026-04-22
+ * Author: Jingli Chen (Wine93)
+ */
+
+#include "cache/infiniband/memory.h"
+
+#include <glog/logging.h>
+
+#include <memory>
+
+namespace dingofs {
+namespace cache {
+namespace infiniband {
+
+RDMAMemoryPool::RDMAMemoryPool(ibv_mr* mr, MemoryPoolUPtr pool,
+                               std::vector<Buffer> buffers)
+    : mr_(mr), pool_(std::move(pool)), buffers_(std::move(buffers)) {}
+
+RDMAMemoryPool::~RDMAMemoryPool() {
+  if (mr_ != nullptr) {
+    PCHECK(ibv_dereg_mr(mr_) == 0) << "Fail to dereg memory region";
+    mr_ = nullptr;
+  }
+}
+
+RDMAMemoryPoolUPtr RDMAMemoryPool::Create(ProtectDomain* protect_domain,
+                                          size_t buffer_size,
+                                          size_t buffer_count) {
+  CHECK_NOTNULL(protect_domain);
+
+  auto pool = MemoryPool::Create(buffer_size, buffer_count);
+  if (pool == nullptr) {
+    return nullptr;
+  }
+
+  size_t bytes = buffer_size * buffer_count;
+  ibv_mr* mr = ibv_reg_mr(protect_domain->GetIbPd(), pool->base(), bytes,
+                          IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+  if (mr == nullptr) {
+    PLOG(ERROR) << "Fail to register memory region: bytes=" << bytes;
+    return nullptr;
+  }
+
+  std::vector<Buffer> buffers;
+  buffers.reserve(buffer_count);
+  for (int i = 0; i < buffer_count; ++i) {
+    Buffer buffer;
+    buffer.data = pool->base() + (i * buffer_size);
+    buffer.capacity = static_cast<uint32_t>(buffer_size);
+    buffer.lkey = 0;
+    buffer.lkey = mr->lkey;
+    buffer.rkey = mr->rkey;
+    buffer.index = i;
+    buffers.emplace_back(buffer);
+  }
+
+  LOG(INFO) << "Successfully create RDMAMemoryPool{buffer_size=" << buffer_size
+            << " buffer_count=" << buffer_count << " lkey=" << mr->lkey
+            << " rkey=" << mr->rkey << "}";
+
+  return std::make_unique<RDMAMemoryPool>(mr, std::move(pool),
+                                          std::move(buffers));
+}
+
+Buffer* RDMAMemoryPool::Require() {
+  char* buf = pool_->Require();
+  if (buf == nullptr) {
+    return nullptr;
+  }
+  return &buffers_[pool_->IndexOf(buf)];
+}
+
+void RDMAMemoryPool::Release(Buffer* buffer) {
+  DCHECK(buffer != nullptr);
+  DCHECK_GE(buffer, buffers_.data());
+  DCHECK_LT(buffer, buffers_.data() + buffers_.size());
+  pool_->Release(buffer->data);
+}
+
+}  // namespace infiniband
+}  // namespace cache
+}  // namespace dingofs
