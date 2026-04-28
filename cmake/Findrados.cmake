@@ -39,7 +39,7 @@ if(RADOS_FOUND AND NOT (TARGET ceph::rados))
 
   # find rdma library
   find_library(RDMACM_LIBRARIES NAMES librdmacm.a)
-  find_library(IBVERBS_LIBRARIES NAMES libibverbs.a)
+  find_package(ibverbs REQUIRED)
 
   find_package(udev REQUIRED)
   message(("Using udev: ${UDEV_LIBRARIES}, include dir: ${UDEV_INCLUDE_DIR}"))
@@ -50,7 +50,7 @@ if(RADOS_FOUND AND NOT (TARGET ceph::rados))
       OpenSSL::SSL
       ${Boost_LIBRARIES}
       ${RDMACM_LIBRARIES}
-      ${IBVERBS_LIBRARIES}
+      ibverbs::ibverbs
       ${UDEV_LIBRARIES}
       ${BLKID_LIBRARIES}
       resolv

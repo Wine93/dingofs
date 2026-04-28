@@ -47,6 +47,9 @@ class Server {
   std::atomic<bool> running_;
   CacheNodeSPtr node_;
   std::unique_ptr<pb::cache::BlockCacheService> service_;
+
+  // std::unique_ptr<infiniband::Server> rdma_server_;
+
   std::unique_ptr<brpc::Server> server_;
   std::unique_ptr<utils::LogCleanManager> log_clean_manager_;
 };

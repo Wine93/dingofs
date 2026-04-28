@@ -1,4 +1,4 @@
-# Copyright (c) 2026 dingodb.com, Inc. All Rights Reserved
+# Copyright (c) 2025 dingodb.com, Inc. All Rights Reserved
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,15 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-file(GLOB TEST_CACHE_COMMON_SRCS "*.cc")
-
-add_library(test_cache_common OBJECT
-    ${TEST_CACHE_COMMON_SRCS}
-    ${CMAKE_SOURCE_DIR}/src/cache/infiniband/device.cpp
+file(GLOB CACHE_INFINIBAND_LIB_SRCS
+    "*.cc"
 )
 
-target_link_libraries(test_cache_common
-    cache_lib
+add_library(cache_infiniband ${CACHE_INFINIBAND_LIB_SRCS})
+target_link_libraries(cache_infiniband
+    PROTO_OBJS
+
+    glog::glog
+    gflags::gflags
+    brpc::brpc
     ibverbs::ibverbs
-    ${TEST_DEPS_WITHOUT_MAIN}
+
+    cache_common
+    cache_iutil
+    dingofs_common
 )
+
+add_subdirectory(example)
