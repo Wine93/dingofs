@@ -40,18 +40,15 @@ namespace cache {
 class CacheNode {
  public:
   CacheNode();
-
   Status Start();
   Status Shutdown();
 
   Status Put(BlockHandle handle, IOBuffer block);
-  // `cache_hit` (out): true iff the request was satisfied from the local cache
-  // (not from the storage fallback). Used by the RPC handler to set the
-  // response's cache_hit field.
   Status Range(BlockHandle handle, off_t offset, size_t length,
-               IOBuffer* buffer, size_t block_length, bool* cache_hit);
-  Status AsyncCache(BlockHandle handle, IOBuffer block);
-  Status AsyncPrefetch(BlockHandle handle, size_t length);
+               IOBuffer* buffer);
+
+  // Status AsyncCache(BlockHandle handle, IOBuffer block);
+  // Status AsyncPrefetch(BlockHandle handle, size_t length);
 
  private:
   bool IsRunning() const { return running_.load(std::memory_order_relaxed); }
@@ -64,7 +61,8 @@ class CacheNode {
   Status RetrieveStorage(const BlockHandle& handle, off_t offset, size_t length,
                          IOBuffer* buffer, size_t block_length);
   Status RetrievePartBlock(const BlockHandle& handle, off_t offset,
-                           size_t length, IOBuffer* buffer, size_t block_length);
+                           size_t length, IOBuffer* buffer,
+                           size_t block_length);
   Status RetrieveWholeBlock(const BlockHandle& handle, size_t block_length,
                             IOBuffer* buffer);
   Status RunTask(StorageClient* storage_client, DownloadTaskSPtr task);

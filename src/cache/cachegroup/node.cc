@@ -179,6 +179,7 @@ Status CacheNode::Put(BlockHandle handle, IOBuffer block) {
   if (!IsRunning()) {
     return Status::CacheDown("cache node is down");
   }
+
   return block_cache_->Put(std::move(handle), std::move(block),
                            {.writeback = true});
 }
@@ -282,10 +283,12 @@ Status CacheNode::RetrievePartBlock(const BlockHandle& handle, off_t offset,
   }
 
   status = storage_client->Range(handle, offset, length, buffer);
-  if (status.ok() && block_length > 0) {
-    block_cache_->AsyncPrefetch(handle, block_length, nullptr);
+  if (!status.ok() || block_length == 0) {
+    return status;
   }
-  return status;
+
+  block_cache_->AsyncPrefetch(handle, block_length, nullptr);
+  return Status::OK();
 }
 
 Status CacheNode::RetrieveWholeBlock(const BlockHandle& handle,

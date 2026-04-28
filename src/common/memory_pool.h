@@ -58,6 +58,16 @@ class MemoryPool {
   char* Require();
   void Release(char* buffer);
 
+  char* base() const { return base_; }
+  size_t buffer_size() const { return buffer_size_; }
+  size_t buffer_count() const { return buffer_count_; }
+
+  size_t IndexOf(char* buffer) const {
+    DCHECK_GE(buffer, base_);
+    DCHECK_LT(buffer, base_ + (buffer_size_ * buffer_count_));
+    return (buffer - base_) / buffer_size_;
+  }
+
  private:
   static constexpr uint32_t kNumShards = 32;
   static constexpr uint32_t kNumCaches = 128;

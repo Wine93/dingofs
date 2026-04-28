@@ -22,6 +22,9 @@
 
 #include "cache/benchmark/worker.h"
 
+#include <butil/time.h>
+#include <glog/logging.h>
+
 #include "cache/benchmark/option.h"
 
 namespace dingofs {
@@ -31,36 +34,67 @@ Worker::Worker(uint64_t idx, TaskFactorySPtr factory, CollectorSPtr collector)
     : idx_(idx),
       factory_(factory),
       collector_(collector),
-      countdown_(FLAGS_blocks) {}
+      finished_(1) {}
 
-void Worker::Start() { ExecAllTasks(); }
+void Worker::Start() {
+  auto status = context_.Init(idx_);
+  if (!status.ok()) {
+    LOG(ERROR) << "Fail to init worker context idx=" << idx_
+               << ": " << status.ToString();
+    collector_->Submit([status](Stat* stat, Stat* total) {
+      stat->Add(0, 0, false);
+      total->Add(0, 0, false);
+    });
+    finished_.signal();
+    return;
+  }
 
-void Worker::Shutdown() { countdown_.wait(); }
+  ExecAllTasks();
+  finished_.signal();
+}
+
+void Worker::Shutdown() { finished_.wait(); }
 
 void Worker::ExecAllTasks() {
   BlockKeyIterator iter(idx_, FLAGS_blksize, FLAGS_blocks);
+  const int64_t deadline_us =
+      FLAGS_time_based
+          ? butil::gettimeofday_us() + static_cast<int64_t>(FLAGS_runtime) *
+                                        1000 * 1000
+          : 0;
 
-  for (iter.SeekToFirst(); iter.Valid(); iter.Next()) {
-    auto task = factory_->GenTask(iter.Key());
-    ExecTask(task);
+  do {
+    for (iter.SeekToFirst(); iter.Valid(); iter.Next()) {
+      if (FLAGS_time_based && butil::gettimeofday_us() >= deadline_us) {
+        return;
+      }
+      auto key = iter.Key();
+      auto task = factory_->GenTask(key, &context_);
+      ExecTask(task);
 
-    VLOG(9) << "Execute task (key=" << iter.Key().Filename() << ").";
-
-    countdown_.signal(1);
-  }
+      VLOG(9) << "Execute task (key=" << key.Filename() << ").";
+    }
+  } while (FLAGS_time_based);
 }
 
-void Worker::ExecTask(std::function<void()> task) {
+void Worker::ExecTask(Task task) {
   butil::Timer timer;
 
   timer.start();
-  task();
+  auto result = task();
   timer.stop();
 
-  collector_->Submit([this, timer](Stat* stat, Stat* total) {
-    stat->Add(FLAGS_blksize, timer.u_elapsed());
-    total->Add(FLAGS_blksize, timer.u_elapsed());
+  const bool ok = result.status.ok();
+  const uint64_t bytes = ok ? result.bytes : 0;
+  const uint64_t latency_us = timer.u_elapsed();
+  collector_->Submit([bytes, latency_us, ok](Stat* stat, Stat* total) {
+    stat->Add(bytes, latency_us, ok);
+    total->Add(bytes, latency_us, ok);
   });
+
+  if (!ok) {
+    LOG(ERROR) << "Task failed: " << result.status.ToString();
+  }
 }
 
 }  // namespace cache

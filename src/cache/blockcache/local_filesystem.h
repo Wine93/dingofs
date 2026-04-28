@@ -63,8 +63,6 @@ class LocalFileSystem {
 
   std::atomic<bool> running_;
   DiskCacheLayoutSPtr layout_;
-  BufferPoolUPtr write_buffer_pool_;
-  BufferPoolUPtr read_buffer_pool_;
   iutil::InflightTracker inflight_;
   AioQueueUPtr aio_queue_;
   DiskHealthCheckerUPtr health_checker_;

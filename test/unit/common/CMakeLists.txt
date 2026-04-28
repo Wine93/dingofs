@@ -17,6 +17,7 @@ add_subdirectory(trace)
 
 add_executable(test_common
   main.cc
+  test_block_key.cc
   test_memory_pool.cc
 )
 

@@ -40,8 +40,7 @@ namespace cache {
 struct IOUringOptions {
   uint32_t entries{4096};
   bool use_sqpoll{true};
-  std::vector<iovec> fixed_write_buffers;
-  std::vector<iovec> fixed_read_buffers;
+  std::vector<iovec> fixed_buffers;
 };
 
 class IOUring {

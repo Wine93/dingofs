@@ -25,6 +25,7 @@
 #include <iostream>
 
 #include "cache/cachegroup/server.h"
+#include "cache/common/slab_pool.h"
 #include "common/flag.h"
 #include "common/helper.h"
 #include "common/logging.h"
@@ -99,6 +100,7 @@ int DingoCache::ParseFlags(int argc, char** argv) {
 }
 
 void DingoCache::GlobalInitOrDie() {
+  InitializeGlobalSlabPool();
   Logger::Init("dingo-cache");
   LOG(INFO) << GenCurrentFlags();
 }

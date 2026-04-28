@@ -26,14 +26,21 @@
 #include <ostream>
 
 #include "cache/cachegroup/node.h"
+#include "common/io_buffer.h"
 #include "dingofs/blockcache.pb.h"
+#include "dingofs/infiniband.pb.h"
 
 namespace dingofs {
 namespace cache {
 
+enum class ServiceType : uint8_t {
+  kBRPC = 0,
+  kRDMA = 1,
+};
+
 class BlockCacheServiceImpl final : public pb::cache::BlockCacheService {
  public:
-  explicit BlockCacheServiceImpl(CacheNodeSPtr node);
+  BlockCacheServiceImpl(ServiceType service_type, CacheNode* node);
 
   void Put(google::protobuf::RpcController* controller,
            const pb::cache::PutRequest* request,
@@ -70,7 +77,11 @@ class BlockCacheServiceImpl final : public pb::cache::BlockCacheService {
     return Status::OK();
   }
 
-  CacheNodeSPtr node_;
+  IOBuffer GetRequestAttachment(google::protobuf::RpcController* controller);
+  void SetResponseAttachment();
+
+  ServiceType service_type_;
+  CacheNode* node_;
 };
 
 }  // namespace cache

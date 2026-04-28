@@ -23,9 +23,10 @@
 #ifndef DINGOFS_SRC_CACHE_BENCHMARK_WORKER_H_
 #define DINGOFS_SRC_CACHE_BENCHMARK_WORKER_H_
 
+#include <bthread/countdown_event.h>
+
 #include "cache/benchmark/collector.h"
 #include "cache/benchmark/factory.h"
-#include "cache/common/type.h"
 
 namespace dingofs {
 namespace cache {
@@ -39,12 +40,13 @@ class Worker {
 
  private:
   void ExecAllTasks();
-  void ExecTask(std::function<void()> task);
+  void ExecTask(Task task);
 
   uint64_t idx_;
   TaskFactorySPtr factory_;
   CollectorSPtr collector_;
-  BthreadCountdownEvent countdown_;
+  TaskContext context_;
+  bthread::CountdownEvent finished_;
 };
 
 using WorkerUPtr = std::unique_ptr<Worker>;

@@ -77,10 +77,19 @@ class IOBuffer {
     iobuf_.append_user_data(data, size, deleter);
   }
 
+  void AppendUserDataWithMeta(void* data, size_t size,
+                              std::function<void(void*)> deleter,
+                              uint64_t meta) {
+    iobuf_.append_user_data_with_meta(data, size, deleter, meta);
+  }
+
+  uint64_t GetFirstDataMeta() { return iobuf_.get_first_data_meta(); }
+
   void PopFront(size_t n) { iobuf_.pop_front(n); }
   void PopBack(size_t n) { iobuf_.pop_back(n); }
 
   size_t Size() const { return iobuf_.length(); }
+  size_t Length() const { return iobuf_.length(); }
 
   char* Fetch1() const {
     CHECK_EQ(iobuf_.backing_block_num(), 1);

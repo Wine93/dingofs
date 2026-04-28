@@ -32,6 +32,7 @@
 #include "cache/blockcache/cache_store.h"
 #include "cache/common/block_handle_helper.h"
 #include "cache/common/error.h"
+#include "cache/common/slab_pool.h"
 #include "common/io_buffer.h"
 #include "common/status.h"
 
@@ -63,25 +64,41 @@ struct ServiceClosure : public google::protobuf::Closure {
   Status& status;
 };
 
-BlockCacheServiceImpl::BlockCacheServiceImpl(CacheNodeSPtr node)
-    : node_(CHECK_NOTNULL(node)) {}
+BlockCacheServiceImpl::BlockCacheServiceImpl(ServiceType service_type,
+                                             CacheNode* node)
+    : service_type_(service_type), node_(CHECK_NOTNULL(node)) {}
+
+IOBuffer BlockCacheServiceImpl::GetRequestAttachment(
+    google::protobuf::RpcController* controller) {
+  if (service_type_ == ServiceType::kBRPC) {
+    auto* cntl = static_cast<brpc::Controller*>(controller);
+    return IOBuffer(cntl->request_attachment().movable());
+  } else if (service_type_ == ServiceType::kRDMA) {
+    auto* cntl = static_cast<infiniband::Controller*>(controller);
+  }
+
+  CHECK(false) << "Unknown service type";
+}
 
 void BlockCacheServiceImpl::Put(google::protobuf::RpcController* controller,
                                 const pb::cache::PutRequest* request,
                                 pb::cache::PutResponse* response,
                                 google::protobuf::Closure* done) {
   Status status;
-  auto* cntl = static_cast<brpc::Controller*>(controller);
   auto* srv_done = new ServiceClosure(done, request, response, status);
   brpc::ClosureGuard done_guard(srv_done);
 
-  IOBuffer block = IOBuffer(cntl->request_attachment().movable());
-  status = CheckBodySize(request->block_size(), block.Size());
-  if (status.ok()) {
-    BlockHandle handle = FromHandlePB(request->handle());
-    status = node_->Put(std::move(handle), std::move(block));
-  }
+  BlockHandle handle = FromHandlePB(request->handle());
+  IOBuffer block = GetRequestAttachment(controller);
+  status = node_->Put(std::move(handle), std::move(block));
   response->set_status(ToPBErr(status));
+}
+
+IOBuffer BlockCacheServiceImpl::AllocIOBuffer(size_t size) {
+  auto& slab_pool = GetGlobalSendSlabPool();
+
+  IOBuffer buffer;
+  buffer.AppendUserData(, size_t size, std::function<void(void*)> deleter);
 }
 
 void BlockCacheServiceImpl::Range(google::protobuf::RpcController* controller,
@@ -89,21 +106,48 @@ void BlockCacheServiceImpl::Range(google::protobuf::RpcController* controller,
                                   pb::cache::RangeResponse* response,
                                   google::protobuf::Closure* done) {
   Status status;
-  auto* cntl = static_cast<brpc::Controller*>(controller);
   auto* srv_done = new ServiceClosure(done, request, response, status);
   brpc::ClosureGuard done_guard(srv_done);
 
-  IOBuffer buffer;
-  bool cache_hit = false;
   BlockHandle handle = FromHandlePB(request->handle());
+  // 这么要考虑前后对齐, 需要对分配点内存
+  auto buffer = AllocIOBuffer(request->offset(), request->length());
   status = node_->Range(handle, request->offset(), request->length(), &buffer,
                         request->block_size(), &cache_hit);
-  if (status.ok()) {
-    cntl->response_attachment() = buffer.IOBuf().movable();
-  }
-  response->set_status(ToPBErr(status));
-  response->set_cache_hit(cache_hit);
+
+  // auto* cntl = static_cast<brpc::Controller*>(controller);
+
+  // IOBuffer buffer;
+  // bool cache_hit = false;
+  // if (status.ok()) {
+  //   cntl->response_attachment() = buffer.IOBuf().movable();
+  // }
+  // response->set_status(ToPBErr(status));
+  // response->set_cache_hit(cache_hit);
 }
+
+// void BlockCacheServiceImpl::Range(google::protobuf::RpcController*
+// controller,
+//                                   const pb::cache::RangeRequest* request,
+//                                   pb::cache::RangeResponse* response,
+//                                   google::protobuf::Closure* done) {
+//   Status status;
+//   auto* cntl = static_cast<brpc::Controller*>(controller);
+//   auto* srv_done = new ServiceClosure(done, request, response, status);
+//   brpc::ClosureGuard done_guard(srv_done);
+//
+//   IOBuffer buffer;
+//   bool cache_hit = false;
+//   BlockHandle handle = FromHandlePB(request->handle());
+//   status = node_->Range(handle, request->offset(), request->length(),
+//   &buffer,
+//                         request->block_size(), &cache_hit);
+//   if (status.ok()) {
+//     cntl->response_attachment() = buffer.IOBuf().movable();
+//   }
+//   response->set_status(ToPBErr(status));
+//   response->set_cache_hit(cache_hit);
+// }
 
 void BlockCacheServiceImpl::Cache(google::protobuf::RpcController* controller,
                                   const pb::cache::CacheRequest* request,

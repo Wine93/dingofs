@@ -173,10 +173,8 @@ void IOUring::Cleanup() {
 void IOUring::PrepWrite(io_uring_sqe* sqe, Aio* aio) const {
   const auto& attr = aio->Attr();
   if (attr.buf_index >= 0) {
-    int idx = fixed_buffers_->GetIndex(false, attr.buf_index);
-    CHECK_GE(idx, 0) << "Invalid write buffer index " << attr.buf_index;
     io_uring_prep_write_fixed(sqe, attr.fd, attr.buffer, attr.length,
-                              attr.offset, idx);
+                              attr.offset, attr.buf_index);
   } else {
     io_uring_prep_write(sqe, attr.fd, attr.buffer, attr.length, attr.offset);
   }
@@ -185,10 +183,8 @@ void IOUring::PrepWrite(io_uring_sqe* sqe, Aio* aio) const {
 void IOUring::PrepRead(io_uring_sqe* sqe, Aio* aio) const {
   const auto& attr = aio->Attr();
   if (attr.buf_index >= 0) {
-    int idx = fixed_buffers_->GetIndex(true, attr.buf_index);
-    CHECK_GE(idx, 0) << "Invalid read buffer index " << attr.buf_index;
     io_uring_prep_read_fixed(sqe, attr.fd, attr.buffer, attr.length,
-                             attr.offset, idx);
+                             attr.offset, attr.buf_index);
   } else {
     io_uring_prep_read(sqe, attr.fd, attr.buffer, attr.length, attr.offset);
   }

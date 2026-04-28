@@ -22,6 +22,7 @@
 
 #include "cache/blockcache/local_filesystem.h"
 
+#include <bits/types/struct_iovec.h>
 #include <butil/memory/aligned_memory.h>
 #include <butil/memory/scope_guard.h>
 #include <fcntl.h>
@@ -37,6 +38,7 @@
 #include "cache/blockcache/disk_cache_layout.h"
 #include "cache/blockcache/disk_health_checker.h"
 #include "cache/common/macro.h"
+#include "cache/common/slab_pool.h"
 #include "cache/iutil/buffer_pool.h"
 #include "cache/iutil/file_util.h"
 #include "cache/iutil/inflight_tracker.h"
@@ -53,14 +55,15 @@ DEFINE_bool(fix_buffer, true, "whether to use fixed buffer for aio");
 LocalFileSystem::LocalFileSystem(DiskCacheLayoutSPtr layout)
     : running_(false),
       layout_(layout),
-      write_buffer_pool_(std::make_unique<BufferPool>(4 * kMiB, FLAGS_iodepth,
-                                                      kAlignedIOBlockSize)),
-      read_buffer_pool_(std::make_unique<BufferPool>(4 * kMiB, FLAGS_iodepth,
-                                                     kAlignedIOBlockSize)),
       inflight_(FLAGS_iodepth),
-      aio_queue_(std::make_unique<AioQueue>(write_buffer_pool_->Fetch(),
-                                            read_buffer_pool_->Fetch())),
-      health_checker_(std::make_unique<DiskHealthChecker>(layout)) {}
+      health_checker_(std::make_unique<DiskHealthChecker>(layout)) {
+  // aio_queue_(std::make_unique<AioQueue>(write_buffer_pool_->Fetch(),
+  //                                       read_buffer_pool_->Fetch())),
+  //
+  auto send_buffers = GetGlobalSendSlabPool().Fetch();
+  auto recv_buffers = GetGlobalSendSlabPool().Fetch();
+  auto fixed_buffers = std::vector<iovec>();
+}
 
 Status LocalFileSystem::Start() {
   if (running_.load(std::memory_order_relaxed)) {
@@ -154,7 +157,8 @@ Status LocalFileSystem::WriteFile(const std::string& path,
 
   IOBuffer tbuffer;
   int buf_index = AllocateAlignedMemory(&tbuffer, aligned_length, false);
-  buffer->CopyTo(tbuffer.Fetch1());
+  // buffer->CopyTo(tbuffer.Fetch1());
+
   status = AioWrite(fd, tbuffer.Fetch1(), aligned_length, buf_index);
   if (!status.ok()) {
     LOG(ERROR) << "Fail to write file'`" << tmppath << "'";
@@ -163,8 +167,7 @@ Status LocalFileSystem::WriteFile(const std::string& path,
 
   status = iutil::Rename(tmppath, path);
   if (!status.ok()) {
-    LOG(ERROR) << "Fail to rename file from `" << tmppath << "' to `" << path
-               << "'";
+    LOG(ERROR) << "Fail to rename `" << tmppath << "' to `" << path << "'";
     return status;
   }
   return status;
@@ -198,7 +201,7 @@ Status LocalFileSystem::ReadFile(const std::string& path, off_t offset,
 
   off_t aligned_offset = AlignOffset(offset);
   size_t aligned_length = AlignLength(length + offset - aligned_offset);
-  int buf_index = AllocateAlignedMemory(buffer, aligned_length, true);
+  int buf_index = GetGlobalSendSlabPool().IndexOf(buffer->Fetch1());
   status =
       AioRead(fd, aligned_offset, aligned_length, buffer->Fetch1(), buf_index);
   if (status.ok()) {
