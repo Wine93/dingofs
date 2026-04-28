@@ -15,6 +15,7 @@
 add_subdirectory(common)
 add_subdirectory(iutil)
 add_subdirectory(blockcache)
+add_subdirectory(infiniband)
 #add_subdirectory(remotecache)
 #add_subdirectory(cachegroup)
 #add_subdirectory(tiercache)
