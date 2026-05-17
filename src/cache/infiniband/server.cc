@@ -119,9 +119,11 @@ ConnectionUPtr Listener::Accept(const ConnMangmentMeta& remote_cm_meta) {
                                       std::move(completion_queue));
 }
 
-InfinibandServiceImpl::InfinibandServiceImpl(Listener* listener)
-    : listener_(listener) {
+InfinibandServiceImpl::InfinibandServiceImpl(Listener* listener,
+                                             Messenger* messenger)
+    : listener_(listener), messenger_(messenger) {
   CHECK_NOTNULL(listener_);
+  CHECK_NOTNULL(messenger_);
 }
 
 void InfinibandServiceImpl::Sync(google::protobuf::RpcController* controller,
@@ -170,7 +172,7 @@ void InfinibandServiceImpl::Sync(google::protobuf::RpcController* controller,
   // is torn down. TODO(wine93): wire session lifecycle to a server-side
   // registry so it can be reclaimed on shutdown / connection close.
   // FIXME: delete session when connection closed
-  auto* session = new ServerRDMASession(std::move(conn));
+  auto* session = new ServerRDMASession(std::move(conn), messenger_);
   session->Start();
 
   auto status = session->OnEstablished();
@@ -204,8 +206,8 @@ void InfinibandServiceImpl::Sync(google::protobuf::RpcController* controller,
             << " local=" << local_cm_meta << " fd=" << fd;
 }
 
-ServerRDMASession::ServerRDMASession(ConnectionUPtr conn)
-    : conn_(std::move(conn)) {}
+ServerRDMASession::ServerRDMASession(ConnectionUPtr conn, Messenger* messenger)
+    : conn_(std::move(conn)), messenger_(messenger) {}
 
 void ServerRDMASession::Start() {
   bthread::ExecutionQueueOptions options;
@@ -422,7 +424,9 @@ void ServerRDMASession::OnResponseSent(const WorkCompletion& wc) {
 
 Server::Server()
     : listener_(std::make_unique<Listener>()),
-      service_(std::make_unique<InfinibandServiceImpl>(listener_.get())) {}
+      messenger_(std::make_unique<Messenger>()),
+      service_(std::make_unique<InfinibandServiceImpl>(listener_.get(),
+                                                       messenger_.get())) {}
 
 Status Server::Start(const EndPoint& ep, ServerOptions* options) {
   auto* brpc_server = options->brpc_server;

@@ -17,8 +17,11 @@
 #include <brpc/server.h>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
+#include <google/protobuf/service.h>
 
+#include "cache/infiniband/controller.h"
 #include "cache/infiniband/server.h"
+#include "dingofs/infiniband.pb.h"
 
 DEFINE_string(device, "mlx5_0", "IB device name (e.g. mlx5_0)");
 DEFINE_int32(port_num, 1, "IB HCA port, 1-based");
@@ -31,9 +34,21 @@ int main(int argc, char** argv) {
   FLAGS_logtostderr = true;
 
   using namespace dingofs::cache::infiniband;  // NOLINT
+  namespace pb_ib = dingofs::pb::infiniband;
 
   brpc::Server brpc_server;
   Server rdma_server;
+
+  // Register RangeRequest handler: echo back num + 1.
+  rdma_server.RegisterHandler(
+      [](Controller* /*cntl*/, const pb_ib::RangeRequest* req,
+         pb_ib::RangeResponse* resp, google::protobuf::Closure* done) {
+        uint64_t in = req->num();
+        uint64_t out = in + 1;
+        resp->set_num(out);
+        LOG(INFO) << "Handle RangeRequest: num=" << in << " -> " << out;
+        done->Run();
+      });
 
   EndPoint ep;
   ep.device_name = FLAGS_device;

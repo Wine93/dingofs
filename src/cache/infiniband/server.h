@@ -59,7 +59,7 @@ using ListenerUPtr = std::unique_ptr<Listener>;
 
 class InfinibandServiceImpl final : public pb::infiniband::InfinibandService {
  public:
-  explicit InfinibandServiceImpl(Listener* listener);
+  InfinibandServiceImpl(Listener* listener, Messenger* messenger);
 
   void Sync(google::protobuf::RpcController* controller,
             const pb::infiniband::SyncRequest* request,
@@ -68,6 +68,7 @@ class InfinibandServiceImpl final : public pb::infiniband::InfinibandService {
 
  private:
   Listener* listener_;
+  Messenger* messenger_;
 };
 
 class RDMAClosure : public ::google::protobuf::Closure {
@@ -81,7 +82,7 @@ class RDMAClosure : public ::google::protobuf::Closure {
 
 class ServerRDMASession : public EventHandler {
  public:
-  explicit ServerRDMASession(ConnectionUPtr conn);
+  ServerRDMASession(ConnectionUPtr conn, Messenger* messenger);
   void Start();
   void Shutdown();
 
@@ -114,10 +115,14 @@ class Server {
   Status Start(const EndPoint& ep, ServerOptions* options);
   Status Shutdown();
 
-  void RegisterHandler();
+  template <typename F>
+  void RegisterHandler(F&& handler) {
+    messenger_->RegisterHandler(std::forward<F>(handler));
+  }
 
  private:
   ListenerUPtr listener_;
+  MessengerUPtr messenger_;
   std::unique_ptr<pb::infiniband::InfinibandService> service_;
 };
 
