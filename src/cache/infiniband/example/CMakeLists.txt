@@ -21,3 +21,14 @@ add_executable(rdma_client rdma_client.cc)
 target_link_libraries(rdma_client
     cache_infiniband
 )
+
+# brpc/TCP counterparts for latency comparison against the RDMA path.
+add_executable(brpc_server brpc_server.cc)
+target_link_libraries(brpc_server
+    cache_infiniband
+)
+
+add_executable(brpc_client brpc_client.cc)
+target_link_libraries(brpc_client
+    cache_infiniband
+)

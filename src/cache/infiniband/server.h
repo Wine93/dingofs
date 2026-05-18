@@ -49,6 +49,8 @@ class Listener {
   Status Listen(const EndPoint& ep);
   ConnectionUPtr Accept(const ConnMangmentMeta& remote_cm_meta);
 
+  ProtectDomain* GetProtectDomain() const { return protect_domain_.get(); }
+
  private:
   DeviceUPtr device_;
   PortUPtr port_;
@@ -114,6 +116,8 @@ class Server {
   Server();
   Status Start(const EndPoint& ep, ServerOptions* options);
   Status Shutdown();
+
+  ProtectDomain* GetProtectDomain() const { return listener_->GetProtectDomain(); }
 
   template <typename F>
   void RegisterHandler(F&& handler) {

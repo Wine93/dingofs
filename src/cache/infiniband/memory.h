@@ -39,10 +39,11 @@ class RDMAMemoryPool;
 using RDMAMemoryPoolUPtr = std::unique_ptr<RDMAMemoryPool>;
 
 struct Buffer {
-  char* data;
-  uint32_t lkey;
-  uint32_t capacity;
-  uint32_t length;
+  char* data{nullptr};
+  uint32_t capacity{0};
+  uint32_t length{0};
+  uint32_t lkey{0};
+  uint32_t rkey{0};
 };
 
 // RDMA-aware wrapper around MemoryPool: the inner pool owns the
@@ -54,6 +55,8 @@ class RDMAMemoryPool {
   RDMAMemoryPool(MemoryPoolUPtr pool, ibv_mr* mr, std::vector<Buffer> buffers);
   ~RDMAMemoryPool();
 
+  static RDMAMemoryPoolUPtr Create(std::string& device_name, size_t buffer_size,
+                                   size_t buffer_count);
   static RDMAMemoryPoolUPtr Create(ProtectDomain* protect_domain,
                                    size_t buffer_size, size_t buffer_count);
 
@@ -62,6 +65,10 @@ class RDMAMemoryPool {
   void Release(Buffer* buffer);
 
  private:
+  // Owned only when created via Create(device_name, ...); nullptr when the
+  // protect domain is borrowed. Declared first so they outlive mr_/pool_.
+  DeviceUPtr device_;
+  ProtectDomainUPtr pd_;
   ibv_mr* mr_;
   std::vector<Buffer> buffers_;
   MemoryPoolUPtr pool_;

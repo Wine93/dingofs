@@ -37,15 +37,20 @@ namespace dingofs {
 namespace cache {
 namespace infiniband {
 
+struct MemoryContext {
+  uint64_t addr{0};
+  uint32_t length{0};
+  uint32_t rkey{0};
+};
+
 struct Controller {
   uint64_t correlation_id{0};
   Status status{Status::Unknown("unknown")};
 
   // request
   Buffer* request_buffer{nullptr};  // => request_buffer
-  uint64_t raddr{0};
-  uint32_t rkey{0};
   bthread::CountdownEvent request_sent{1};
+  MemoryContext request_memory_context{};
 
   // response
   Buffer* response_buffer{nullptr};

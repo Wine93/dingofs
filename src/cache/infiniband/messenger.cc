@@ -94,8 +94,7 @@ Status Messenger::Dispatch(Controller* cntl,
                            google::protobuf::Closure* done) {
   auto it = handlers_.find(request.body_case());
   if (it == handlers_.end()) {
-    LOG(WARNING) << "No handler for request body_case=" << request.body_case()
-                 << ", request_id=" << request.request_id();
+    LOG(WARNING) << "No handler for request body_case=" << request.body_case();
     // if (done != nullptr) {
     //   done->Run();
     // }

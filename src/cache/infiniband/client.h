@@ -57,6 +57,8 @@ class Dialer {
 
   ConnectionUPtr Dial(const std::string& address);
 
+  ProtectDomain* GetProtectDomain() const { return protect_domain_.get(); }
+
  private:
   Status SyncConnMangmentMeta(const std::string& address,
                               const ConnMangmentMeta& local_cm_meta,
@@ -97,17 +99,19 @@ class Client {
 
   Status Connect(const std::string& address);
 
+  ProtectDomain* GetProtectDomain() const { return dialer_->GetProtectDomain(); }
+
   template <typename Req, typename Resp>
-  Status Call(const Req& request, Resp* response) {
+  Status Call(Controller* cntl, const Req& request, Resp* response) {
     static_assert(std::is_base_of_v<google::protobuf::Message, Req>,
                   "Req must be a protobuf Message type");
     static_assert(std::is_base_of_v<google::protobuf::Message, Resp>,
                   "Resp must be a protobuf Message type");
-    return DoCall(request, response);
+    return DoCall(cntl, request, response);
   }
 
  private:
-  Status DoCall(const google::protobuf::Message& request,
+  Status DoCall(Controller* cntl, const google::protobuf::Message& request,
                 google::protobuf::Message* response);
 
   DialerUPtr dialer_;

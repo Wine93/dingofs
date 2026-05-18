@@ -41,6 +41,29 @@ RDMAMemoryPool::~RDMAMemoryPool() {
   }
 }
 
+RDMAMemoryPoolUPtr RDMAMemoryPool::Create(std::string& device_name,
+                                          size_t buffer_size,
+                                          size_t buffer_count) {
+  auto device = Device::Open(device_name);
+  if (device == nullptr) {
+    return nullptr;
+  }
+
+  auto pd = ProtectDomain::Alloc(device.get());
+  if (pd == nullptr) {
+    return nullptr;
+  }
+
+  auto pool = Create(pd.get(), buffer_size, buffer_count);
+  if (pool == nullptr) {
+    return nullptr;
+  }
+
+  pool->device_ = std::move(device);
+  pool->pd_ = std::move(pd);
+  return pool;
+}
+
 RDMAMemoryPoolUPtr RDMAMemoryPool::Create(ProtectDomain* protect_domain,
                                           size_t buffer_size,
                                           size_t buffer_count) {
@@ -63,7 +86,8 @@ RDMAMemoryPoolUPtr RDMAMemoryPool::Create(ProtectDomain* protect_domain,
   buffers.reserve(buffer_count);
   for (size_t i = 0; i < buffer_count; ++i) {
     buffers.push_back({pool->base() + (i * buffer_size),
-                       static_cast<uint32_t>(buffer_size), mr->lkey, mr->rkey});
+                       static_cast<uint32_t>(buffer_size), 0, mr->lkey,
+                       mr->rkey});
   }
 
   LOG(INFO) << "Successfully create RDMAMemoryPool{buffer_size=" << buffer_size

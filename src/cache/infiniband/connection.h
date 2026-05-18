@@ -29,6 +29,7 @@
 #include <functional>
 #include <memory>
 #include <utility>
+#include <vector>
 
 #include "cache/infiniband/event.h"
 #include "cache/infiniband/infiniband.h"
@@ -89,8 +90,7 @@ struct WorkCompletion {
 };
 
 struct CompletionBatch {
-  WorkCompletion* entries;
-  int n;
+  std::shared_ptr<std::vector<WorkCompletion>> wcs;
 };
 
 class Connection {

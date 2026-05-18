@@ -156,13 +156,12 @@ bool Connection::HandleCompletion(CompletionHandler handler) {
 }
 
 bool Connection::PollCompletionQueue(CompletionHandler handler) {
-  static const int kMaxWcNum = 32;
-  static std::vector<ibv_wc> cqe(kMaxWcNum);
-  static std::vector<WorkCompletion> work_completions(kMaxWcNum);
+  static constexpr int kMaxWcNum = 32;
+  ibv_wc cqe[kMaxWcNum];
   auto* cq = completion_queue_->GetIbCq();
 
   do {
-    int n = ibv_poll_cq(cq, kMaxWcNum, cqe.data());
+    int n = ibv_poll_cq(cq, kMaxWcNum, cqe);
     if (n < 0) {
       PLOG(ERROR) << "Fail to poll completion queue";
       return false;
@@ -170,38 +169,47 @@ bool Connection::PollCompletionQueue(CompletionHandler handler) {
       return true;
     }
 
+    auto wcs = std::make_shared<std::vector<WorkCompletion>>(n);
     for (int i = 0; i < n; i++) {
+      auto& wc = (*wcs)[i];
+
       // wr_id
-      work_completions[i].id = cqe[i].wr_id;
+      wc.id = cqe[i].wr_id;
 
       // status
       switch (cqe[i].status) {
         case IBV_WC_SUCCESS:
-          work_completions[i].status = Status::OK();
+          wc.status = Status::OK();
           break;
         default:
-          work_completions[i].status = Status::IoError("work request failed");
+          wc.status = Status::IoError(ibv_wc_status_str(cqe[i].status));
+          LOG(ERROR) << "[DBG] WR failed: wr_id=0x" << std::hex << cqe[i].wr_id
+                     << " opcode=" << std::dec << cqe[i].opcode
+                     << " vendor_err=0x" << std::hex << cqe[i].vendor_err
+                     << " status=" << ibv_wc_status_str(cqe[i].status);
       }
 
       // opcode
       switch (cqe[i].opcode) {
         case IBV_WC_SEND:
-          work_completions[i].optype = OpType::kSend;
+          wc.optype = OpType::kSend;
           break;
 
         case IBV_WC_RECV:
-          work_completions[i].optype = OpType::kRecv;
+          wc.optype = OpType::kRecv;
           break;
 
         default:
-          work_completions[i].optype = OpType::kUnknown;
+          wc.optype = OpType::kUnknown;
       }
 
       // bytes_len
-      work_completions[i].byte_len = cqe[i].byte_len;
+      wc.byte_len = cqe[i].byte_len;
     }
 
-    handler(CompletionBatch{work_completions.data(), n});
+    // LOG(INFO) << "Successfully poll " << n << " work completions";
+
+    handler(CompletionBatch{std::move(wcs)});
 
     if (n < kMaxWcNum) {
       break;

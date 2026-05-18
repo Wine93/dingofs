@@ -240,10 +240,10 @@ int ServerRDMASession::HandleWorkCompletion(
 
   auto* session = static_cast<ServerRDMASession*>(meta);
   for (; iter; iter++) {
-    auto batch = *iter;
-    for (int i = 0; i < batch.n; i++) {
-      auto wc = batch.entries[i];
+    auto& batch = *iter;
+    for (const auto& wc : *batch.wcs) {
       switch (wc.optype) {
+        // FIXME: 这里需要先判断 status，因为有些字段在 status!=OK 下是无效的
         case OpType::kRecv:  // request received
           session->OnRequestReceived(wc);
           break;
@@ -293,6 +293,11 @@ Status ServerRDMASession::OnEstablished() {
 }
 
 void ServerRDMASession::OnRequestReceived(const WorkCompletion& wc) {
+  if (!wc.status.ok()) {
+    LOG(ERROR) << "Fail to receive request: " << wc.status.ToString();
+    return;
+  }
+
   auto* buffer = reinterpret_cast<Buffer*>(wc.id);
   CHECK_NOTNULL(buffer);
   buffer->length = wc.byte_len;
@@ -334,8 +339,12 @@ Status ServerRDMASession::ProcessRequest(
     LOG(ERROR) << "Fail to parse infiniband request";
     return status;
   }
-  cntl->raddr = ib_request.meta().addr();
-  cntl->rkey = ib_request.meta().lkey();
+
+  // memory ctx
+  auto& ctx = cntl->request_memory_context;
+  ctx.addr = ib_request.memory_context().addr();
+  ctx.length = ib_request.memory_context().length();
+  ctx.rkey = ib_request.memory_context().rkey();
 
   // return receive work request
   RecvWorkRequest entry;
@@ -374,8 +383,10 @@ Status ServerRDMASession::SendResponse(
     entry.addr = reinterpret_cast<uint64_t>(attachment->data);
     entry.length = attachment->length;
     entry.lkey = attachment->lkey;
-    entry.raddr = cntl->raddr;
-    entry.rkey = cntl->rkey;
+    entry.raddr = cntl->request_memory_context.addr;
+    entry.rkey = cntl->request_memory_context.rkey;
+
+    // FIXME: check cntl->request_memory_context.length >= attchment->length
 
     entries.emplace_back(entry);
   }
@@ -417,9 +428,15 @@ Status ServerRDMASession::SendResponse(
 }
 
 void ServerRDMASession::OnResponseSent(const WorkCompletion& wc) {
+  if (!wc.status.ok()) {
+    LOG(ERROR) << "Fail to send response: " << wc.status.ToString();
+    return;
+  }
+
   auto* cntl = reinterpret_cast<Controller*>(wc.id);
   cntl->status = wc.status;
   cntl->response_sent.signal();
+  // LOG(INFO) << "<<< response sent";
 }
 
 Server::Server()
