@@ -70,6 +70,8 @@ EventDispatcher& GetGlobalEventDispatcher(int fd) {
                        FLAGS_rdma_event_dispatcher_num];
 }
 
+EventDispatcher::EventDispatcher() : epoll_fd_(-1), running_(false) {}
+
 EventDispatcher::~EventDispatcher() {
   if (running_.load(std::memory_order_acquire)) {
     Shutdown();
@@ -78,6 +80,7 @@ EventDispatcher::~EventDispatcher() {
 
 Status EventDispatcher::Start() {
   if (running_.load(std::memory_order_acquire)) {
+    LOG(WARNING) << "EventDispatcher already started";
     return Status::OK();
   }
 
@@ -94,6 +97,7 @@ Status EventDispatcher::Start() {
 
 Status EventDispatcher::Shutdown() {
   if (!running_.exchange(false, std::memory_order_acq_rel)) {
+    LOG(WARNING) << "EventDispatcher already shutdown";
     return Status::OK();
   }
 
@@ -106,16 +110,13 @@ Status EventDispatcher::Shutdown() {
   return Status::OK();
 }
 
-// Send a "poison pill": register a signaled eventfd with a null handler.
-// The worker wakes from epoll_wait, skips the null handler, then exits
-// the loop because running_ is already false. Closing the fd auto-drops
-// it from epoll, so no DelEvent is needed.
 void EventDispatcher::NotifyAndWaitWorkerStop() {
   int notify_fd = eventfd(0, EFD_CLOEXEC);
   CHECK_GE(notify_fd, 0);
 
   uint64_t one = 1;
-  ssize_t r = ::write(notify_fd, &one, sizeof(one));
+  ssize_t nwritten = ::write(notify_fd, &one, sizeof(one));
+  CHECK_EQ(nwritten, sizeof(one));
   CHECK(AddEvent(notify_fd, EventType::kReadEvent, nullptr).ok());
 
   if (worker_thread_.joinable()) {

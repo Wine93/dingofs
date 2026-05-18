@@ -47,7 +47,7 @@ enum class EventType : uint8_t {
 
 class EventDispatcher {
  public:
-  EventDispatcher() = default;
+  EventDispatcher();
   ~EventDispatcher();
 
   Status Start();
@@ -57,14 +57,14 @@ class EventDispatcher {
   Status DelEvent(int fd) const;
 
  private:
+  static constexpr const int kMaxEvents = 1024;
+
   void EventWorker();
   void NotifyAndWaitWorkerStop();
 
-  int epoll_fd_{-1};
-  std::atomic<bool> running_{false};
+  int epoll_fd_;
+  std::atomic<bool> running_;
   std::thread worker_thread_;
-
-  static constexpr int kMaxEvents = 1024;
 };
 
 void InitializeGlobalDispatchers();
