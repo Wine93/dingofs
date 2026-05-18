@@ -409,9 +409,9 @@ std::ostream& operator<<(std::ostream& os, LinkLayer link_layer) {
 }
 
 std::ostream& operator<<(std::ostream& os, const ConnMangmentMeta& cm_meta) {
-  // GID 按 IPv6 风格输出：8 组 16-bit hex，冒号分隔。
   auto flags = os.flags();
   auto fill = os.fill();
+
   os << "ConnMangmentMeta{qpn=" << cm_meta.qpn << " lid=" << cm_meta.lid
      << " port_num=" << static_cast<int>(cm_meta.port_num)
      << " link_type=" << cm_meta.link_type
@@ -426,8 +426,10 @@ std::ostream& operator<<(std::ostream& os, const ConnMangmentMeta& cm_meta) {
     os << std::setw(4) << word;
   }
   os << "}";
+
   os.flags(flags);
   os.fill(fill);
+
   return os;
 }
 
