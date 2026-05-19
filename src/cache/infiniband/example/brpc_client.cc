@@ -40,6 +40,10 @@ DEFINE_int32(rounds, 1, "Number of rounds; -1 means infinite");
 DEFINE_int32(timeout_ms, 30000, "Per-RPC timeout in ms");
 DEFINE_string(protocol, "baidu_std", "brpc protocol");
 DEFINE_string(connection_type, "single", "single | pooled | short");
+DEFINE_bool(use_rdma, false,
+            "If true, brpc connects to the server via its built-in RDMA "
+            "backend (after the TCP HelloMessage handshake). Server must "
+            "also be started with --use_rdma=true.");
 
 namespace pb_rb = dingofs::pb::range_bench;
 
@@ -60,11 +64,14 @@ int main(int argc, char** argv) {
   options.connection_type = FLAGS_connection_type;
   options.timeout_ms = FLAGS_timeout_ms;
   options.max_retry = 0;
+  options.use_rdma = FLAGS_use_rdma;
   if (channel.Init(FLAGS_server_address.c_str(), &options) != 0) {
-    LOG(ERROR) << "Fail to init channel: server=" << FLAGS_server_address;
+    LOG(ERROR) << "Fail to init channel: server=" << FLAGS_server_address
+               << " use_rdma=" << FLAGS_use_rdma;
     return 1;
   }
-  LOG(INFO) << "Connected to brpc server=" << FLAGS_server_address;
+  LOG(INFO) << "Connected to brpc server=" << FLAGS_server_address
+            << " use_rdma=" << FLAGS_use_rdma;
 
   pb_rb::RangeBenchService_Stub stub(&channel);
   std::mt19937_64 rng(std::random_device{}());
@@ -101,19 +108,18 @@ int main(int argc, char** argv) {
 
     // Pull head/tail markers out of the attachment (matches rdma_client's
     // verification step on the server-written 4MB region).
-    // const auto& body = cntl.response_attachment();
-    // uint64_t head = 0, tail = 0;
-    // if (body.size() >= 2 * sizeof(uint64_t)) {
-    //  body.copy_to(&head, sizeof(uint64_t), 0);
-    //  body.copy_to(&tail, sizeof(uint64_t), body.size() - sizeof(uint64_t));
-    //}
+    const auto& body = cntl.response_attachment();
+    uint64_t head = 0, tail = 0;
+    if (body.size() >= 2 * sizeof(uint64_t)) {
+      body.copy_to(&head, sizeof(uint64_t), 0);
+      body.copy_to(&tail, sizeof(uint64_t), body.size() - sizeof(uint64_t));
+    }
 
     ++success;
-    LOG(INFO) << "Round[" << i << "] OK: req.num=" << num << " resp.num="
-              << response.num()
-              //<< " attachment_size=" << body.size() << " head=" << head
-              //<< " tail=" << tail << ", cost "
-              << ", cost "
+    LOG(INFO) << "Round[" << i << "] OK: req.num=" << num
+              << " resp.num=" << response.num()
+              << " attachment_size=" << body.size() << " head=" << head
+              << " tail=" << tail << ", cost "
               << absl::StrFormat("%.6lf", timer.u_elapsed() * 1.0 / 1e6)
               << " seconds.";
   }
