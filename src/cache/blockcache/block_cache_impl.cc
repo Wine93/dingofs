@@ -163,6 +163,34 @@ Status BlockCacheImpl::Range(ContextSPtr ctx, const BlockContext& block_ctx,
   return store_->Load(ctx, block_ctx, offset, length, buffer);
 }
 
+Status BlockCacheImpl::Range(ContextSPtr ctx, const BlockContext& block_ctx,
+                             off_t offset, size_t length, char* data,
+                             size_t data_capacity, int buf_index,
+                             RangeOption /*option*/) {
+  DCHECK_RUNNING("BlockCacheImpl");
+
+  return store_->Load(ctx, block_ctx, offset, length, data, data_capacity,
+                      buf_index);
+}
+
+Status BlockCacheImpl::Cache(ContextSPtr ctx, const BlockContext& block_ctx,
+                             const char* data, size_t length, int buf_index,
+                             CacheOption /*option*/) {
+  DCHECK_RUNNING("BlockCacheImpl");
+
+  auto status = store_->Cache(ctx, block_ctx, data, length, buf_index);
+  if (status.IsCacheFull()) {
+    LOG_EVERY_SECOND(WARNING)
+        << "Cache block failed (zero-copy): key="
+        << block_ctx.key.Filename() << ", length=" << length
+        << ", status=" << status.ToString();
+  } else if (!status.ok()) {
+    LOG(ERROR) << "Fail to cache block (zero-copy) key="
+               << block_ctx.key.Filename();
+  }
+  return status;
+}
+
 Status BlockCacheImpl::Cache(ContextSPtr ctx, const BlockContext& block_ctx,
                              const Block& block, CacheOption /*option*/) {
   DCHECK_RUNNING("BlockCacheImpl");
@@ -267,6 +295,37 @@ void BlockCacheImpl::AsyncCache(ContextSPtr ctx,
           cb(status);
         }
 
+        tracker->Remove(block_ctx.key.Filename());
+      });
+
+  if (tid != 0) {
+    joiner_->BackgroundJoin(tid);
+  }
+}
+
+void BlockCacheImpl::AsyncCache(ContextSPtr ctx,
+                                const BlockContext& block_ctx,
+                                const char* data, size_t length, int buf_index,
+                                AsyncCallback cb, CacheOption option) {
+  DCHECK_RUNNING("BlockCacheImpl");
+
+  auto tracker = cache_tracker_;
+  auto status = tracker->Add(block_ctx.key.Filename());
+  if (status.IsExist()) {
+    if (cb) {
+      cb(status);
+    }
+    return;
+  }
+
+  auto* self = GetSelfPtr();
+  auto tid = iutil::RunInBthread(
+      [tracker, self, ctx, block_ctx, data, length, buf_index, cb, option]() {
+        Status status = self->Cache(ctx, block_ctx, data, length, buf_index,
+                                    option);
+        if (cb) {
+          cb(status);
+        }
         tracker->Remove(block_ctx.key.Filename());
       });
 

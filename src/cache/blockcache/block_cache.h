@@ -81,6 +81,25 @@ class BlockCache {
     return Status::NotSupport("not implemented");
   }
 
+  // Zero-copy overloads: `data` is a caller-provided contiguous buffer also
+  // registered as an io_uring fixed buffer at `buf_index`. Used by the RDMA
+  // service path so the disk read/write targets the RDMA-registered memory
+  // directly. Default impl falls through to the IOBuffer-based variants
+  // (with the existing one-copy bounce).
+  virtual Status Range(ContextSPtr /*ctx*/, const BlockContext& /*block_ctx*/,
+                       off_t /*offset*/, size_t /*length*/, char* /*data*/,
+                       size_t /*data_capacity*/, int /*buf_index*/,
+                       [[maybe_unused]] RangeOption option = RangeOption()) {
+    return Status::NotSupport("not implemented");
+  }
+
+  virtual Status Cache(ContextSPtr /*ctx*/, const BlockContext& /*block_ctx*/,
+                       const char* /*data*/, size_t /*length*/,
+                       int /*buf_index*/,
+                       [[maybe_unused]] CacheOption option = CacheOption()) {
+    return Status::NotSupport("not implemented");
+  }
+
   virtual Status Prefetch(
       ContextSPtr /*ctx*/, const BlockContext& /*block_ctx*/,
       size_t /*length*/,
@@ -110,6 +129,17 @@ class BlockCache {
   virtual void AsyncCache(ContextSPtr /*ctx*/,
                           const BlockContext& /*block_ctx*/,
                           const Block& /*block*/, AsyncCallback cb,
+                          [[maybe_unused]] CacheOption option = CacheOption()) {
+    if (cb) {
+      cb(Status::NotSupport("not implemented"));
+    }
+  }
+
+  // Zero-copy async overload — see Cache() above.
+  virtual void AsyncCache(ContextSPtr /*ctx*/,
+                          const BlockContext& /*block_ctx*/,
+                          const char* /*data*/, size_t /*length*/,
+                          int /*buf_index*/, AsyncCallback cb,
                           [[maybe_unused]] CacheOption option = CacheOption()) {
     if (cb) {
       cb(Status::NotSupport("not implemented"));

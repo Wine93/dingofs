@@ -197,19 +197,15 @@ bool Connection::PollCompletionQueue(CompletionHandler handler) {
         case IBV_WC_SEND:
           wc.opcode = OpCode::kSend;
           break;
-
         case IBV_WC_RECV:
           wc.opcode = OpCode::kRecv;
           break;
-
         case IBV_WC_RDMA_WRITE:
           wc.opcode = OpCode::kRDMAWrite;
           break;
-
         case IBV_WC_RDMA_READ:
           wc.opcode = OpCode::kRDMARead;
           break;
-
         default:
           wc.opcode = OpCode::kUnknown;
       }

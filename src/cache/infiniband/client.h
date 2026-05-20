@@ -28,6 +28,7 @@
 #include <google/protobuf/message.h>
 
 #include <memory>
+#include <string_view>
 #include <type_traits>
 
 #include "cache/infiniband/client_session.h"
@@ -51,21 +52,24 @@ using ClientUPtr = std::unique_ptr<Client>;
 
 class Dialer {
  public:
-  Dialer(DeviceUPtr device, PortUPtr port, ProtectDomainUPtr protect_domain);
+  Dialer(Device* device, Port* port, ProtectDomain* protect_domain);
   static DialerUPtr Create(const EndPoint& ep);
 
   ConnectionUPtr Dial(const std::string& address);
 
-  ProtectDomain* GetProtectDomain() const { return protect_domain_.get(); }
+  ProtectDomain* GetProtectDomain() const { return protect_domain_; }
 
  private:
   Status SyncConnMangmentMeta(const std::string& address,
                               const ConnMangmentMeta& local_cm_meta,
                               ConnMangmentMeta* remote_cm_meta);
 
-  DeviceUPtr device_;
-  PortUPtr port_;
-  ProtectDomainUPtr protect_domain_;
+  // Borrowed pointers — owned by the process-wide DeviceRegistry. Same PD
+  // is shared with any RDMAMemoryPool registered on this device, so QP
+  // lkey/rkey match the client-side global buffer pool.
+  Device* device_{nullptr};
+  Port* port_{nullptr};
+  ProtectDomain* protect_domain_{nullptr};
 };
 
 class Client {
@@ -80,16 +84,20 @@ class Client {
   }
 
   template <typename Req, typename Resp>
-  Status Call(Controller* cntl, const Req& request, Resp* response) {
+  Status Call(Controller* cntl, std::string_view service_name,
+              std::string_view method_name, const Req& request,
+              Resp* response) {
     static_assert(std::is_base_of_v<google::protobuf::Message, Req>,
                   "Req must be a protobuf Message type");
     static_assert(std::is_base_of_v<google::protobuf::Message, Resp>,
                   "Resp must be a protobuf Message type");
-    return DoCall(cntl, request, response);
+    return DoCall(cntl, service_name, method_name, request, response);
   }
 
  private:
-  Status DoCall(Controller* cntl, const google::protobuf::Message& request,
+  Status DoCall(Controller* cntl, std::string_view service_name,
+                std::string_view method_name,
+                const google::protobuf::Message& request,
                 google::protobuf::Message* response);
 
   DialerUPtr dialer_;

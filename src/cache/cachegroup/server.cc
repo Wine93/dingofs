@@ -24,7 +24,12 @@
 
 #include <atomic>
 
+#include "cache/cachegroup/rdma_service.h"
 #include "cache/cachegroup/service.h"
+#include "cache/common/use_rdma_flag.h"
+#include "cache/infiniband/connection.h"
+#include "cache/infiniband/memory.h"
+#include "cache/infiniband/server.h"
 #include "cache/iutil/string_util.h"
 #include "common/options/cache.h"
 #include "fmt/format.h"
@@ -43,6 +48,19 @@ DEFINE_validator(listen_ip, iutil::StringValidator);
 
 DEFINE_uint32(listen_port, 9300, "port to listen on for this cache node");
 
+DEFINE_string(rdma_listen_device, "mlx5_0",
+              "IB device the cache RDMA server listens on (matches "
+              "Listener::Listen)");
+DEFINE_uint32(rdma_listen_port_num, 1,
+              "HCA port (1-based) the cache RDMA server listens on");
+DEFINE_uint32(rdma_server_attachment_buffer_size, 4 * 1024 * 1024,
+              "Per-buffer size of the server-side RDMA attachment pool. Must "
+              "be >= the largest block_size handled.");
+DEFINE_uint32(rdma_server_attachment_pool_size, 256,
+              "Number of buffers in the server-side RDMA attachment pool. "
+              "Bounds the in-flight RDMA Range/Cache concurrency on the "
+              "server.");
+
 static void PrintReadyInfo(const std::string& addr) {
   std::cout << "\n";
   std::cout << "dingo-cache is listening on " << addr;
@@ -55,7 +73,6 @@ Server::Server()
       node_(std::make_shared<CacheNode>()),
       service_(std::make_unique<BlockCacheServiceImpl>(node_)),
       server_(std::make_unique<::brpc::Server>()) {}
-// 这里添加一个 rdma_server();
 
 Status Server::Start() {
   if (running_.load(std::memory_order_relaxed)) {
@@ -67,7 +84,17 @@ Status Server::Start() {
 
   InstallSignal();
 
-  // TODO: 先启动 rdma server，再启动 bthread server
+  // The RDMA listener and its attachment pool share a PD per device
+  // (DeviceRegistry in rdma_memory.cc). The brpc server hosts the
+  // InfinibandService used for the RDMA handshake, so we must bring the
+  // RDMA server up before starting the brpc server.
+  if (FLAGS_use_rdma) {
+    auto status = StartRDMAServer();
+    if (!status.ok()) {
+      LOG(ERROR) << "Fail to start RDMA server: " << status.ToString();
+      return status;
+    }
+  }
 
   std::string listen_ip = FLAGS_wide_access ? "0.0.0.0" : FLAGS_listen_ip;
   auto status = StartRpcServer(FLAGS_listen_ip, FLAGS_listen_port);
@@ -119,6 +146,14 @@ Status Server::Shutdown() {
     return status;
   }
 
+  if (rdma_server_ != nullptr) {
+    auto rs = rdma_server_->Shutdown();
+    if (!rs.ok()) {
+      LOG(ERROR) << "Fail to shutdown RDMA server: " << rs.ToString();
+      // Continue — log clean manager still needs to stop.
+    }
+  }
+
   status = log_clean_manager_->Stop();
   if (!status.ok()) {
     LOG(ERROR) << "Stop log clean manager failed, status: "
@@ -133,18 +168,39 @@ Status Server::Shutdown() {
 
 void Server::InstallSignal() { CHECK(SIG_ERR != signal(SIGPIPE, SIG_IGN)); }
 
-// TODO: 这里添加一个 StartIBServer();
-// Status Server::StartIBServer() {
-/*
-1. 把各个 handler 都注册进去（都需要以 node 位参数）
- rdma_server_->RegisterHandler([](){
-  node_->HandleXXX();
+Status Server::StartRDMAServer() {
+  rdma_server_ = std::make_unique<infiniband::Server>();
 
- });
+  infiniband::EndPoint ep{
+      FLAGS_rdma_listen_device,
+      static_cast<uint8_t>(FLAGS_rdma_listen_port_num),
+  };
+  infiniband::ServerOptions opts{.brpc_server = server_.get()};
+  auto status = rdma_server_->Start(ep, &opts);
+  if (!status.ok()) {
+    return status;
+  }
 
- rdma_server->Start();
- */
-// }
+  rdma_attachment_pool_ = infiniband::RDMAMemoryPool::Create(
+      rdma_server_->GetProtectDomain(),
+      FLAGS_rdma_server_attachment_buffer_size,
+      FLAGS_rdma_server_attachment_pool_size);
+  if (rdma_attachment_pool_ == nullptr) {
+    return Status::Internal("create RDMA attachment pool failed");
+  }
+
+  rdma_service_ = std::make_unique<RDMABlockCacheServiceImpl>(
+      node_, rdma_attachment_pool_.get());
+  status = rdma_server_->AddService(rdma_service_.get());
+  if (!status.ok()) {
+    return status;
+  }
+
+  LOG(INFO) << "RDMA cache service is registered on device="
+            << FLAGS_rdma_listen_device
+            << " port=" << static_cast<int>(FLAGS_rdma_listen_port_num);
+  return Status::OK();
+}
 
 Status Server::StartRpcServer(const std::string& listen_ip,
                               uint32_t listen_port) {
@@ -161,11 +217,6 @@ Status Server::StartRpcServer(const std::string& listen_ip,
     LOG(ERROR) << "Fail to add BlockCacheService to brpc server";
     return Status::Internal("add service failed");
   }
-
-  // TODO(wine93): 注册 InfinibandServiceImpl —— 接口尚未与 CacheNode 串起来。
-  // rc = server_->AddService(
-  //     std::make_unique<InfinibandServiceImpl>(...).release(),
-  //     brpc::SERVER_DOESNT_OWN_SERVICE);
 
   brpc::ServerOptions options;
   options.ignore_eovercrowded = true;

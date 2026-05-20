@@ -218,6 +218,103 @@ Status LocalFileSystem::ReadFile(ContextSPtr ctx, const std::string& path,
   return status;
 }
 
+Status LocalFileSystem::WriteFile(ContextSPtr ctx, const std::string& path,
+                                  const char* data, size_t length,
+                                  int buf_index) {
+  DCHECK_RUNNING("LocalFilesystem");
+
+  if (!health_checker_->IsHealthy()) {
+    return Status::CacheUnhealthy("disk is unhealthy");
+  }
+
+  Status status;
+  BRPC_SCOPE_EXIT {
+    if (status.ok()) {
+      health_checker_->IOSuccess();
+    } else {
+      health_checker_->IOError();
+    }
+  };
+
+  size_t aligned_length = AlignLength(length);
+  if (aligned_length != length) {
+    // Caller-provided RDMA buffers are sized to block_size (4MB), which is
+    // already aligned. If a future caller passes a non-aligned length they'd
+    // need to either pre-zero past `length` or expose an aligned capacity.
+    return Status::InvalidParam(
+        "WriteFile zero-copy path requires aligned length");
+  }
+
+  auto tmppath = TempFilepath(path);
+  status = iutil::MkDirs(iutil::ParentDir(tmppath));
+  if (!status.ok() && !status.IsExist()) {
+    return status;
+  }
+
+  int fd;
+  status = iutil::OpenFile(tmppath, O_CREAT | O_WRONLY | O_TRUNC | O_DIRECT,
+                           0644, &fd);
+  if (!status.ok()) {
+    return status;
+  }
+  BRPC_SCOPE_EXIT {
+    iutil::Close(fd);
+    if (!status.ok()) {
+      iutil::Unlink(tmppath);
+    }
+  };
+
+  status = AioWrite(ctx, fd, const_cast<char*>(data), aligned_length, buf_index);
+  if (!status.ok()) {
+    return status;
+  }
+
+  return iutil::Rename(tmppath, path);
+}
+
+Status LocalFileSystem::ReadFile(ContextSPtr ctx, const std::string& path,
+                                 off_t offset, size_t length, char* data,
+                                 size_t data_capacity, int buf_index) {
+  DCHECK_RUNNING("LocalFilesystem");
+
+  if (!health_checker_->IsHealthy()) {
+    return Status::CacheUnhealthy("disk is unhealthy");
+  }
+
+  Status status;
+  BRPC_SCOPE_EXIT {
+    if (status.ok()) {
+      health_checker_->IOSuccess();
+    } else {
+      health_checker_->IOError();
+    }
+  };
+
+  off_t aligned_offset = AlignOffset(offset);
+  size_t aligned_length = AlignLength(length + offset - aligned_offset);
+  if (aligned_length > data_capacity) {
+    return Status::InvalidParam("read buffer too small for aligned range");
+  }
+
+  int fd;
+  status = iutil::OpenFile(path, O_RDONLY | O_DIRECT, &fd);
+  if (!status.ok()) {
+    return status;
+  }
+  BRPC_SCOPE_EXIT { iutil::Close(fd); };
+
+  status = AioRead(ctx, fd, aligned_offset, aligned_length, data, buf_index);
+  if (!status.ok()) {
+    return status;
+  }
+
+  // If the caller's offset/length isn't 4K-aligned, the data the caller wants
+  // is at [offset - aligned_offset, length) inside `data`. Since the caller
+  // owns the buffer (and typically requests aligned blocks), we don't memmove
+  // here — the caller is expected to consume the slice or pass aligned args.
+  return status;
+}
+
 // The inflight for aio which use fixed buffer is controlled by buffer pool,
 // others need to be tracked here.
 struct InflightAioGuard {
@@ -284,13 +381,15 @@ int LocalFileSystem::AllocateAlignedMemory(IOBuffer* buffer,
     return -1;
   }
 
-  // use fixed buffer
+  // Use fixed buffer. Return a GLOBAL index into io_uring's fixed-buffer
+  // table (see IOUring ctor for the layout). write pool occupies
+  // [0, FLAGS_iodepth); read pool occupies [FLAGS_iodepth, 2*FLAGS_iodepth).
   if (for_read) {
     char* data = read_buffer_pool_->Alloc();
     buffer->AppendUserData(data, aligned_length, [this](void* ptr) {
       read_buffer_pool_->Free((char*)ptr);
     });
-    return read_buffer_pool_->Index(data);
+    return read_buffer_pool_->Index(data) + static_cast<int>(FLAGS_iodepth);
   }
 
   char* data = write_buffer_pool_->Alloc();

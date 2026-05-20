@@ -54,15 +54,18 @@ class ServerSession : public EventHandler {
   void OnError(const WorkCompletion& wc);
 
   void OnRequestReceived(const WorkCompletion& wc);
+  // Parse the recv frame, dispatch to the registered Service, and on
+  // completion serialize the response into a send frame.
   Status ProcessRequest(Controller* cntl,
-                        pb::infiniband::InfinibandResponse* ib_response);
+                        pb::infiniband::ResponseMeta* resp_meta,
+                        ::google::protobuf::Message** resp_body);
   Status SendResponse(Controller* cntl,
-                      pb::infiniband::InfinibandResponse* ib_response);
+                      pb::infiniband::ResponseMeta* resp_meta,
+                      const ::google::protobuf::Message* resp_body);
   void OnResponseSent(const WorkCompletion& wc);
 
   Messenger* messenger_;
   ConnectionUPtr conn_;
-  std::vector<WorkRequestId> ids_;
   bthread::ExecutionQueueId<WorkCompletions> handle_wc_queue_id_;
 };
 

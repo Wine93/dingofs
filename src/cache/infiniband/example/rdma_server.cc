@@ -14,43 +14,84 @@
  * limitations under the License.
  */
 
+#include <brpc/closure_guard.h>
 #include <brpc/server.h>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <google/protobuf/service.h>
 
+#include <cstdint>
+
 #include "cache/infiniband/controller.h"
 #include "cache/infiniband/memory.h"
 #include "cache/infiniband/server.h"
-#include "dingofs/infiniband.pb.h"
+#include "dingofs/blockcache.pb.h"
 
 DEFINE_string(device, "mlx5_0", "IB device name (e.g. mlx5_0)");
 DEFINE_int32(port_num, 1, "IB HCA port, 1-based");
 DEFINE_int32(brpc_port, 8888,
              "TCP port for the connection-management brpc service");
+DEFINE_int32(attachment_pool_size, 64,
+             "Number of attachment buffers — must be >= max concurrent "
+             "in-flight RPCs across all clients");
+DEFINE_int32(attachment_buffer_size, 4194304, "Attachment buffer size in bytes");
+
+namespace {
+
+using ::dingofs::cache::infiniband::Controller;
+using ::dingofs::cache::infiniband::RDMAMemoryPool;
+
+// Demo Service: implements BlockCacheService::Range as an echo over RDMA.
+// The client encodes a 64-bit value in RangeRequest.offset and exposes a
+// remote RDMA buffer; the server writes back `offset + 1` into a per-RPC
+// staging buffer and lets the transport RDMA_WRITE it to the client.
+//
+// Each Range invocation acquires its own buffer from `pool_` so concurrent
+// RPCs do not clobber each other's staged value. The buffer is returned to
+// the pool via Controller::on_destroy, which fires after the response (and
+// the RDMA_WRITE) have been sent.
+class BlockCacheServiceImpl
+    : public ::dingofs::pb::cache::BlockCacheService {
+ public:
+  explicit BlockCacheServiceImpl(RDMAMemoryPool* pool) : pool_(pool) {}
+
+  void Range(::google::protobuf::RpcController* controller,
+             const ::dingofs::pb::cache::RangeRequest* request,
+             ::dingofs::pb::cache::RangeResponse* response,
+             ::google::protobuf::Closure* done) override {
+    brpc::ClosureGuard done_guard(done);
+    auto* cntl = static_cast<Controller*>(controller);
+
+    auto* buf = pool_->Require();
+    CHECK(buf != nullptr) << "attachment pool exhausted; bump "
+                             "--attachment_pool_size";
+
+    uint64_t out = request->offset() + 1;
+    *reinterpret_cast<uint64_t*>(buf->data) = out;
+    *reinterpret_cast<uint64_t*>(buf->data + buf->capacity - sizeof(uint64_t)) =
+        out;
+    buf->length = buf->capacity;
+    cntl->SetResponseAttachment(buf);
+
+    // Return the buffer to the pool when the Controller is destroyed — by
+    // that point the transport has already issued the RDMA_WRITE.
+    auto* pool = pool_;
+    cntl->SetOnDestroy([pool, buf]() { pool->Release(buf); });
+
+    response->set_status(::dingofs::pb::cache::BlockCacheOk);
+    response->set_cache_hit(true);
+  }
+
+ private:
+  RDMAMemoryPool* pool_;
+};
+
+}  // namespace
 
 int main(int argc, char** argv) {
-  // Perf-friendly logging defaults:
-  // - INFO -> buffered log file under FLAGS_log_dir (default /tmp),
-  //   flushed every FLAGS_logbufsecs. No syscall per LOG on hot paths.
-  // - WARNING+ -> file (immediate) AND stderr (so failures are visible live).
-  // Override on the command line as needed, e.g.:
-  //   --logtostderr=true   force everything back to stderr (debugging)
-  //   --log_dir=...        change log directory
-  //   --logbufsecs=N       change flush cadence (default 1s)
-  //   --v=N                enable VLOG(<=N) lines
-  // FLAGS_logtostderr = false;
-  // FLAGS_alsologtostderr = false;
-  // FLAGS_stderrthreshold = google::WARNING;
-  // FLAGS_logbuflevel = google::INFO;
-  // FLAGS_logbufsecs = 1;
-  // FLAGS_max_log_size = 256;
-
   google::ParseCommandLineFlags(&argc, &argv, true);
-  // google::InitGoogleLogging(argv[0]);
 
   using namespace dingofs::cache::infiniband;  // NOLINT
-  namespace pb_ib = dingofs::pb::infiniband;
 
   brpc::Server brpc_server;
   Server rdma_server;
@@ -73,30 +114,19 @@ int main(int argc, char** argv) {
   }
 
   // Allocate from the *same* PD that backs server's QPs.
-  auto mem_pool =
-      RDMAMemoryPool::Create(rdma_server.GetProtectDomain(), 4194304, 2);
+  auto mem_pool = RDMAMemoryPool::Create(rdma_server.GetProtectDomain(),
+                                         FLAGS_attachment_buffer_size,
+                                         FLAGS_attachment_pool_size);
   CHECK_NOTNULL(mem_pool);
-  auto* buffer = mem_pool->Require();
-  CHECK_NOTNULL(buffer);
 
-  // Register RangeRequest handler: echo back num + 1. Registered after Start
-  // (PD/listener ready) and before brpc_server.Start (no client can connect
-  // yet), so no handler-less request can slip through.
-  rdma_server.RegisterHandler(
-      [buffer](Controller* cntl, const pb_ib::RangeRequest* req,
-               pb_ib::RangeResponse* resp, google::protobuf::Closure* done) {
-        uint64_t in = req->num();
-        uint64_t out = in + 1;
-        resp->set_num(out);
-        *reinterpret_cast<uint64_t*>(buffer->data) = out;
-        *reinterpret_cast<uint64_t*>(buffer->data + buffer->capacity -
-                                     sizeof(uint64_t)) = out;
-        buffer->length = buffer->capacity;
-
-        cntl->response_attachment = buffer;
-
-        done->Run();
-      });
+  // brpc-style: derive from the generic Service, override the method(s),
+  // hand it to the server. No oneof, no lambda glue.
+  BlockCacheServiceImpl service(mem_pool.get());
+  status = rdma_server.AddService(&service);
+  if (!status.ok()) {
+    LOG(ERROR) << "Fail to add service: " << status.ToString();
+    return 1;
+  }
 
   brpc::ServerOptions brpc_options;
   if (brpc_server.Start(FLAGS_brpc_port, &brpc_options) != 0) {

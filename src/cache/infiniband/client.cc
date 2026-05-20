@@ -46,6 +46,7 @@
 #include "cache/infiniband/memory.h"
 #include "cache/infiniband/messenger.h"
 #include "cache/infiniband/protocol.h"
+#include "cache/infiniband/rdma_memory.h"
 #include "common/status.h"
 #include "dingofs/infiniband.pb.h"
 
@@ -53,54 +54,30 @@ namespace dingofs {
 namespace cache {
 namespace infiniband {
 
-Dialer::Dialer(DeviceUPtr device, PortUPtr port,
-               ProtectDomainUPtr protect_domain)
-    : device_(std::move(device)),
-      port_(std::move(port)),
-      protect_domain_(std::move(protect_domain)) {}
+Dialer::Dialer(Device* device, Port* port, ProtectDomain* protect_domain)
+    : device_(device), port_(port), protect_domain_(protect_domain) {}
 
 DialerUPtr Dialer::Create(const EndPoint& ep) {
-  auto device = Device::Open(ep.device_name);
-  if (nullptr == device) {
-    LOG(ERROR) << "Fail to open device=" << ep.device_name;
+  auto* pd = GetOrAllocPD(ep.device_name, ep.port_num);
+  if (pd == nullptr) {
     return nullptr;
   }
-
-  auto port = Port::Query(device.get(), ep.port_num);
-  if (nullptr == port) {
-    LOG(ERROR) << "Fail to query port=" << (int)ep.port_num
-               << " of device=" << ep.device_name;
-    return nullptr;
-  } else if (port->GetPortState() != PortState::kActive) {
-    LOG(ERROR) << "Port=" << (int)ep.port_num << " of device=" << ep.device_name
-               << " is not active";
-    return nullptr;
-  } else if (port->GetLinkLayer() == LinkLayer::kUnspecified) {
-    LOG(ERROR) << "Port=" << (int)ep.port_num << " of device=" << ep.device_name
-               << " has unspecified link layer";
-    return nullptr;
-  }
-
-  auto protect_domain = ProtectDomain::Alloc(device.get());
-  if (nullptr == protect_domain) {
-    LOG(ERROR) << "Fail to alloc protect domain of device=" << ep.device_name;
-    return nullptr;
-  }
-
-  return std::make_unique<Dialer>(std::move(device), std::move(port),
-                                  std::move(protect_domain));
+  auto* device = GetCachedDevice(ep.device_name);
+  auto* port = GetCachedPort(ep.device_name);
+  CHECK_NOTNULL(device);
+  CHECK_NOTNULL(port);
+  return std::make_unique<Dialer>(device, port, pd);
 }
 
 ConnectionUPtr Dialer::Dial(const std::string& address) {
-  auto completion_queue = CompletionQueue::Create(device_.get());
+  auto completion_queue = CompletionQueue::Create(device_);
   if (nullptr == completion_queue) {
     LOG(ERROR) << "Fail to create completion queue";
     return nullptr;
   }
 
-  auto queue_pair =
-      QueuePair::Create(device_.get(), port_.get(), protect_domain_.get(),
-                        completion_queue.get());
+  auto queue_pair = QueuePair::Create(device_, port_, protect_domain_,
+                                      completion_queue.get());
   if (nullptr == queue_pair) {
     LOG(ERROR) << "Fail to create queue pair";
     return nullptr;
@@ -220,37 +197,20 @@ Status Client::Connect(const std::string& address) {
   return Status::OK();
 }
 
-Status Client::DoCall(Controller* cntl,
+Status Client::DoCall(Controller* cntl, std::string_view service_name,
+                      std::string_view method_name,
                       const google::protobuf::Message& request,
                       google::protobuf::Message* response) {
   auto* session = session_.get();
   CHECK_NOTNULL(session);
 
-  butil::Timer timer;
-  timer.start();
-  auto status = session->SendRequest(cntl, request);
-  timer.stop();
-
-  // LOG(INFO) << "<<< SendRequest cost "
-  //           << absl::StrFormat("%.6lf", timer.u_elapsed(0) / 1e6) << "
-  //           seconds";
-
+  auto status = session->SendRequest(cntl, service_name, method_name, request);
   if (status.ok()) {
-    timer.start();
-
-    bool timeout = cntl->response_received.timed_wait();
-
+    cntl->WaitResponseReceived();
     status = session->ProcessResponse(cntl, response);
-
-    timer.stop();
-
-    // LOG(INFO) << "<<< ProcessResponse cost "
-    //           << absl::StrFormat("%.6lf", timer.u_elapsed(0) / 1e6)
-    //           << " seconds";
   } else {
     LOG(ERROR) << "Fail to send request: " << status.ToString();
   }
-
   return status;
 }
 

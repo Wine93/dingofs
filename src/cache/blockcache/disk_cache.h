@@ -129,6 +129,16 @@ class DiskCache final : public CacheStore {
               size_t length, IOBuffer* buffer,
               LoadOption option = LoadOption()) override;
 
+  // Zero-copy overloads (see CacheStore docs). Override the defaults with a
+  // direct path that hands `data` straight to LocalFileSystem's io_uring
+  // fixed-buffer route, skipping the internal disk BufferPool.
+  Status Cache(ContextSPtr ctx, const BlockContext& block_ctx,
+               const char* data, size_t length, int buf_index,
+               CacheOption option = CacheOption()) override;
+  Status Load(ContextSPtr ctx, const BlockContext& block_ctx, off_t offset,
+              size_t length, char* data, size_t data_capacity, int buf_index,
+              LoadOption option = LoadOption()) override;
+
   std::string Id() const override { return uuid_; }
 
   bool IsRunning() const override {

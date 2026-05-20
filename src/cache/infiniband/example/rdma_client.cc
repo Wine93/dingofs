@@ -14,48 +14,43 @@
  * limitations under the License.
  */
 
+#include <absl/strings/str_format.h>
 #include <butil/time.h>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
-#include <unistd.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <random>
+#include <thread>
+#include <vector>
 
 #include "cache/infiniband/client.h"
 #include "cache/infiniband/controller.h"
-#include "dingofs/infiniband.pb.h"
+#include "dingofs/blockcache.pb.h"
 
 DEFINE_string(device, "mlx5_0", "IB device name (e.g. mlx5_0)");
 DEFINE_int32(port_num, 1, "IB HCA port, 1-based");
 DEFINE_string(server_address, "127.0.0.1:8888",
               "RDMA server brpc address (host:port)");
-DEFINE_int32(rounds, 1, "Number of RangeRequest rounds; -1 means infinite");
-DEFINE_int32(interval_ms, 1000, "Interval between rounds in milliseconds");
+DEFINE_int32(rounds, 1,
+             "Number of RangeRequest rounds per thread; -1 means infinite");
+DEFINE_int32(threads, 1, "Number of concurrent worker threads issuing RPCs");
+DEFINE_bool(log_per_round, true,
+            "Log per-round result. Disable for cleaner latency stats.");
+
+namespace {
+constexpr const char* kServiceName = "dingofs.pb.cache.BlockCacheService";
+constexpr const char* kMethodName = "Range";
+}  // namespace
 
 int main(int argc, char** argv) {
-  // Perf-friendly logging defaults:
-  // - INFO -> buffered log file under FLAGS_log_dir (default /tmp),
-  //   flushed every FLAGS_logbufsecs. No syscall per LOG on hot paths.
-  // - WARNING+ -> file (immediate) AND stderr (so failures are visible live).
-  // Override on the command line as needed, e.g.:
-  //   --logtostderr=true   force everything back to stderr (debugging)
-  //   --log_dir=...        change log directory
-  //   --logbufsecs=N       change flush cadence (default 1s)
-  //   --v=N                enable VLOG(<=N) lines
-  // FLAGS_logtostderr = false;
-  // FLAGS_alsologtostderr = false;
-  // FLAGS_stderrthreshold = google::WARNING;
-  // FLAGS_logbuflevel = google::INFO;
-  // FLAGS_logbufsecs = 1;
-  // FLAGS_max_log_size = 256;
-
   google::ParseCommandLineFlags(&argc, &argv, true);
-  // google::InitGoogleLogging(argv[0]);
 
   using namespace dingofs::cache::infiniband;  // NOLINT
-  namespace pb_ib = dingofs::pb::infiniband;
+  namespace pb_cache = dingofs::pb::cache;
 
   EndPoint ep;
   ep.device_name = FLAGS_device;
@@ -75,75 +70,131 @@ int main(int argc, char** argv) {
   }
   LOG(INFO) << "Connected to server=" << FLAGS_server_address;
 
-  // Allocate from the *same* PD that backs the client's QP. Otherwise the rkey
-  // we advertise to the server is meaningless on this connection — server's
-  // RDMA WRITE would hit LOC_PROT_ERR on our HCA and tear the QP down.
-  auto mem_pool =
-      RDMAMemoryPool::Create(client->GetProtectDomain(), 4194304, 2);
+  // One buffer per worker thread — the server RDMA_WRITEs the attachment into
+  // the region whose addr/rkey each Controller advertises, so threads cannot
+  // share a buffer (concurrent writes would clobber each other).
+  const int pool_size = std::max(2, FLAGS_threads);
+  auto mem_pool = RDMAMemoryPool::Create(client->GetProtectDomain(), 4194304,
+                                         pool_size);
   CHECK_NOTNULL(mem_pool);
-  auto* buffer = mem_pool->Require();
-  CHECK_NOTNULL(buffer);
 
-  std::mt19937_64 rng(std::random_device{}());
-  std::uniform_int_distribution<uint64_t> dist(0, (1ULL << 32) - 1);
+  auto worker = [&](int tid, std::vector<uint64_t>* latencies_us,
+                    int* success_out, int* fail_out) {
+    auto* buffer = mem_pool->Require();
+    CHECK(buffer != nullptr) << "tid=" << tid << " (pool exhausted)";
 
-  int success = 0;
-  int fail = 0;
-  for (int i = 0; FLAGS_rounds < 0 || i < FLAGS_rounds; ++i) {
-    butil::Timer timer;
-    timer.start();
+    std::mt19937_64 rng(std::random_device{}() ^ static_cast<uint64_t>(tid));
+    std::uniform_int_distribution<uint64_t> dist(0, (1ULL << 32) - 1);
 
-    uint64_t num = dist(rng);
-    pb_ib::RangeRequest request;
-    request.set_num(num);
+    int success = 0;
+    int fail = 0;
+    latencies_us->reserve(FLAGS_rounds > 0 ? FLAGS_rounds : 1024);
 
-    pb_ib::RangeResponse response;
+    for (int i = 0; FLAGS_rounds < 0 || i < FLAGS_rounds; ++i) {
+      butil::Timer timer;
+      timer.start();
 
-    auto* cntl = new Controller;
-    cntl->correlation_id = reinterpret_cast<uint64_t>(cntl);
-    cntl->request_memory_context =
-        MemoryContext{reinterpret_cast<uint64_t>(buffer->data),
-                      buffer->capacity, buffer->rkey};
+      uint64_t num = dist(rng);
+      pb_cache::RangeRequest request;
+      request.set_offset(num);
+      request.set_length(1);
+      pb_cache::RangeResponse response;
 
-    status = client->Call(cntl, request, &response);
-    if (!status.ok()) {
-      ++fail;
-      LOG(ERROR) << "Round[" << i << "] Call failed: req.num=" << num
-                 << " err=" << status.ToString();
-    } else if (response.num() != num + 1) {
-      ++fail;
-      LOG(ERROR) << "Round[" << i << "] Mismatch: req.num=" << num
-                 << " resp.num=" << response.num() << " expected=" << (num + 1);
-    } else {
-      ++success;
-      // LOG(INFO) << "Round[" << i << "] OK: req.num=" << num
-      //           << " resp.num=" << response.num();
+      auto* cntl = new Controller;
+      cntl->SetCorrelationId(reinterpret_cast<uint64_t>(cntl));
+      cntl->SetRequestMemoryContext(
+          MemoryContext{reinterpret_cast<uint64_t>(buffer->data),
+                        buffer->capacity, buffer->rkey});
+
+      auto st =
+          client->Call(cntl, kServiceName, kMethodName, request, &response);
+      uint64_t echoed = *reinterpret_cast<uint64_t*>(buffer->data);
+
+      timer.stop();
+      const uint64_t cost_us = timer.u_elapsed(0);
+      latencies_us->push_back(cost_us);
+
+      if (!st.ok()) {
+        ++fail;
+        LOG(ERROR) << "tid=" << tid << " Round[" << i << "] Call failed:"
+                   << " req.offset=" << num << " err=" << st.ToString();
+      } else if (echoed != num + 1) {
+        ++fail;
+        LOG(ERROR) << "tid=" << tid << " Round[" << i << "] Mismatch:"
+                   << " req.offset=" << num << " attachment[0]=" << echoed
+                   << " expected=" << (num + 1);
+      } else {
+        ++success;
+        if (FLAGS_log_per_round) {
+          LOG(INFO) << "tid=" << tid << " Round[" << i
+                    << "] OK: req.offset=" << num
+                    << " resp.cache_hit=" << response.cache_hit()
+                    << ", cost "
+                    << absl::StrFormat("%.6lf", cost_us / 1e6) << " seconds.";
+        }
+      }
+
+      delete cntl;
     }
 
-    timer.stop();
+    *success_out = success;
+    *fail_out = fail;
+  };
 
-    LOG(INFO) << "Round[" << i << "] OK: req.num=" << num
-              << " resp.num=" << response.num()
-              << " buffer_start=" << *reinterpret_cast<uint64_t*>(buffer->data)
-              << " buffer_end="
-              << *reinterpret_cast<uint64_t*>(buffer->data + 4194304 -
-                                              sizeof(uint64_t))
-              << ", cost " << absl::StrFormat("%.6lf", timer.u_elapsed(0) / 1e6)
-              << " seconds.";
+  std::vector<std::thread> workers;
+  std::vector<std::vector<uint64_t>> per_thread_lat(FLAGS_threads);
+  std::vector<int> per_thread_success(FLAGS_threads, 0);
+  std::vector<int> per_thread_fail(FLAGS_threads, 0);
 
-    // LOG(INFO) << "Done: success=" << success << " fail=" << fail << ", cost "
-    //           << " seconds.";
+  butil::Timer wall;
+  wall.start();
+  workers.reserve(FLAGS_threads);
+  for (int t = 0; t < FLAGS_threads; ++t) {
+    workers.emplace_back(worker, t, &per_thread_lat[t],
+                         &per_thread_success[t], &per_thread_fail[t]);
+  }
+  for (auto& th : workers) th.join();
+  wall.stop();
 
-    // bool more = (FLAGS_rounds < 0) || (i + 1 < FLAGS_rounds);
-    // if (more && FLAGS_interval_ms > 0) {
-    //   ::usleep(static_cast<useconds_t>(FLAGS_interval_ms) * 1000);
-    // }
-    delete cntl;
+  // Aggregate.
+  std::vector<uint64_t> all_latencies;
+  int total_success = 0, total_fail = 0;
+  for (int t = 0; t < FLAGS_threads; ++t) {
+    all_latencies.insert(all_latencies.end(), per_thread_lat[t].begin(),
+                         per_thread_lat[t].end());
+    total_success += per_thread_success[t];
+    total_fail += per_thread_fail[t];
+  }
+  std::sort(all_latencies.begin(), all_latencies.end());
+
+  uint64_t min_us = 0, p50 = 0, p90 = 0, p99 = 0, max_us = 0;
+  double mean_us = 0;
+  if (!all_latencies.empty()) {
+    const size_t n = all_latencies.size();
+    min_us = all_latencies.front();
+    max_us = all_latencies.back();
+    p50 = all_latencies[n * 50 / 100];
+    p90 = all_latencies[n * 90 / 100];
+    p99 = all_latencies[std::min(n - 1, n * 99 / 100)];
+    uint64_t sum = 0;
+    for (auto v : all_latencies) sum += v;
+    mean_us = static_cast<double>(sum) / static_cast<double>(n);
   }
 
-  // LOG(INFO) << "Done: success=" << success << " fail=" << fail << ", cost "
-  //           << absl::StrFormat("%.6lf", timer.u_elapsed(0) / 1e6)
-  //           << " seconds.";
+  const double wall_s = wall.u_elapsed() / 1e6;
+  const double qps =
+      wall_s > 0 ? static_cast<double>(total_success + total_fail) / wall_s : 0;
 
-  return fail == 0 ? 0 : 1;
+  LOG(INFO) << "==================== Summary ====================";
+  LOG(INFO) << "threads=" << FLAGS_threads << " rounds_per_thread="
+            << FLAGS_rounds << " total_rpcs=" << all_latencies.size()
+            << " success=" << total_success << " fail=" << total_fail;
+  LOG(INFO) << "wall=" << absl::StrFormat("%.3fs", wall_s)
+            << " throughput=" << absl::StrFormat("%.0f rpc/s", qps);
+  LOG(INFO) << "latency(us): min=" << min_us << " mean="
+            << absl::StrFormat("%.0f", mean_us) << " P50=" << p50
+            << " P90=" << p90 << " P99=" << p99 << " max=" << max_us;
+  LOG(INFO) << "================================================";
+
+  return total_fail == 0 ? 0 : 1;
 }

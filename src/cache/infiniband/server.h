@@ -27,6 +27,7 @@
 #include <bthread/countdown_event.h>
 #include <bthread/execution_queue.h>
 #include <bthread/execution_queue_inl.h>
+#include <google/protobuf/service.h>
 
 #include <memory>
 
@@ -49,12 +50,15 @@ class Listener {
   Status Listen(const EndPoint& ep);
   ConnectionUPtr Accept(const ConnMangmentMeta& remote_cm_meta);
 
-  ProtectDomain* GetProtectDomain() const { return protect_domain_.get(); }
+  ProtectDomain* GetProtectDomain() const { return protect_domain_; }
 
  private:
-  DeviceUPtr device_;
-  PortUPtr port_;
-  ProtectDomainUPtr protect_domain_;
+  // Borrowed pointers — Device/Port/PD are owned by the process-wide
+  // DeviceRegistry in rdma_memory.cc, so a single PD per device is shared by
+  // the listener QPs and any RDMAMemoryPool registered for this device.
+  Device* device_{nullptr};
+  Port* port_{nullptr};
+  ProtectDomain* protect_domain_{nullptr};
 };
 
 using ListenerUPtr = std::unique_ptr<Listener>;
@@ -85,9 +89,11 @@ class Server {
 
   ProtectDomain* GetProtectDomain() const { return listener_->GetProtectDomain(); }
 
-  template <typename F>
-  void RegisterHandler(F&& handler) {
-    messenger_->RegisterHandler(std::forward<F>(handler));
+  // brpc-style: derive from a protobuf-generated Service (e.g.
+  // pb::cache::BlockCacheService), implement the virtual methods, then add
+  // it here. Caller retains ownership; the service must outlive the Server.
+  Status AddService(::google::protobuf::Service* service) {
+    return messenger_->AddService(service);
   }
 
  private:

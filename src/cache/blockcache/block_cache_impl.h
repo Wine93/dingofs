@@ -56,6 +56,14 @@ class BlockCacheImpl final : public BlockCache {
                   size_t length,
                   PrefetchOption option = PrefetchOption()) override;
 
+  // Zero-copy overloads (see BlockCache docs).
+  Status Range(ContextSPtr ctx, const BlockContext& block_ctx, off_t offset,
+               size_t length, char* data, size_t data_capacity, int buf_index,
+               RangeOption option = RangeOption()) override;
+  Status Cache(ContextSPtr ctx, const BlockContext& block_ctx, const char* data,
+               size_t length, int buf_index,
+               CacheOption option = CacheOption()) override;
+
   void AsyncPut(ContextSPtr ctx, const BlockContext& block_ctx,
                 const Block& block, AsyncCallback cb,
                 PutOption option = PutOption()) override;
@@ -65,6 +73,10 @@ class BlockCacheImpl final : public BlockCache {
                   RangeOption option = RangeOption()) override;
   void AsyncCache(ContextSPtr ctx, const BlockContext& block_ctx,
                   const Block& block, AsyncCallback cb,
+                  CacheOption option = CacheOption()) override;
+  void AsyncCache(ContextSPtr ctx, const BlockContext& block_ctx,
+                  const char* data, size_t length, int buf_index,
+                  AsyncCallback cb,
                   CacheOption option = CacheOption()) override;
   void AsyncPrefetch(ContextSPtr ctx, const BlockContext& block_ctx,
                      size_t length, AsyncCallback cb,

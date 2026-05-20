@@ -39,6 +39,7 @@
 #include "cache/infiniband/memory.h"
 #include "cache/infiniband/messenger.h"
 #include "cache/infiniband/protocol.h"
+#include "cache/infiniband/rdma_memory.h"
 #include "cache/infiniband/server_session.h"
 #include "cache/iutil/bthread.h"
 #include "common/status.h"
@@ -48,36 +49,17 @@ namespace dingofs {
 namespace cache {
 namespace infiniband {
 
-Listener::Listener()
-    : device_(nullptr), port_(nullptr), protect_domain_(nullptr) {}
+Listener::Listener() = default;
 
 Status Listener::Listen(const EndPoint& ep) {
-  device_ = Device::Open(ep.device_name);
-  if (nullptr == device_) {
-    LOG(ERROR) << "Fail to open device=" << ep.device_name;
-    return Status::Internal("open device failed");
+  protect_domain_ = GetOrAllocPD(ep.device_name, ep.port_num);
+  if (protect_domain_ == nullptr) {
+    return Status::Internal("open device / alloc PD failed");
   }
-
-  port_ = Port::Query(device_.get(), ep.port_num);
-  if (nullptr == port_) {
-    LOG(ERROR) << "Fail to query port=" << (int)ep.port_num
-               << " of device=" << ep.device_name;
-    return Status::Internal("query port failed");
-  } else if (port_->GetPortState() != PortState::kActive) {
-    LOG(ERROR) << "Port=" << (int)ep.port_num << " of device=" << ep.device_name
-               << " is not active";
-    return Status::Internal("port is not active");
-  } else if (port_->GetLinkLayer() == LinkLayer::kUnspecified) {
-    LOG(ERROR) << "Port=" << (int)ep.port_num << " of device=" << ep.device_name
-               << " has unspecified link layer";
-    return Status::Internal("unspecified link layer");
-  }
-
-  protect_domain_ = ProtectDomain::Alloc(device_.get());
-  if (nullptr == protect_domain_) {
-    LOG(ERROR) << "Fail to alloc protect domain of device=" << ep.device_name;
-    return Status::Internal("alloc protect domain failed");
-  }
+  device_ = GetCachedDevice(ep.device_name);
+  port_ = GetCachedPort(ep.device_name);
+  CHECK_NOTNULL(device_);
+  CHECK_NOTNULL(port_);
 
   LOG(INFO) << "RDMA listener is listening on " << ep.device_name << ":"
             << static_cast<int>(ep.port_num);
@@ -87,15 +69,14 @@ Status Listener::Listen(const EndPoint& ep) {
 ConnectionUPtr Listener::Accept(const ConnMangmentMeta& remote_cm_meta) {
   LOG(INFO) << "Accepting RDMA connection: peer=" << remote_cm_meta;
 
-  auto completion_queue = CompletionQueue::Create(device_.get());
+  auto completion_queue = CompletionQueue::Create(device_);
   if (nullptr == completion_queue) {
     LOG(ERROR) << "Fail to create completion queue";
     return nullptr;
   }
 
-  auto queue_pair =
-      QueuePair::Create(device_.get(), port_.get(), protect_domain_.get(),
-                        completion_queue.get());
+  auto queue_pair = QueuePair::Create(device_, port_, protect_domain_,
+                                      completion_queue.get());
   if (nullptr == queue_pair) {
     LOG(ERROR) << "Fail to create queue pair";
     return nullptr;

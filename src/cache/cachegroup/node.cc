@@ -215,6 +215,75 @@ Status CacheNode::AsyncCache(ContextSPtr ctx, const BlockContext& block_ctx,
   return Status::OK();
 }
 
+Status CacheNode::Range(ContextSPtr ctx, const BlockContext& block_ctx,
+                        off_t offset, size_t length, char* dst,
+                        size_t dst_capacity, size_t* out_length,
+                        size_t block_length, int io_uring_buf_index) {
+  CHECK_NOTNULL(dst);
+  CHECK_NOTNULL(out_length);
+  CHECK_LE(length, dst_capacity);
+
+  if (!IsRunning()) {
+    return Status::CacheDown("cache node is down");
+  }
+
+  // Cache-hit fast path: disk read goes directly into `dst` via
+  // io_uring_prep_read_fixed against our io_uring_buf_index. No bounce
+  // through io_uring's own BufferPool, no memcpy.
+  auto status = block_cache_->Range(ctx, block_ctx, offset, length, dst,
+                                    dst_capacity, io_uring_buf_index);
+  if (status.ok()) {
+    num_hit_cache_ << 1;
+    ctx->SetCacheHit(true);
+    *out_length = length;
+    return status;
+  }
+  num_miss_cache_ << 1;
+
+  // Cache-miss path: storage_client still produces its own IOBuffer; we copy
+  // its contents into `dst` so the wire-level RDMA_WRITE source remains
+  // `dst`. This is the only memcpy on the server-side read path, and only
+  // on cache miss.
+  IOBuffer storage_buf;
+  status = RetrieveStorage(ctx, block_ctx, offset, length, &storage_buf,
+                           block_length);
+  if (!status.ok()) {
+    return status;
+  }
+  size_t out = storage_buf.Size();
+  if (out > dst_capacity) {
+    return Status::Internal("range result exceeds dst capacity");
+  }
+  storage_buf.CopyTo(dst, out);
+  *out_length = out;
+  return Status::OK();
+}
+
+Status CacheNode::AsyncCache(ContextSPtr ctx, const BlockContext& block_ctx,
+                             char* src, size_t length,
+                             std::function<void()> on_buffer_released,
+                             int io_uring_buf_index) {
+  if (!IsRunning()) {
+    LOG(ERROR) << "Cache node is down, skip async cache block, key="
+               << block_ctx.key.Filename();
+    if (on_buffer_released) on_buffer_released();
+    return Status::CacheDown("cache node is down");
+  }
+
+  // Disk write goes directly from `src` via io_uring_prep_write_fixed —
+  // no bounce through the disk BufferPool.
+  block_cache_->AsyncCache(
+      ctx, block_ctx, src, length, io_uring_buf_index,
+      [cb = std::move(on_buffer_released)](Status status) {
+        if (!status.ok()) {
+          LOG(ERROR) << "Fail to async cache block (zero-copy), status="
+                     << status.ToString();
+        }
+        if (cb) cb();
+      });
+  return Status::OK();
+}
+
 Status CacheNode::AsyncPrefetch(ContextSPtr ctx,
                                 const BlockContext& block_ctx,
                                 size_t length) {

@@ -27,6 +27,7 @@
 #include <google/protobuf/message.h>
 
 #include <memory>
+#include <string_view>
 
 #include "cache/infiniband/connection.h"
 #include "cache/infiniband/controller.h"
@@ -46,17 +47,20 @@ class ClientSession : public EventHandler {
   Status OnEstablished();
   void HandleEvent() override;
 
+  // Build a 3-section frame [Header][RequestMeta][request body] and post it.
+  Status SendRequest(Controller* cntl, std::string_view service_name,
+                     std::string_view method_name,
+                     const google::protobuf::Message& request);
+  Status ProcessResponse(Controller* cntl, google::protobuf::Message* response);
+
  private:
   static int HandleWorkCompletion(void* meta,
                                   bthread::TaskIterator<WorkCompletions>& iter);
   void OnSuccess(const WorkCompletion& wc);
   void OnError(const WorkCompletion& wc);
 
-  Status SendRequest(Controller* cntl,
-                     const google::protobuf::Message& request);
   void OnRequestSent(const WorkCompletion& wc);
   void OnResponseReceived(const WorkCompletion& wc);
-  Status ProcessResponse(Controller* cntl, google::protobuf::Message* response);
 
   ConnectionUPtr conn_;
   bthread::ExecutionQueueId<WorkCompletions> handle_wc_queue_id_;

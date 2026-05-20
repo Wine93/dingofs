@@ -59,10 +59,19 @@ void ClientSession::Shutdown() {
 }
 
 void ClientSession::HandleEvent() {
-  bool succ = conn_->HandleCompletion([this](WorkCompletions wcs) {
-    CHECK_EQ(0, bthread::execution_queue_execute(handle_wc_queue_id_, wcs));
+  // Skip the per-WC handoff to a dedicated ExecutionQueue consumer: the
+  // callbacks here (OnRequestSent / OnResponseReceived) are signal-only and
+  // do not block, so running them inline on the epoll thread removes one
+  // cross-thread wakeup per WC.
+  conn_->HandleCompletion([this](WorkCompletions wcs) {
+    for (const auto& wc : wcs) {
+      if (wc.status.ok()) {
+        OnSuccess(wc);
+      } else {
+        OnError(wc);
+      }
+    }
   });
-  CHECK(succ);
 }
 
 int ClientSession::HandleWorkCompletion(
@@ -74,26 +83,13 @@ int ClientSession::HandleWorkCompletion(
   auto* session = static_cast<ClientSession*>(meta);
   for (; iter; iter++) {
     for (const auto& wc : *iter) {
-      //
+      if (wc.status.ok()) {
+        session->OnSuccess(wc);
+      } else {
+        session->OnError(wc);
+      }
     }
-    // auto& batch = *iter;
-    //  for (const auto& wc : *batch.wcs) {
-    //    switch (wc.optype) {
-    //      case OpType::kSend:  // request sent
-    //        session->OnRequestSent(wc);
-    //        break;
-
-    //    case OpType::kRecv:  // response received
-    //      session->OnResponseReceived(wc);
-    //      break;
-
-    //    default:
-    //      CHECK(false) << "Unexpected work completion opcode";
-    //      break;
-    //  }
-    //}
   }
-
   return 0;
 }
 
@@ -103,12 +99,15 @@ void ClientSession::OnSuccess(const WorkCompletion& wc) {
   } else if (wc.opcode == OpCode::kRecv) {
     OnResponseReceived(wc);
   } else {
-    //
+    LOG(WARNING) << "Unexpected work completion opcode="
+                 << static_cast<int>(wc.opcode);
   }
 }
 
 void ClientSession::OnError(const WorkCompletion& wc) {
-  //
+  LOG(ERROR) << "Work completion in error state: opcode="
+             << static_cast<int>(wc.opcode) << " wc.id=" << wc.id
+             << " status=" << wc.status.ToString();
 }
 
 Status ClientSession::OnEstablished() {
@@ -122,7 +121,7 @@ Status ClientSession::OnEstablished() {
     }
 
     RecvWorkRequest entry;
-    // entry.id = WorkRequestCtx(OpCode::kRecv, buffer).Id();
+    entry.id = reinterpret_cast<uint64_t>(buffer);
     entry.addr = reinterpret_cast<uint64_t>(buffer->data);
     entry.length = buffer->capacity;
     entry.lkey = buffer->lkey;
@@ -142,10 +141,9 @@ Status ClientSession::OnEstablished() {
 }
 
 Status ClientSession::SendRequest(Controller* cntl,
+                                  std::string_view service_name,
+                                  std::string_view method_name,
                                   const google::protobuf::Message& request) {
-  // butil::Timer timer;
-  // timer.start();
-
   auto* mem_pool = conn_->GetSendMemPool();
   auto* buffer = mem_pool->Require();
   if (buffer == nullptr) {
@@ -153,28 +151,22 @@ Status ClientSession::SendRequest(Controller* cntl,
     return Status::Internal("require send buffer failed");
   }
 
-  // timer.stop();
-
-  // LOG(INFO) << "<<< Require send buffer cost "
-  //           << absl::StrFormat("%.6lf", timer.u_elapsed(0) / 1e6)
-  //           << " seconds.";
-
   BRPC_SCOPE_EXIT { mem_pool->Release(buffer); };
 
-  // timer.start();
-  pb::infiniband::InfinibandRequest ib_request;
-  auto& ctx = cntl->request_memory_context;
-  ib_request.mutable_memory_context()->set_addr(ctx.addr);
-  ib_request.mutable_memory_context()->set_length(ctx.length);
-  ib_request.mutable_memory_context()->set_rkey(ctx.rkey);
+  // Build RequestMeta on the Controller's Arena to avoid a per-RPC heap
+  // allocation for the wrapper protobuf.
+  auto* meta = ::google::protobuf::Arena::CreateMessage<
+      pb::infiniband::RequestMeta>(cntl->Arena());
+  meta->set_service_name(std::string(service_name));
+  meta->set_method_name(std::string(method_name));
+  const auto& ctx = cntl->RequestMemoryContext();
+  auto* mc = meta->mutable_memory_context();
+  mc->set_addr(ctx.addr);
+  mc->set_length(ctx.length);
+  mc->set_rkey(ctx.rkey);
 
-  auto status = Protocol::PackBody(request, &ib_request);
-  if (!status.ok()) {
-    return status;
-  }
-
-  status = Protocol::Serialize(ib_request, cntl->correlation_id, buffer->data,
-                               buffer->capacity, &buffer->length);
+  auto status =
+      Protocol::SerializeFrame(buffer, cntl->CorrelationId(), *meta, request);
   if (!status.ok()) {
     return status;
   }
@@ -189,8 +181,8 @@ Status ClientSession::SendRequest(Controller* cntl,
 
   SendWorkRequest entry;
   entry.id = reinterpret_cast<uint64_t>(cntl);
-  entry.optype = OpType::kSend;
-  entry.signal = true;
+  entry.opcode = OpCode::kSend;
+  entry.signaled = true;
   entry.addr = reinterpret_cast<uint64_t>(buffer->data);
   entry.length = buffer->length;
   entry.lkey = buffer->lkey;
@@ -208,14 +200,14 @@ Status ClientSession::SendRequest(Controller* cntl,
   //           << " seconds.";
 
   // timer.start();
-  cntl->request_sent.wait();
+  cntl->WaitRequestSent();
   // timer.stop();
 
   // LOG(INFO) << "<<< Wait request sent success cost "
   //           << absl::StrFormat("%.6lf", timer.u_elapsed(0) / 1e6)
   //           << " seconds.";
 
-  return cntl->status;
+  return cntl->WcStatus();
 }
 
 void ClientSession::OnRequestSent(const WorkCompletion& wc) {
@@ -225,8 +217,8 @@ void ClientSession::OnRequestSent(const WorkCompletion& wc) {
   timer.start();
 
   auto* cntl = reinterpret_cast<Controller*>(wc.id);
-  cntl->status = wc.status;
-  cntl->request_sent.signal();
+  cntl->SetWcStatus(wc.status);
+  cntl->SignalRequestSent();
 
   timer.stop();
   // LOG(INFO) << "<<< Notify request sent cost "
@@ -240,18 +232,17 @@ void ClientSession::OnResponseReceived(const WorkCompletion& wc) {
   buffer->length = wc.byte_len;
 
   uint64_t correlation_id;
-  auto status = Protocol::PeekCorrelationId(buffer->data, buffer->length,
-                                            &correlation_id);
+  auto status = Protocol::PeekCorrelationId(buffer, &correlation_id);
   CHECK(status.ok());
 
   auto* cntl = reinterpret_cast<Controller*>(correlation_id);
-  cntl->response_buffer = buffer;
-  cntl->response_received.signal();
+  cntl->SetResponseBuffer(buffer);
+  cntl->SignalResponseReceived();
 }
 
 Status ClientSession::ProcessResponse(Controller* cntl,
                                       google::protobuf::Message* response) {
-  auto* buffer = cntl->response_buffer;
+  auto* buffer = cntl->ResponseBuffer();
   BRPC_SCOPE_EXIT {
     RecvWorkRequest entry;
     entry.id = reinterpret_cast<uint64_t>(buffer);
@@ -262,12 +253,25 @@ Status ClientSession::ProcessResponse(Controller* cntl,
     CHECK(conn_->PostRecvWorkRequest(entry).ok());
   };
 
-  pb::infiniband::InfinibandResponse ib_response;
-  auto status = Protocol::Parse(buffer->data, buffer->length, &ib_response);
-  if (status.ok()) {
-    status = Protocol::UnpackBody(ib_response, response);
+  pb::infiniband::ResponseMeta resp_meta;
+  std::string_view data;
+  uint64_t correlation_id = 0;
+  auto status =
+      Protocol::ParseFrame(buffer, &correlation_id, &resp_meta, &data);
+  if (!status.ok()) {
+    return status;
   }
-  return status;
+  if (resp_meta.error_code() != 0) {
+    LOG(ERROR) << "RDMA RPC failed on server: code=" << resp_meta.error_code()
+               << " msg=" << resp_meta.error_message();
+    return Status::Internal(resp_meta.error_message());
+  }
+  cntl->SetResponseAttachmentLength(resp_meta.memory_context().attachment_length());
+  if (!response->ParseFromArray(data.data(), static_cast<int>(data.size()))) {
+    LOG(ERROR) << "Fail to parse response body";
+    return Status::InvalidParam("parse response body failed");
+  }
+  return Status::OK();
 }
 
 }  // namespace infiniband
