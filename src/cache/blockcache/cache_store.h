@@ -137,6 +137,35 @@ class CacheStore {
                       off_t offset, size_t length, IOBuffer* buffer,
                       LoadOption option = LoadOption()) = 0;
 
+  // Zero-copy overloads. The caller provides a contiguous `data` buffer that
+  // is ALSO registered as an io_uring fixed buffer at `buf_index`, so the
+  // disk IO targets `data` directly (no bounce through the internal disk
+  // BufferPool). buf_index = -1 means "not io_uring-registered" — fall back
+  // to non-fixed disk IO.
+  //
+  // Default impl wraps `data` in an IOBuffer and dispatches to the existing
+  // IOBuffer-based path — the implementer overrides to actually skip the
+  // bounce. Status::NotSupport indicates this store can't take a flat buffer.
+  virtual Status Cache(ContextSPtr ctx, const BlockContext& block_ctx,
+                       const char* data, size_t length, int buf_index,
+                       CacheOption option = CacheOption()) {
+    (void)buf_index;
+    IOBuffer wrapped;
+    wrapped.AppendUserData(const_cast<char*>(data), length, [](void*) {});
+    return Cache(ctx, block_ctx, Block(std::move(wrapped)), option);
+  }
+
+  virtual Status Load(ContextSPtr ctx, const BlockContext& block_ctx,
+                      off_t offset, size_t length, char* data,
+                      size_t data_capacity, int buf_index,
+                      LoadOption option = LoadOption()) {
+    (void)buf_index;
+    (void)data_capacity;
+    IOBuffer sink;
+    sink.AppendUserData(data, data_capacity, [](void*) {});
+    return Load(ctx, block_ctx, offset, length, &sink, option);
+  }
+
   virtual std::string Id() const = 0;
   virtual bool IsRunning() const = 0;
   virtual bool IsCached(const BlockContext& block_ctx) const = 0;

@@ -16,9 +16,11 @@ file(GLOB TEST_CACHE_COMMON_SRCS "*.cc")
 
 add_library(test_cache_common OBJECT
     ${TEST_CACHE_COMMON_SRCS}
+    ${CMAKE_SOURCE_DIR}/src/cache/infiniband/device.cpp
 )
 
 target_link_libraries(test_cache_common
     cache_lib
+    ibverbs::ibverbs
     ${TEST_DEPS_WITHOUT_MAIN}
 )

@@ -33,6 +33,7 @@
 
 #include "cache/blockcache/aio.h"
 #include "cache/common/macro.h"
+#include "cache/infiniband/rdma_memory.h"
 #include "common/io_buffer.h"
 #include "common/options/cache.h"
 #include "common/status.h"
@@ -43,7 +44,13 @@ namespace cache {
 IOUring::IOUring(const std::vector<iovec>& fixed_write_buffers,
                  const std::vector<iovec>& fixed_read_buffers)
     : running_(false), io_uring_(), epoll_fd_(-1) {
-  // NOTE: only call register_buffers once, so we need to merge the buffers
+  // Buffer layout in the io_uring fixed-buffer table:
+  //   [0 .. fixed_write_buffers.size())                       write pool
+  //   [fixed_write_buffers.size() .. + read pool count)       read pool
+  //   [..             ..  + each RDMA pool registered ..)     RDMA pools
+  //
+  // Callers receive GLOBAL indices that already encode this layout — see
+  // LocalFileSystem::AllocateAlignedMemory and RDMA Buffer::io_uring_buf_index.
   fixed_buffers_.reserve(fixed_write_buffers.size() +
                          fixed_read_buffers.size());
   fixed_buffers_.insert(fixed_buffers_.end(), fixed_write_buffers.begin(),
@@ -86,12 +93,26 @@ Status IOUring::Start() {
     return Status::Internal("init io_uring failed");
   }
 
+  // Append any RDMA pool iovecs to the fixed-buffer table so cache disk IO
+  // can read/write directly into RDMA-registered memory via prep_*_fixed.
+  // After register_buffers succeeds, the registry assigns each pool its
+  // io_uring_buf_index range starting at `rdma_base`.
+  const int rdma_base = static_cast<int>(fixed_buffers_.size());
+  auto rdma_iovecs =
+      infiniband::RDMAFixedBufferRegistry::Instance().CollectIovecs();
+  fixed_buffers_.insert(fixed_buffers_.end(), rdma_iovecs.begin(),
+                        rdma_iovecs.end());
+
   rc = io_uring_register_buffers(&io_uring_, fixed_buffers_.data(),
                                  fixed_buffers_.size());
   if (rc < 0) {
     LOG(ERROR) << "Fail to register buffers: " << strerror(-rc);
     return Status::Internal("register buffers failed");
   }
+  infiniband::RDMAFixedBufferRegistry::Instance().FinalizeIndexAssignment(
+      rdma_base);
+  LOG(INFO) << "io_uring registered " << fixed_buffers_.size()
+            << " fixed buffers (rdma_base=" << rdma_base << ")";
 
   epoll_fd_ = epoll_create1(0);
   if (epoll_fd_ <= 0) {
@@ -131,9 +152,11 @@ Status IOUring::Shutdown() {
 
 void IOUring::PrepWrite(io_uring_sqe* sqe, Aio* aio) const {
   if (aio->buf_index >= 0) {
+    // buf_index is a global index into io_uring's fixed-buffer table.
+    // Callers (LocalFileSystem / RDMA service) hand out global indices so
+    // we don't have to know which pool they came from.
     io_uring_prep_write_fixed(sqe, aio->fd, aio->buffer, aio->length,
-                              aio->offset,
-                              aio->buf_index + write_buf_index_offset_);
+                              aio->offset, aio->buf_index);
   } else {
     io_uring_prep_write(sqe, aio->fd, aio->buffer, aio->length, aio->offset);
   }
@@ -142,8 +165,7 @@ void IOUring::PrepWrite(io_uring_sqe* sqe, Aio* aio) const {
 void IOUring::PrepRead(io_uring_sqe* sqe, Aio* aio) const {
   if (aio->buf_index >= 0) {
     io_uring_prep_read_fixed(sqe, aio->fd, aio->buffer, aio->length,
-                             aio->offset,
-                             aio->buf_index + read_buf_index_offset_);
+                             aio->offset, aio->buf_index);
   } else {
     io_uring_prep_read(sqe, aio->fd, aio->buffer, aio->length, aio->offset);
   }

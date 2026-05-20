@@ -50,6 +50,20 @@ class LocalFileSystem {
   Status ReadFile(ContextSPtr ctx, const std::string& path, off_t offset,
                   size_t length, IOBuffer* buffer);
 
+  // Zero-copy overloads. `data` is a caller-provided contiguous buffer
+  // (e.g. a slice of an RDMA-registered pool) that is ALSO registered as
+  // an io_uring fixed buffer at `buf_index`. The file IO targets `data`
+  // directly via io_uring_prep_{read,write}_fixed — no copy through the
+  // internal BufferPool. Pass buf_index = -1 to fall back to non-fixed IO.
+  //
+  // For ReadFile, `data` must have at least the aligned-up length of
+  // (length + offset%4096). The caller owns alignment / overshoot.
+  Status WriteFile(ContextSPtr ctx, const std::string& path, const char* data,
+                   size_t length, int buf_index);
+  Status ReadFile(ContextSPtr ctx, const std::string& path, off_t offset,
+                  size_t length, char* data, size_t data_capacity,
+                  int buf_index);
+
  private:
   Status AioWrite(ContextSPtr ctx, int fd, char* buffer, size_t length,
                   int buf_index);

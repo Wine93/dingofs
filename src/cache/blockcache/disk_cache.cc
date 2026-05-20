@@ -304,6 +304,67 @@ Status DiskCache::Load(ContextSPtr ctx, const BlockContext& block_ctx,
   return status;
 }
 
+Status DiskCache::Cache(ContextSPtr ctx, const BlockContext& block_ctx,
+                        const char* data, size_t length, int buf_index,
+                        CacheOption /*option*/) {
+  auto status = CheckStatus(kWantExec | kWantCache);
+  if (!status.ok()) {
+    LOG(ERROR) << "Disk cache status is unavailable, skip cache(zero-copy): "
+                  "key="
+               << block_ctx.key.Filename()
+               << ", status=" << status.ToString();
+    return status;
+  }
+
+  if (IsCached(block_ctx)) {
+    return Status::OK();
+  }
+
+  auto cache_path = GetCachePath(block_ctx.key);
+  status = localfs_->WriteFile(ctx, cache_path, data, length, buf_index);
+  if (!status.ok()) {
+    LOG(ERROR) << "Fail to write cache file (zero-copy)=`" << cache_path
+               << "'";
+    return status;
+  }
+
+  manager_->Add(block_ctx.key, CacheValue(length, iutil::TimeNow()),
+                BlockPhase::kCached);
+  return status;
+}
+
+Status DiskCache::Load(ContextSPtr ctx, const BlockContext& block_ctx,
+                       off_t offset, size_t length, char* data,
+                       size_t data_capacity, int buf_index,
+                       LoadOption /*option*/) {
+  Status status;
+  DiskCacheVarsRecordGuard guard(__func__, status, vars_.get());
+
+  status = CheckStatus(kWantExec);
+  if (!status.ok()) {
+    return status;
+  }
+
+  if (!IsCached(block_ctx)) {
+    status = Status::NotFound("cache not found");
+    return status;
+  }
+
+  auto cache_path = GetCachePath(block_ctx.key);
+  status = localfs_->ReadFile(ctx, cache_path, offset, length, data,
+                              data_capacity, buf_index);
+  if (status.IsNotFound()) {
+    LOG(WARNING) << "Cache block file not found, delete the corresponding "
+                    "key from lru, path=`"
+                 << cache_path << "'";
+    manager_->Delete(block_ctx.key);
+  } else if (!status.ok()) {
+    LOG(ERROR) << "Fail to read block file (zero-copy)=`" << cache_path
+               << "'";
+  }
+  return status;
+}
+
 // CheckStatus cache status:
 //   1. check running status (UP/DOWN)
 //   2. check disk healthy (HEALTHY/UNHEALTHY)
