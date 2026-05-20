@@ -63,6 +63,16 @@ if(NOT DINGOSDK_INSTALL_PATH)
 endif()
 message("DINGOSDK_INSTALL_PATH:${DINGOSDK_INSTALL_PATH}")
 
+# tikvgo install dir
+if(NOT TIKVGO_INSTALL_PATH)
+  if(DEFINED ENV{TIKVGO_INSTALL_PATH})
+    set(TIKVGO_INSTALL_PATH $ENV{TIKVGO_INSTALL_PATH})
+  else()
+    set(TIKVGO_INSTALL_PATH "$ENV{HOME}/.local/tikvgo")
+  endif()
+endif()
+message("TIKVGO_INSTALL_PATH:${TIKVGO_INSTALL_PATH}")
+
 # dingofs SDK install prefix
 # Default: ~/.local/dingofs  Override: cmake -DCMAKE_INSTALL_PREFIX=/your/path ..
 if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
@@ -74,6 +84,7 @@ message("CMAKE_INSTALL_PREFIX: ${CMAKE_INSTALL_PREFIX}")
 set(CMAKE_PREFIX_PATH
   ${THIRD_PARTY_INSTALL_PATH}
   ${DINGOSDK_INSTALL_PATH}
+  ${TIKVGO_INSTALL_PATH}
   ${CMAKE_PREFIX_PATH}
   )
 message("CMAKE_PREFIX_PATH:${CMAKE_PREFIX_PATH}")
@@ -82,10 +93,13 @@ message("CMAKE_PREFIX_PATH:${CMAKE_PREFIX_PATH}")
 link_directories(BEFORE ${THIRD_PARTY_INSTALL_PATH}/lib)
 link_directories(BEFORE ${THIRD_PARTY_INSTALL_PATH}/lib64)
 link_directories(BEFORE ${DINGOSDK_INSTALL_PATH}/lib)
+link_directories(BEFORE ${TIKVGO_INSTALL_PATH}/lib)
+link_directories(BEFORE ${TIKVGO_INSTALL_PATH}/lib64)
 
 # include dir
 include_directories(${THIRD_PARTY_INSTALL_PATH}/include)
 include_directories(${DINGOSDK_INSTALL_PATH}/include)
+include_directories(${TIKVGO_INSTALL_PATH}/include)
 
 set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake" ${CMAKE_MODULE_PATH})
 message("CMAKE_MODULE_PATH: ${CMAKE_MODULE_PATH}")
