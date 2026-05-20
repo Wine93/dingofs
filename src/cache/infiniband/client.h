@@ -30,6 +30,7 @@
 #include <memory>
 #include <type_traits>
 
+#include "cache/infiniband/client_session.h"
 #include "cache/infiniband/connection.h"
 #include "cache/infiniband/controller.h"
 #include "cache/infiniband/event.h"
@@ -43,11 +44,9 @@ namespace cache {
 namespace infiniband {
 
 class Dialer;
-class ClientRDMASession;
 class Client;
 
 using DialerUPtr = std::unique_ptr<Dialer>;
-using ClientRDMASessionUPtr = std::unique_ptr<ClientRDMASession>;
 using ClientUPtr = std::unique_ptr<Client>;
 
 class Dialer {
@@ -69,29 +68,6 @@ class Dialer {
   ProtectDomainUPtr protect_domain_;
 };
 
-class ClientRDMASession : public EventHandler {
- public:
-  explicit ClientRDMASession(ConnectionUPtr conn);
-  void Start();
-  void Shutdown();
-
-  void HandleEvent() override;
-
-  Status OnEstablished();
-  Status SendRequest(Controller* cntl,
-                     const google::protobuf::Message& request);
-  void OnRequestSent(const WorkCompletion& wc);
-  void OnResponseReceived(const WorkCompletion& wc);
-  Status ProcessResponse(Controller* cntl, google::protobuf::Message* response);
-
- private:
-  static int HandleWorkCompletion(void* meta,
-                                  bthread::TaskIterator<CompletionBatch>& iter);
-
-  ConnectionUPtr conn_;
-  bthread::ExecutionQueueId<CompletionBatch> handle_wc_queue_id_;
-};
-
 class Client {
  public:
   explicit Client(DialerUPtr dialer);
@@ -99,7 +75,9 @@ class Client {
 
   Status Connect(const std::string& address);
 
-  ProtectDomain* GetProtectDomain() const { return dialer_->GetProtectDomain(); }
+  ProtectDomain* GetProtectDomain() const {
+    return dialer_->GetProtectDomain();
+  }
 
   template <typename Req, typename Resp>
   Status Call(Controller* cntl, const Req& request, Resp* response) {
@@ -115,7 +93,7 @@ class Client {
                 google::protobuf::Message* response);
 
   DialerUPtr dialer_;
-  ClientRDMASessionUPtr session_;
+  ClientSessionUPtr session_;
 };
 
 }  // namespace infiniband

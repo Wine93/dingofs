@@ -48,9 +48,9 @@ struct Controller {
   Status status{Status::Unknown("unknown")};
 
   // request
-  Buffer* request_buffer{nullptr};  // => request_buffer
+  Buffer* request_buffer{nullptr};
   bthread::CountdownEvent request_sent{1};
-  MemoryContext request_memory_context{};
+  MemoryContext request_memory_context;
 
   // response
   Buffer* response_buffer{nullptr};

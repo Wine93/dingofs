@@ -73,40 +73,6 @@ class InfinibandServiceImpl final : public pb::infiniband::InfinibandService {
   Messenger* messenger_;
 };
 
-class RDMAClosure : public ::google::protobuf::Closure {
- public:
-  void Wait() { countdown_.wait(); }
-  void Run() override { countdown_.signal(); }
-
- private:
-  bthread::CountdownEvent countdown_{1};
-};
-
-class ServerRDMASession : public EventHandler {
- public:
-  ServerRDMASession(ConnectionUPtr conn, Messenger* messenger);
-  void Start();
-  void Shutdown();
-
-  void HandleEvent() override;
-
-  Status OnEstablished();
-  void OnRequestReceived(const WorkCompletion& wc);
-  Status ProcessRequest(Controller* cntl,
-                        pb::infiniband::InfinibandResponse* ib_response);
-  Status SendResponse(Controller* cntl,
-                      pb::infiniband::InfinibandResponse* ib_response);
-  void OnResponseSent(const WorkCompletion& wc);
-
- private:
-  static int HandleWorkCompletion(void* meta,
-                                  bthread::TaskIterator<CompletionBatch>& iter);
-
-  Messenger* messenger_;
-  ConnectionUPtr conn_;
-  bthread::ExecutionQueueId<CompletionBatch> handle_wc_queue_id_;
-};
-
 struct ServerOptions {
   brpc::Server* brpc_server{nullptr};
 };

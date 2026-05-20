@@ -81,21 +81,24 @@ Status Connection::PostSendWorkRequests(
     work_requests[i].num_sge = 1;
 
     // opcode
-    if (entries[i].optype == OpType::kSend) {
+    if (entries[i].opcode == OpCode::kSend) {
       work_requests[i].opcode = IBV_WR_SEND;
-    } else if (entries[i].optype == OpType::kWrite) {
+    } else if (entries[i].opcode == OpCode::kRDMAWrite) {
       work_requests[i].opcode = IBV_WR_RDMA_WRITE;
+    } else if (entries[i].opcode == OpCode::kRDMARead) {
+      work_requests[i].opcode = IBV_WR_RDMA_READ;
     } else {
       CHECK(false) << "Unsupport send optype";
     }
 
     // send_flags
-    if (entries[i].signal) {
+    if (entries[i].signaled) {
       work_requests[i].send_flags = IBV_SEND_SIGNALED;
     }
 
     // wr
-    if (entries[i].optype == OpType::kWrite) {
+    if (entries[i].opcode == OpCode::kRDMAWrite ||
+        entries[i].opcode == OpCode::kRDMARead) {
       work_requests[i].wr.rdma.remote_addr = entries[i].raddr;
       work_requests[i].wr.rdma.rkey = entries[i].rkey;
     }
@@ -147,12 +150,12 @@ Status Connection::PostRecvWorkRequests(
   return Status::OK();
 }
 
-bool Connection::HandleCompletion(CompletionHandler handler) {
+void Connection::HandleCompletion(CompletionHandler handler) {
+  // TODO: modify qp state to error
   CHECK(completion_queue_->GetCqEvent());
   CHECK(PollCompletionQueue(handler));
   CHECK(completion_queue_->RearmNotify());
   CHECK(PollCompletionQueue(handler));
-  return true;
 }
 
 bool Connection::PollCompletionQueue(CompletionHandler handler) {
@@ -169,9 +172,9 @@ bool Connection::PollCompletionQueue(CompletionHandler handler) {
       return true;
     }
 
-    auto wcs = std::make_shared<std::vector<WorkCompletion>>(n);
+    auto wcs = std::vector<WorkCompletion>(n);
     for (int i = 0; i < n; i++) {
-      auto& wc = (*wcs)[i];
+      auto& wc = wcs[i];
 
       // wr_id
       wc.id = cqe[i].wr_id;
@@ -182,7 +185,7 @@ bool Connection::PollCompletionQueue(CompletionHandler handler) {
           wc.status = Status::OK();
           break;
         default:
-          wc.status = Status::IoError(ibv_wc_status_str(cqe[i].status));
+          wc.status = Status::Internal(ibv_wc_status_str(cqe[i].status));
           LOG(ERROR) << "[DBG] WR failed: wr_id=0x" << std::hex << cqe[i].wr_id
                      << " opcode=" << std::dec << cqe[i].opcode
                      << " vendor_err=0x" << std::hex << cqe[i].vendor_err
@@ -192,24 +195,30 @@ bool Connection::PollCompletionQueue(CompletionHandler handler) {
       // opcode
       switch (cqe[i].opcode) {
         case IBV_WC_SEND:
-          wc.optype = OpType::kSend;
+          wc.opcode = OpCode::kSend;
           break;
 
         case IBV_WC_RECV:
-          wc.optype = OpType::kRecv;
+          wc.opcode = OpCode::kRecv;
+          break;
+
+        case IBV_WC_RDMA_WRITE:
+          wc.opcode = OpCode::kRDMAWrite;
+          break;
+
+        case IBV_WC_RDMA_READ:
+          wc.opcode = OpCode::kRDMARead;
           break;
 
         default:
-          wc.optype = OpType::kUnknown;
+          wc.opcode = OpCode::kUnknown;
       }
 
       // bytes_len
       wc.byte_len = cqe[i].byte_len;
     }
 
-    // LOG(INFO) << "Successfully poll " << n << " work completions";
-
-    handler(CompletionBatch{std::move(wcs)});
+    handler(std::move(wcs));
 
     if (n < kMaxWcNum) {
       break;

@@ -39,6 +39,7 @@ class RDMAMemoryPool;
 using RDMAMemoryPoolUPtr = std::unique_ptr<RDMAMemoryPool>;
 
 struct Buffer {
+  int index{0};
   char* data{nullptr};
   uint32_t capacity{0};
   uint32_t length{0};
