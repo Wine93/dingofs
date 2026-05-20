@@ -25,59 +25,96 @@
 #include <glog/logging.h>
 
 #include <memory>
+#include <utility>
+
+#include "cache/infiniband/rdma_memory.h"
 
 namespace dingofs {
 namespace cache {
 namespace infiniband {
 
-RDMAMemoryPool::RDMAMemoryPool(ibv_mr* mr, MemoryPoolUPtr pool,
-                               std::vector<Buffer> buffers)
-    : mr_(mr), pool_(std::move(pool)), buffers_(std::move(buffers)) {}
+namespace {
 
-RDMAMemoryPool::~RDMAMemoryPool() {
-  if (mr_ != nullptr) {
-    PCHECK(ibv_dereg_mr(mr_) == 0) << "Fail to dereg memory region";
-    mr_ = nullptr;
+constexpr int kPoolAccess = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                            IBV_ACCESS_REMOTE_READ;
+
+RDMAMemoryPoolUPtr BuildPool(RDMARegionUPtr region, MemoryPoolUPtr backing,
+                             size_t buffer_size, size_t buffer_count) {
+  std::vector<Buffer> buffers;
+  buffers.reserve(buffer_count);
+  for (size_t i = 0; i < buffer_count; ++i) {
+    Buffer buffer;
+    buffer.data = backing->base() + (i * buffer_size);
+    buffer.capacity = static_cast<uint32_t>(buffer_size);
+    buffer.lkey = region->lkey;
+    buffer.rkey = region->rkey;
+    buffers.emplace_back(buffer);
   }
+
+  LOG(INFO) << "Successfully create RDMAMemoryPool{buffer_size=" << buffer_size
+            << " buffer_count=" << buffer_count << " lkey=" << region->lkey
+            << " rkey=" << region->rkey << "}";
+
+  auto pool = std::make_unique<RDMAMemoryPool>(
+      std::move(region), std::move(backing), std::move(buffers));
+  // The same physical memory will (later, in LocalFileSystem::Start) be
+  // handed to io_uring_register_buffers so cache-disk IO can read/write
+  // directly into RDMA-registered memory without bouncing through io_uring's
+  // own BufferPool.
+  RDMAFixedBufferRegistry::Instance().Register(pool.get());
+  return pool;
 }
+
+}  // namespace
+
+RDMAMemoryPool::RDMAMemoryPool(RDMARegionUPtr region, MemoryPoolUPtr pool,
+                               std::vector<Buffer> buffers)
+    : region_(std::move(region)),
+      pool_(std::move(pool)),
+      buffers_(std::move(buffers)) {}
+
+RDMAMemoryPool::~RDMAMemoryPool() = default;
 
 RDMAMemoryPoolUPtr RDMAMemoryPool::Create(ProtectDomain* protect_domain,
                                           size_t buffer_size,
                                           size_t buffer_count) {
   CHECK_NOTNULL(protect_domain);
 
-  auto pool = MemoryPool::Create(buffer_size, buffer_count);
-  if (pool == nullptr) {
+  auto backing = MemoryPool::Create(buffer_size, buffer_count);
+  if (backing == nullptr) {
     return nullptr;
   }
 
+  RDMARegionUPtr region;
   size_t bytes = buffer_size * buffer_count;
-  ibv_mr* mr = ibv_reg_mr(protect_domain->GetIbPd(), pool->base(), bytes,
-                          IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
-  if (mr == nullptr) {
-    PLOG(ERROR) << "Fail to register memory region: bytes=" << bytes;
+  auto st = RegisterRDMAMemoryOnPD(protect_domain, backing->base(), bytes,
+                                   kPoolAccess, &region);
+  if (!st.ok()) {
     return nullptr;
   }
 
-  std::vector<Buffer> buffers;
-  buffers.reserve(buffer_count);
-  for (int i = 0; i < buffer_count; ++i) {
-    Buffer buffer;
-    buffer.data = pool->base() + (i * buffer_size);
-    buffer.capacity = static_cast<uint32_t>(buffer_size);
-    buffer.lkey = 0;
-    buffer.lkey = mr->lkey;
-    buffer.rkey = mr->rkey;
-    buffer.index = i;
-    buffers.emplace_back(buffer);
+  return BuildPool(std::move(region), std::move(backing), buffer_size,
+                   buffer_count);
+}
+
+RDMAMemoryPoolUPtr RDMAMemoryPool::Create(const PoolEndPoint& endpoint,
+                                          size_t buffer_size,
+                                          size_t buffer_count) {
+  auto backing = MemoryPool::Create(buffer_size, buffer_count);
+  if (backing == nullptr) {
+    return nullptr;
   }
 
-  LOG(INFO) << "Successfully create RDMAMemoryPool{buffer_size=" << buffer_size
-            << " buffer_count=" << buffer_count << " lkey=" << mr->lkey
-            << " rkey=" << mr->rkey << "}";
+  RDMARegionUPtr region;
+  size_t bytes = buffer_size * buffer_count;
+  auto st = RegisterRDMAMemory(endpoint.device_name, endpoint.port_num,
+                               backing->base(), bytes, kPoolAccess, &region);
+  if (!st.ok()) {
+    return nullptr;
+  }
 
-  return std::make_unique<RDMAMemoryPool>(mr, std::move(pool),
-                                          std::move(buffers));
+  return BuildPool(std::move(region), std::move(backing), buffer_size,
+                   buffer_count);
 }
 
 Buffer* RDMAMemoryPool::Require() {
@@ -93,6 +130,32 @@ void RDMAMemoryPool::Release(Buffer* buffer) {
   DCHECK_GE(buffer, buffers_.data());
   DCHECK_LT(buffer, buffers_.data() + buffers_.size());
   pool_->Release(buffer->data);
+}
+
+size_t RDMAMemoryPool::IndexOf(Buffer* buffer) const {
+  return pool_->IndexOf(buffer->data);
+}
+
+std::vector<iovec> RDMAMemoryPool::Fetch() const {
+  std::vector<iovec> v;
+  v.reserve(buffers_.size());
+  for (const auto& b : buffers_) {
+    iovec iov;
+    iov.iov_base = b.data;
+    iov.iov_len = b.capacity;
+    v.push_back(iov);
+  }
+  return v;
+}
+
+void RDMAMemoryPool::AssignIoUringIndices(int read_index_offset,
+                                          int write_index_offset) {
+  for (size_t i = 0; i < buffers_.size(); ++i) {
+    buffers_[i].io_uring_read_buf_index =
+        read_index_offset + static_cast<int>(i);
+    buffers_[i].io_uring_write_buf_index =
+        write_index_offset + static_cast<int>(i);
+  }
 }
 
 }  // namespace infiniband

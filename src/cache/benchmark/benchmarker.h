@@ -27,9 +27,7 @@
 #include "cache/benchmark/reporter.h"
 #include "cache/benchmark/worker.h"
 #include "cache/blockcache/block_cache.h"
-#include "cache/common/mds_client.h"
-#include "cache/storage/storage.h"
-#include "cache/storage/storage_pool.h"
+#include "utils/concurrent/task_thread_pool.h"
 
 namespace dingofs {
 namespace cache {
@@ -45,8 +43,6 @@ class Benchmarker {
  private:
   // Init
   Status InitAll();
-  Status InitMdsClient();
-  Status InitStorage();
   Status InitBlockCache();
   Status InitCollector();
   Status InitReporter();
@@ -65,15 +61,12 @@ class Benchmarker {
   void StopCollector();
 
  private:
-  MDSClientSPtr mds_client_;
-  StoragePoolSPtr storage_pool_;
-  StorageSPtr storage_;
   BlockCacheSPtr block_cache_;
   CollectorSPtr collector_;
   ReporterSPtr reporter_;
   TaskFactorySPtr factory_;
   std::vector<WorkerUPtr> workers_;
-  TaskThreadPoolUPtr thread_pool_;
+  utils::TaskThreadPoolUPtr thread_pool_;
 };
 
 }  // namespace cache

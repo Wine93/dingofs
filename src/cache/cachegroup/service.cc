@@ -95,9 +95,12 @@ void BlockCacheServiceImpl::Range(google::protobuf::RpcController* controller,
 
   IOBuffer buffer;
   bool cache_hit = false;
+  RangeOption option;
+  option.retrieve_storage =
+      request->has_retrieve_storage() ? request->retrieve_storage() : true;
   BlockHandle handle = FromHandlePB(request->handle());
   status = node_->Range(handle, request->offset(), request->length(), &buffer,
-                        request->block_size(), &cache_hit);
+                        request->block_size(), &cache_hit, option);
   if (status.ok()) {
     cntl->response_attachment() = buffer.IOBuf().movable();
   }

@@ -23,8 +23,7 @@
 #include "cache/infiniband/server.h"
 
 #include <brpc/controller.h>
-#include <bthread/countdown_event.h>
-#include <gflags/gflags.h>
+#include <brpc/server.h>
 #include <glog/logging.h>
 #include <infiniband/verbs.h>
 
@@ -32,15 +31,11 @@
 #include <memory>
 #include <utility>
 
-#include "cache/common/closure.h"
 #include "cache/infiniband/connection.h"
 #include "cache/infiniband/event.h"
 #include "cache/infiniband/infiniband.h"
-#include "cache/infiniband/memory.h"
-#include "cache/infiniband/messenger.h"
-#include "cache/infiniband/protocol.h"
+#include "cache/infiniband/rdma_memory.h"
 #include "cache/infiniband/server_session.h"
-#include "cache/iutil/bthread.h"
 #include "common/status.h"
 #include "dingofs/infiniband.pb.h"
 
@@ -48,36 +43,17 @@ namespace dingofs {
 namespace cache {
 namespace infiniband {
 
-Listener::Listener()
-    : device_(nullptr), port_(nullptr), protect_domain_(nullptr) {}
+Listener::Listener() = default;
 
 Status Listener::Listen(const EndPoint& ep) {
-  device_ = Device::Open(ep.device_name);
-  if (nullptr == device_) {
-    LOG(ERROR) << "Fail to open device=" << ep.device_name;
-    return Status::Internal("open device failed");
+  protect_domain_ = GetOrAllocPD(ep.device_name, ep.port_num);
+  if (protect_domain_ == nullptr) {
+    return Status::Internal("open device / alloc PD failed");
   }
-
-  port_ = Port::Query(device_.get(), ep.port_num);
-  if (nullptr == port_) {
-    LOG(ERROR) << "Fail to query port=" << (int)ep.port_num
-               << " of device=" << ep.device_name;
-    return Status::Internal("query port failed");
-  } else if (port_->GetPortState() != PortState::kActive) {
-    LOG(ERROR) << "Port=" << (int)ep.port_num << " of device=" << ep.device_name
-               << " is not active";
-    return Status::Internal("port is not active");
-  } else if (port_->GetLinkLayer() == LinkLayer::kUnspecified) {
-    LOG(ERROR) << "Port=" << (int)ep.port_num << " of device=" << ep.device_name
-               << " has unspecified link layer";
-    return Status::Internal("unspecified link layer");
-  }
-
-  protect_domain_ = ProtectDomain::Alloc(device_.get());
-  if (nullptr == protect_domain_) {
-    LOG(ERROR) << "Fail to alloc protect domain of device=" << ep.device_name;
-    return Status::Internal("alloc protect domain failed");
-  }
+  device_ = GetCachedDevice(ep.device_name);
+  port_ = GetCachedPort(ep.device_name);
+  CHECK_NOTNULL(device_);
+  CHECK_NOTNULL(port_);
 
   LOG(INFO) << "RDMA listener is listening on " << ep.device_name << ":"
             << static_cast<int>(ep.port_num);
@@ -87,15 +63,14 @@ Status Listener::Listen(const EndPoint& ep) {
 ConnectionUPtr Listener::Accept(const ConnMangmentMeta& remote_cm_meta) {
   LOG(INFO) << "Accepting RDMA connection: peer=" << remote_cm_meta;
 
-  auto completion_queue = CompletionQueue::Create(device_.get());
+  auto completion_queue = CompletionQueue::Create(device_);
   if (nullptr == completion_queue) {
     LOG(ERROR) << "Fail to create completion queue";
     return nullptr;
   }
 
-  auto queue_pair =
-      QueuePair::Create(device_.get(), port_.get(), protect_domain_.get(),
-                        completion_queue.get());
+  auto queue_pair = QueuePair::Create(device_, port_, protect_domain_,
+                                      completion_queue.get());
   if (nullptr == queue_pair) {
     LOG(ERROR) << "Fail to create queue pair";
     return nullptr;
@@ -126,6 +101,8 @@ InfinibandServiceImpl::InfinibandServiceImpl(Listener* listener,
   CHECK_NOTNULL(listener_);
   CHECK_NOTNULL(messenger_);
 }
+
+InfinibandServiceImpl::~InfinibandServiceImpl() { ShutdownSessions(); }
 
 void InfinibandServiceImpl::Sync(google::protobuf::RpcController* controller,
                                  const pb::infiniband::SyncRequest* request,
@@ -173,26 +150,30 @@ void InfinibandServiceImpl::Sync(google::protobuf::RpcController* controller,
   // is torn down. TODO(wine93): wire session lifecycle to a server-side
   // registry so it can be reclaimed on shutdown / connection close.
   // FIXME: delete session when connection closed
-  auto* session = new ServerSession(std::move(conn), messenger_);
+  auto session = std::make_unique<ServerSession>(std::move(conn), messenger_);
   session->Start();
 
   auto status = session->OnEstablished();
   if (!status.ok()) {
     LOG(ERROR) << "Fail to establish session: " << status.ToString();
     session->Shutdown();
-    delete session;
     cntl->SetFailed("establish session failed: " + status.ToString());
     return;
   }
 
   status =
-      GetGlobalEventDispatcher(fd).AddEvent(fd, EventType::kReadEvent, session);
+      GetGlobalEventDispatcher(fd).AddEvent(fd, EventType::kReadEvent,
+                                            session.get());
   if (!status.ok()) {
     LOG(ERROR) << "Fail to register event: " << status.ToString();
     session->Shutdown();
-    delete session;
     cntl->SetFailed("register event failed: " + status.ToString());
     return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(sessions_mutex_);
+    sessions_.emplace_back(std::move(session));
   }
 
   auto* cm = response->mutable_cm_meta();
@@ -205,6 +186,27 @@ void InfinibandServiceImpl::Sync(google::protobuf::RpcController* controller,
 
   LOG(INFO) << "Accepted RDMA connection: peer=" << remote_cm_meta
             << " local=" << local_cm_meta << " fd=" << fd;
+}
+
+Status InfinibandServiceImpl::ShutdownSessions() {
+  std::vector<ServerSessionUPtr> sessions;
+  {
+    std::lock_guard<std::mutex> lock(sessions_mutex_);
+    sessions.swap(sessions_);
+  }
+
+  Status status;
+  for (auto& session : sessions) {
+    auto del_status =
+        GetGlobalEventDispatcher(session->Fd()).DelEvent(session->Fd());
+    if (!del_status.ok()) {
+      LOG(WARNING) << "Fail to remove RDMA session event: "
+                   << del_status.ToString();
+      status = del_status;
+    }
+    session->Shutdown();
+  }
+  return status;
 }
 
 Server::Server()
@@ -223,7 +225,8 @@ Status Server::Start(const EndPoint& ep, ServerOptions* options) {
     return status;
   }
 
-  int rc = brpc_server->AddService(service_.get(), brpc::SERVER_OWNS_SERVICE);
+  int rc =
+      brpc_server->AddService(service_.get(), brpc::SERVER_DOESNT_OWN_SERVICE);
   if (rc != 0) {
     LOG(ERROR) << "Fail to add InfinibandService to brpc server";
     return Status::Internal("add service failed");
@@ -233,8 +236,7 @@ Status Server::Start(const EndPoint& ep, ServerOptions* options) {
 }
 
 Status Server::Shutdown() {
-  //
-  return Status::OK();
+  return service_->ShutdownSessions();
 }
 
 }  // namespace infiniband

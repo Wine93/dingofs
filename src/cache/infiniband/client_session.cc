@@ -24,7 +24,6 @@
 
 #include <bthread/execution_queue.h>
 #include <butil/memory/scope_guard.h>
-#include <butil/time.h>
 #include <glog/logging.h>
 
 #include <cstdint>
@@ -59,10 +58,9 @@ void ClientSession::Shutdown() {
 }
 
 void ClientSession::HandleEvent() {
-  bool succ = conn_->HandleCompletion([this](WorkCompletions wcs) {
+  conn_->HandleCompletion([this](WorkCompletions wcs) {
     CHECK_EQ(0, bthread::execution_queue_execute(handle_wc_queue_id_, wcs));
   });
-  CHECK(succ);
 }
 
 int ClientSession::HandleWorkCompletion(
@@ -74,26 +72,13 @@ int ClientSession::HandleWorkCompletion(
   auto* session = static_cast<ClientSession*>(meta);
   for (; iter; iter++) {
     for (const auto& wc : *iter) {
-      //
+      if (wc.status.ok()) {
+        session->OnSuccess(wc);
+      } else {
+        session->OnError(wc);
+      }
     }
-    // auto& batch = *iter;
-    //  for (const auto& wc : *batch.wcs) {
-    //    switch (wc.optype) {
-    //      case OpType::kSend:  // request sent
-    //        session->OnRequestSent(wc);
-    //        break;
-
-    //    case OpType::kRecv:  // response received
-    //      session->OnResponseReceived(wc);
-    //      break;
-
-    //    default:
-    //      CHECK(false) << "Unexpected work completion opcode";
-    //      break;
-    //  }
-    //}
   }
-
   return 0;
 }
 
@@ -103,12 +88,24 @@ void ClientSession::OnSuccess(const WorkCompletion& wc) {
   } else if (wc.opcode == OpCode::kRecv) {
     OnResponseReceived(wc);
   } else {
-    //
+    LOG(WARNING) << "Unexpected work completion opcode="
+                 << static_cast<int>(wc.opcode);
   }
 }
 
 void ClientSession::OnError(const WorkCompletion& wc) {
-  //
+  LOG(ERROR) << "Work completion in error state: opcode="
+             << static_cast<int>(wc.opcode) << " wc.id=" << wc.id
+             << " status=" << wc.status.ToString();
+  if (wc.opcode == OpCode::kSend) {
+    auto* cntl = reinterpret_cast<Controller*>(wc.id);
+    if (cntl != nullptr) {
+      UnregisterInflight(cntl->CorrelationId());
+      cntl->NotifyRequestSent(wc.status);
+    }
+  } else if (wc.opcode == OpCode::kRecv) {
+    FailInflights(wc.status);
+  }
 }
 
 Status ClientSession::OnEstablished() {
@@ -122,7 +119,7 @@ Status ClientSession::OnEstablished() {
     }
 
     RecvWorkRequest entry;
-    // entry.id = WorkRequestCtx(OpCode::kRecv, buffer).Id();
+    entry.id = reinterpret_cast<uint64_t>(buffer);
     entry.addr = reinterpret_cast<uint64_t>(buffer->data);
     entry.length = buffer->capacity;
     entry.lkey = buffer->lkey;
@@ -142,55 +139,47 @@ Status ClientSession::OnEstablished() {
 }
 
 Status ClientSession::SendRequest(Controller* cntl,
+                                  std::string_view service_name,
+                                  std::string_view method_name,
                                   const google::protobuf::Message& request) {
-  // butil::Timer timer;
-  // timer.start();
+  if (cntl->CorrelationId() == 0) {
+    cntl->SetCorrelationId(reinterpret_cast<uint64_t>(cntl));
+  }
+  RegisterInflight(cntl);
 
   auto* mem_pool = conn_->GetSendMemPool();
   auto* buffer = mem_pool->Require();
   if (buffer == nullptr) {
     LOG(ERROR) << "Fail to require send buffer";
+    UnregisterInflight(cntl->CorrelationId());
     return Status::Internal("require send buffer failed");
   }
 
-  // timer.stop();
-
-  // LOG(INFO) << "<<< Require send buffer cost "
-  //           << absl::StrFormat("%.6lf", timer.u_elapsed(0) / 1e6)
-  //           << " seconds.";
-
   BRPC_SCOPE_EXIT { mem_pool->Release(buffer); };
 
-  // timer.start();
-  pb::infiniband::InfinibandRequest ib_request;
-  auto& ctx = cntl->request_memory_context;
-  ib_request.mutable_memory_context()->set_addr(ctx.addr);
-  ib_request.mutable_memory_context()->set_length(ctx.length);
-  ib_request.mutable_memory_context()->set_rkey(ctx.rkey);
+  // Build RequestMeta on the Controller's Arena to avoid a per-RPC heap
+  // allocation for the wrapper protobuf.
+  auto* meta = ::google::protobuf::Arena::CreateMessage<
+      pb::infiniband::RequestMeta>(cntl->Arena());
+  meta->set_service_name(std::string(service_name));
+  meta->set_method_name(std::string(method_name));
+  const auto& ctx = cntl->RequestMemoryContext();
+  auto* mc = meta->mutable_memory_context();
+  mc->set_addr(ctx.addr);
+  mc->set_length(ctx.length);
+  mc->set_rkey(ctx.rkey);
 
-  auto status = Protocol::PackBody(request, &ib_request);
+  auto status =
+      Protocol::SerializeFrame(buffer, cntl->CorrelationId(), *meta, request);
   if (!status.ok()) {
+    UnregisterInflight(cntl->CorrelationId());
     return status;
   }
-
-  status = Protocol::Serialize(ib_request, cntl->correlation_id, buffer->data,
-                               buffer->capacity, &buffer->length);
-  if (!status.ok()) {
-    return status;
-  }
-
-  // timer.stop();
-
-  // LOG(INFO) << "<<< Serialize send request cost "
-  //           << absl::StrFormat("%.6lf", timer.u_elapsed(0) / 1e6)
-  //           << " seconds.";
-
-  // timer.start();
 
   SendWorkRequest entry;
   entry.id = reinterpret_cast<uint64_t>(cntl);
-  entry.optype = OpType::kSend;
-  entry.signal = true;
+  entry.opcode = OpCode::kSend;
+  entry.signaled = true;
   entry.addr = reinterpret_cast<uint64_t>(buffer->data);
   entry.length = buffer->length;
   entry.lkey = buffer->lkey;
@@ -198,40 +187,24 @@ Status ClientSession::SendRequest(Controller* cntl,
   status = conn_->PostSendWorkRequest(entry);
   if (!status.ok()) {
     LOG(ERROR) << "Fail to post send work request: " << status.ToString();
+    UnregisterInflight(cntl->CorrelationId());
     return status;
   }
 
-  // timer.stop();
-
-  // LOG(INFO) << "<<< Post send work request cost "
-  //           << absl::StrFormat("%.6lf", timer.u_elapsed(0) / 1e6)
-  //           << " seconds.";
-
-  // timer.start();
-  cntl->request_sent.wait();
-  // timer.stop();
-
-  // LOG(INFO) << "<<< Wait request sent success cost "
-  //           << absl::StrFormat("%.6lf", timer.u_elapsed(0) / 1e6)
-  //           << " seconds.";
-
-  return cntl->status;
+  status = cntl->WaitRequestSent();
+  if (!status.ok()) {
+    UnregisterInflight(cntl->CorrelationId());
+    return status;
+  }
+  if (!cntl->WcStatus().ok()) {
+    UnregisterInflight(cntl->CorrelationId());
+  }
+  return cntl->WcStatus();
 }
 
 void ClientSession::OnRequestSent(const WorkCompletion& wc) {
-  // LOG(INFO) << "<<< OnRequestSent()";
-
-  butil::Timer timer;
-  timer.start();
-
   auto* cntl = reinterpret_cast<Controller*>(wc.id);
-  cntl->status = wc.status;
-  cntl->request_sent.signal();
-
-  timer.stop();
-  // LOG(INFO) << "<<< Notify request sent cost "
-  //           << absl::StrFormat("%.6lf", timer.u_elapsed() * 1.0 / 1e6)
-  //           << " seconds.";
+  cntl->NotifyRequestSent(wc.status);
 }
 
 void ClientSession::OnResponseReceived(const WorkCompletion& wc) {
@@ -240,18 +213,28 @@ void ClientSession::OnResponseReceived(const WorkCompletion& wc) {
   buffer->length = wc.byte_len;
 
   uint64_t correlation_id;
-  auto status = Protocol::PeekCorrelationId(buffer->data, buffer->length,
-                                            &correlation_id);
-  CHECK(status.ok());
+  auto status = Protocol::PeekCorrelationId(buffer, &correlation_id);
+  if (!status.ok()) {
+    LOG(ERROR) << "Fail to parse response correlation id: "
+               << status.ToString();
+    RepostRecv(buffer);
+    return;
+  }
 
-  auto* cntl = reinterpret_cast<Controller*>(correlation_id);
-  cntl->response_buffer = buffer;
-  cntl->response_received.signal();
+  auto* cntl = FindInflight(correlation_id);
+  if (cntl == nullptr) {
+    LOG(ERROR) << "No RDMA inflight RPC found for correlation_id="
+               << correlation_id;
+    RepostRecv(buffer);
+    return;
+  }
+  UnregisterInflight(correlation_id);
+  cntl->NotifyResponseReceived(buffer);
 }
 
 Status ClientSession::ProcessResponse(Controller* cntl,
                                       google::protobuf::Message* response) {
-  auto* buffer = cntl->response_buffer;
+  auto* buffer = cntl->ResponseBuffer();
   BRPC_SCOPE_EXIT {
     RecvWorkRequest entry;
     entry.id = reinterpret_cast<uint64_t>(buffer);
@@ -262,12 +245,70 @@ Status ClientSession::ProcessResponse(Controller* cntl,
     CHECK(conn_->PostRecvWorkRequest(entry).ok());
   };
 
-  pb::infiniband::InfinibandResponse ib_response;
-  auto status = Protocol::Parse(buffer->data, buffer->length, &ib_response);
-  if (status.ok()) {
-    status = Protocol::UnpackBody(ib_response, response);
+  pb::infiniband::ResponseMeta resp_meta;
+  std::string_view data;
+  uint64_t correlation_id = 0;
+  auto status =
+      Protocol::ParseFrame(buffer, &correlation_id, &resp_meta, &data);
+  if (!status.ok()) {
+    return status;
   }
-  return status;
+  if (resp_meta.error_code() != 0) {
+    LOG(ERROR) << "RDMA RPC failed on server: code=" << resp_meta.error_code()
+               << " msg=" << resp_meta.error_message();
+    return Status::Internal(resp_meta.error_message());
+  }
+  cntl->SetResponseAttachmentLength(resp_meta.memory_context().attachment_length());
+  if (!response->ParseFromArray(data.data(), static_cast<int>(data.size()))) {
+    LOG(ERROR) << "Fail to parse response body";
+    return Status::InvalidParam("parse response body failed");
+  }
+  return Status::OK();
+}
+
+void ClientSession::RepostRecv(Buffer* buffer) {
+  RecvWorkRequest entry;
+  entry.id = reinterpret_cast<uint64_t>(buffer);
+  entry.addr = reinterpret_cast<uint64_t>(buffer->data);
+  entry.length = buffer->capacity;
+  entry.lkey = buffer->lkey;
+
+  auto status = conn_->PostRecvWorkRequest(entry);
+  if (!status.ok()) {
+    LOG(ERROR) << "Fail to repost RDMA receive buffer: "
+               << status.ToString();
+    FailInflights(status);
+  }
+}
+
+void ClientSession::RegisterInflight(Controller* cntl) {
+  std::lock_guard<std::mutex> lock(inflight_mutex_);
+  auto [_, inserted] = inflights_.emplace(cntl->CorrelationId(), cntl);
+  CHECK(inserted) << "Duplicate RDMA correlation id="
+                  << cntl->CorrelationId();
+}
+
+void ClientSession::UnregisterInflight(uint64_t correlation_id) {
+  std::lock_guard<std::mutex> lock(inflight_mutex_);
+  inflights_.erase(correlation_id);
+}
+
+Controller* ClientSession::FindInflight(uint64_t correlation_id) {
+  std::lock_guard<std::mutex> lock(inflight_mutex_);
+  auto it = inflights_.find(correlation_id);
+  return it == inflights_.end() ? nullptr : it->second;
+}
+
+void ClientSession::FailInflights(const Status& status) {
+  std::unordered_map<uint64_t, Controller*> inflights;
+  {
+    std::lock_guard<std::mutex> lock(inflight_mutex_);
+    inflights.swap(inflights_);
+  }
+
+  for (const auto& [_, cntl] : inflights) {
+    cntl->NotifyResponseError(status);
+  }
 }
 
 }  // namespace infiniband

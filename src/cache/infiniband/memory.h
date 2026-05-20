@@ -23,13 +23,17 @@
 #ifndef DINGOFS_SRC_CACHE_INFINIBAND_MEMORY_H_
 #define DINGOFS_SRC_CACHE_INFINIBAND_MEMORY_H_
 
+#include <bits/types/struct_iovec.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <ostream>
+#include <string>
 #include <vector>
 
 #include "cache/infiniband/infiniband.h"
+#include "cache/infiniband/rdma_memory.h"
 #include "common/memory_pool.h"
 
 namespace dingofs {
@@ -45,22 +49,55 @@ struct Buffer {
   uint32_t length{0};
   uint32_t lkey{0};
   uint32_t rkey{0};
-  int index{0};
+  // io_uring fixed-buffer indexes for this region after the buffer's owning
+  // pool is also registered with io_uring (via RDMAFixedBufferRegistry +
+  // IOUring). -1 means "not registered with io_uring" — io_uring callers
+  // fall back to non-fixed prep_{read,write}.
+  int io_uring_read_buf_index{-1};
+  int io_uring_write_buf_index{-1};
+};
+
+// EndPoint describing where to register memory (device + port). Kept here
+// (rather than connection.h) so RDMAMemoryPool can take it without a
+// circular include.
+struct PoolEndPoint {
+  std::string device_name;
+  uint8_t port_num{1};
 };
 
 class RDMAMemoryPool {
  public:
-  RDMAMemoryPool(ibv_mr* mr, MemoryPoolUPtr pool, std::vector<Buffer> buffers);
+  RDMAMemoryPool(RDMARegionUPtr region, MemoryPoolUPtr pool,
+                 std::vector<Buffer> buffers);
   ~RDMAMemoryPool();
+
+  // Connection-bound use (caller already owns the PD, e.g. via a QP).
   static RDMAMemoryPoolUPtr Create(ProtectDomain* protect_domain,
+                                   size_t buffer_size, size_t buffer_count);
+
+  // Free-standing use (server attachment pool, client global pool). Opens
+  // (or reuses) the device's cached PD via GetOrAllocPD.
+  static RDMAMemoryPoolUPtr Create(const PoolEndPoint& endpoint,
                                    size_t buffer_size, size_t buffer_count);
 
   // Returns nullptr if the pool is exhausted.
   Buffer* Require();
   void Release(Buffer* buffer);
+  size_t IndexOf(Buffer* buffer) const;
+
+  // Iovec view of the underlying contiguous registered region, one entry
+  // per buffer. Used by IOUring to register the same memory for fixed-buffer
+  // io_uring ops, so a single buffer can simultaneously back an RDMA
+  // attachment and an io_uring_prep_{read,write}_fixed.
+  std::vector<iovec> Fetch() const;
+
+  // After this pool's iovecs have been registered with io_uring, assign each
+  // Buffer's read/write-local fixed-buffer index. Idempotent if called more
+  // than once with the same offsets.
+  void AssignIoUringIndices(int read_index_offset, int write_index_offset);
 
  private:
-  ibv_mr* mr_;
+  RDMARegionUPtr region_;
   MemoryPoolUPtr pool_;
   std::vector<Buffer> buffers_;
 };

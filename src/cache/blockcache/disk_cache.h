@@ -24,6 +24,7 @@
 #define DINGOFS_SRC_CACHE_BLOCKCACHE_DISK_CACHE_H_
 
 #include <atomic>
+#include <cstddef>
 #include <memory>
 
 #include "cache/blockcache/cache_store.h"
@@ -124,7 +125,7 @@ class DiskCache final : public CacheStore {
   Status Cache(BlockHandle handle, IOBuffer block,
                CacheOption option = {}) override;
   Status Load(BlockHandle handle, off_t offset, size_t length, IOBuffer* buffer,
-              LoadOption option = {}) override;
+              LoadOption option = LoadOption()) override;
 
   std::string Id() const override { return uuid_; }
 
@@ -157,6 +158,11 @@ class DiskCache final : public CacheStore {
 
   // check running status, disk free space
   Status CheckStatus(uint8_t want) const;
+  Status WriteBlockFile(const std::string& path, const IOBuffer& block,
+                        bool source_buffer_prepared,
+                        const char* source_buffer,
+                        size_t source_buffer_capacity,
+                        int source_buffer_index);
   bool StillLoading() const { return loader_->StillLoading(); }
   bool StageFull() const { return manager_->StageFull(); }
   bool CacheFull() const { return manager_->CacheFull(); }

@@ -23,19 +23,15 @@
 #ifndef DINGOFS_SRC_CACHE_INFINIBAND_MESSENGER_H_
 #define DINGOFS_SRC_CACHE_INFINIBAND_MESSENGER_H_
 
-#include <butil/iobuf.h>
 #include <google/protobuf/message.h>
 #include <google/protobuf/service.h>
 
-#include <cstdint>
-#include <functional>
+#include <cstddef>
 #include <memory>
-#include <type_traits>
+#include <string>
 #include <unordered_map>
-#include <utility>
 
 #include "cache/infiniband/controller.h"
-#include "cache/infiniband/memory.h"
 #include "common/status.h"
 #include "dingofs/infiniband.pb.h"
 
@@ -43,80 +39,42 @@ namespace dingofs {
 namespace cache {
 namespace infiniband {
 
+// brpc-style service dispatcher.
+//
+// Users derive from a protobuf-generated Service (e.g.
+// pb::cache::BlockCacheService) and register it via Server::AddService(),
+// which forwards to Messenger::AddService. Dispatch looks up the target
+// service by name in the request metadata, then calls Service::CallMethod —
+// the same machinery brpc uses.
+//
+// Request/response protobuf objects are allocated on Controller::arena so
+// the dispatch path has zero per-request operator new/delete.
 class Messenger {
  public:
   Messenger() = default;
 
-  // 类型安全的注册接口，Req/Resp 从 lambda 签名自动推导，无需显式模板参数。
-  // 在 proto 里给 Request.body 和 Response.body oneof
-  // 各加一个分支后，业务侧直接：
-  //   messenger.RegisterHandler(
-  //       [](Controller* cntl,
-  //          const pb::cache::PutRequest* req,
-  //          pb::cache::PutResponse* resp,
-  //          google::protobuf::Closure* done) { ... });
-  // 即可，messenger.h 不用改。
-  //
-  // 实现说明：通过 DeduceHandlerArgs 从 lambda::operator() 的成员指针类型
-  // 反推 Req、Resp；真正的 descriptor 查找、注册逻辑在 messenger.cpp 的
-  // DoRegister。
-  template <typename F>
-  void RegisterHandler(F&& handler) {
-    using Args = decltype(DeduceHandlerArgs(&std::decay_t<F>::operator()));
-    using Req = typename Args::first_type;
-    using Resp = typename Args::second_type;
+  // Register a Service. Multiple services with distinct full names are
+  // allowed. Caller retains ownership of `service`.
+  Status AddService(::google::protobuf::Service* service);
 
-    static_assert(std::is_base_of_v<google::protobuf::Message, Req>,
-                  "Req must be a protobuf Message type");
-    static_assert(std::is_base_of_v<google::protobuf::Message, Resp>,
-                  "Resp must be a protobuf Message type");
-
-    DoRegister(
-        Req::descriptor(), Resp::descriptor(),
-        [h = std::forward<F>(handler)](
-            Controller* cntl, const google::protobuf::Message* req,
-            google::protobuf::Message* resp, google::protobuf::Closure* done) {
-          h(cntl, static_cast<const Req*>(req), static_cast<Resp*>(resp), done);
-        });
-  }
-
-  // Connection 完成 buffer 解析、构造好 Controller / Response / Closure 后调。
-  // - cntl:     调用方分配，已填好 request_attachment
-  // - response: 调用方分配的空 Response，handler 内填充
-  // - done:     handler 处理完后调用 done->Run() 触发 send-back
+  // Called by ServerSession after parsing the wire frame:
+  // - cntl:      transport state (request_memory_context already filled)
+  // - meta:      parsed RequestMeta (carries service_name, method_name)
+  // - data:      pointer into the recv buffer for the request body
+  // - data_len:  bytes available at `data`
+  // - resp_meta: output, populated with error_code/message on failure
+  // - resp_body: output, set to the response Message* on success (lives on
+  //              cntl->Arena(); nullptr if the call failed before invocation)
+  // - done:      invoked after the service method's Closure fires
   Status Dispatch(Controller* cntl,
-                  const pb::infiniband::InfinibandRequest& request,
-                  pb::infiniband::InfinibandResponse* response,
-                  google::protobuf::Closure* done);
+                  const pb::infiniband::RequestMeta& meta, const char* data,
+                  size_t data_len, pb::infiniband::ResponseMeta* resp_meta,
+                  ::google::protobuf::Message** resp_body,
+                  ::google::protobuf::Closure* done);
 
  private:
-  // 仅用于在 RegisterHandler 里从 lambda 的 operator() 反推 (Req, Resp)。
-  // const / 非 const 两个版本分别匹配普通 lambda 和 mutable lambda。
-  // 仅声明、不需要定义 —— 用在 decltype 上下文里推导返回类型。
-  template <typename C, typename Req, typename Resp>
-  static auto DeduceHandlerArgs(void (C::*)(Controller*, const Req*, Resp*,
-                                            google::protobuf::Closure*) const)
-      -> std::pair<Req, Resp>;
-  template <typename C, typename Req, typename Resp>
-  static auto DeduceHandlerArgs(void (C::*)(Controller*, const Req*, Resp*,
-                                            google::protobuf::Closure*))
-      -> std::pair<Req, Resp>;
-
-  using ErasedHandler = std::function<void(
-      Controller*, const google::protobuf::Message*, google::protobuf::Message*,
-      google::protobuf::Closure*)>;
-
-  // 非模板，定义在 messenger.cpp。所有 protobuf reflection 相关的逻辑都在这里。
-  void DoRegister(const google::protobuf::Descriptor* req_type_desc,
-                  const google::protobuf::Descriptor* resp_type_desc,
-                  ErasedHandler handler);
-
-  using DispatchEntry = std::function<void(
-      Controller*, const pb::infiniband::InfinibandRequest&,
-      pb::infiniband::InfinibandResponse*, google::protobuf::Closure*)>;
-
-  std::unordered_map<pb::infiniband::InfinibandRequest::BodyCase, DispatchEntry>
-      handlers_;
+  // Keyed by service->GetDescriptor()->full_name().
+  std::unordered_map<std::string, ::google::protobuf::Service*> services_;
 };
 
 using MessengerUPtr = std::unique_ptr<Messenger>;

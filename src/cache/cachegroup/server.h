@@ -28,6 +28,9 @@
 #include <csignal>
 
 #include "cache/cachegroup/node.h"
+#include "cache/cachegroup/rdma_service.h"
+#include "cache/infiniband/memory.h"
+#include "cache/infiniband/server.h"
 #include "dingofs/blockcache.pb.h"
 #include "utils/logclean_manager.h"
 
@@ -43,12 +46,15 @@ class Server {
  private:
   void InstallSignal();
   Status StartRpcServer(const std::string& listen_ip, uint32_t listen_port);
+  Status StartRDMAServer();
 
   std::atomic<bool> running_;
   CacheNodeSPtr node_;
   std::unique_ptr<pb::cache::BlockCacheService> service_;
 
-  // std::unique_ptr<infiniband::Server> rdma_server_;
+  std::unique_ptr<infiniband::Server> rdma_server_;
+  infiniband::RDMAMemoryPoolUPtr rdma_attachment_pool_;
+  std::unique_ptr<RDMABlockCacheServiceImpl> rdma_service_;
 
   std::unique_ptr<brpc::Server> server_;
   std::unique_ptr<utils::LogCleanManager> log_clean_manager_;

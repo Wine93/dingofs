@@ -23,9 +23,10 @@
 #ifndef DINGOFS_SRC_CACHE_INFINIBAND_SERVER_SESSION_H_
 #define DINGOFS_SRC_CACHE_INFINIBAND_SERVER_SESSION_H_
 
-#include <bthread/countdown_event.h>
 #include <bthread/execution_queue.h>
 #include <google/protobuf/service.h>
+
+#include <memory>
 
 #include "cache/infiniband/connection.h"
 #include "cache/infiniband/controller.h"
@@ -46,6 +47,7 @@ class ServerSession : public EventHandler {
 
   void HandleEvent() override;
   Status OnEstablished();
+  int Fd() const { return conn_->GetFd(); }
 
  private:
   static int HandleWorkCompletion(void* meta,
@@ -54,17 +56,22 @@ class ServerSession : public EventHandler {
   void OnError(const WorkCompletion& wc);
 
   void OnRequestReceived(const WorkCompletion& wc);
+  // Parse the recv frame, dispatch to the registered Service, and on
+  // completion serialize the response into a send frame.
   Status ProcessRequest(Controller* cntl,
-                        pb::infiniband::InfinibandResponse* ib_response);
+                        pb::infiniband::ResponseMeta* resp_meta,
+                        ::google::protobuf::Message** resp_body);
   Status SendResponse(Controller* cntl,
-                      pb::infiniband::InfinibandResponse* ib_response);
+                      pb::infiniband::ResponseMeta* resp_meta,
+                      const ::google::protobuf::Message* resp_body);
   void OnResponseSent(const WorkCompletion& wc);
 
   Messenger* messenger_;
   ConnectionUPtr conn_;
-  std::vector<WorkRequestId> ids_;
   bthread::ExecutionQueueId<WorkCompletions> handle_wc_queue_id_;
 };
+
+using ServerSessionUPtr = std::unique_ptr<ServerSession>;
 
 }  // namespace infiniband
 }  // namespace cache

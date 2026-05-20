@@ -99,7 +99,7 @@ class DiskCacheGroup final : public CacheStore {
   Status Cache(BlockHandle handle, IOBuffer block,
                CacheOption option = {}) override;
   Status Load(BlockHandle handle, off_t offset, size_t length, IOBuffer* buffer,
-              LoadOption option = {}) override;
+              LoadOption option = LoadOption()) override;
 
   std::string Id() const override;
   bool IsRunning() const override;

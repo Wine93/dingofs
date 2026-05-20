@@ -26,6 +26,7 @@
 #include <fmt/format.h>
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 
 #include "cache/blockcache/disk_cache_manager.h"
@@ -38,6 +39,16 @@
 
 namespace dingofs {
 namespace cache {
+namespace {
+
+constexpr size_t kDirectIOAlignment = 4096;
+
+bool IsAlignedForDirectIO(const void* data, size_t length) {
+  return reinterpret_cast<uintptr_t>(data) % kDirectIOAlignment == 0 &&
+         length % kDirectIOAlignment == 0;
+}
+
+}  // namespace
 
 DEFINE_string(cache_dir, GetDefaultDir(kCacheDir),
               "directory to store blocks, mutiple paths are separated by "
@@ -198,7 +209,10 @@ Status DiskCache::Stage(BlockHandle handle, IOBuffer block,
 
   std::string stage_path(GetStagePath(handle));
   std::string cache_path(GetCachePath(handle));
-  status = localfs_->WriteFile(stage_path, &block);
+  status = WriteBlockFile(stage_path, block, option.source_buffer_prepared,
+                          option.source_buffer,
+                          option.source_buffer_capacity,
+                          option.source_buffer_index);
   if (!status.ok()) {
     LOG(ERROR) << "Fail to write stage file, path=" << stage_path
                << ", length=" << length << ", status=" << status.ToString();
@@ -241,7 +255,7 @@ Status DiskCache::RemoveStage(BlockHandle handle,
 }
 
 Status DiskCache::Cache(BlockHandle handle, IOBuffer block,
-                        CacheOption /*option*/) {
+                        CacheOption option) {
   size_t length = block.Size();
   auto status = CheckStatus(kWantExec | kWantCache);
   if (!status.ok()) {
@@ -258,7 +272,10 @@ Status DiskCache::Cache(BlockHandle handle, IOBuffer block,
   }
 
   auto cache_path = GetCachePath(handle);
-  status = localfs_->WriteFile(cache_path, &block);
+  status = WriteBlockFile(cache_path, block, option.source_buffer_prepared,
+                          option.source_buffer,
+                          option.source_buffer_capacity,
+                          option.source_buffer_index);
   if (!status.ok()) {
     LOG(ERROR) << "Fail to write cache file=`" << cache_path << "'";
     return status;
@@ -270,8 +287,33 @@ Status DiskCache::Cache(BlockHandle handle, IOBuffer block,
   return status;
 }
 
+Status DiskCache::WriteBlockFile(const std::string& path,
+                                 const IOBuffer& block,
+                                 bool source_buffer_prepared,
+                                 const char* source_buffer,
+                                 size_t source_buffer_capacity,
+                                 int source_buffer_index) {
+  const size_t length = block.Size();
+  if (!source_buffer_prepared) {
+    return localfs_->WriteFile(path, &block);
+  }
+
+  if (source_buffer == nullptr || source_buffer_capacity < length) {
+    return Status::InvalidParam("invalid prepared write buffer");
+  }
+
+  if (!IsAlignedForDirectIO(source_buffer, length)) {
+    VLOG(9) << "Prepared write buffer is not O_DIRECT aligned, fallback copy: "
+            << "path=" << path << ", data="
+            << static_cast<const void*>(source_buffer) << ", length=" << length;
+    return localfs_->WriteFile(path, &block);
+  }
+
+  return localfs_->WriteFile(path, source_buffer, length, source_buffer_index);
+}
+
 Status DiskCache::Load(BlockHandle handle, off_t offset, size_t length,
-                       IOBuffer* buffer, LoadOption /*option*/) {
+                       IOBuffer* buffer, LoadOption option) {
   Status status;
   DiskCacheVarsRecordGuard guard(__func__, status, vars_.get());
 
@@ -289,7 +331,22 @@ Status DiskCache::Load(BlockHandle handle, off_t offset, size_t length,
   }
 
   auto cache_path = GetCachePath(handle);
-  status = localfs_->ReadFile(cache_path, offset, length, buffer);
+  if (option.buffer_prepared) {
+    if (option.prepared_buffer == nullptr ||
+        option.prepared_buffer_capacity < length) {
+      status = Status::InvalidParam("invalid prepared load buffer");
+      return status;
+    }
+    status = localfs_->ReadFile(cache_path, offset, length,
+                                option.prepared_buffer,
+                                option.prepared_buffer_capacity,
+                                option.prepared_buffer_index);
+    if (status.ok()) {
+      buffer->AppendUserData(option.prepared_buffer, length, [](void*) {});
+    }
+  } else {
+    status = localfs_->ReadFile(cache_path, offset, length, buffer);
+  }
   if (status.IsNotFound()) {  // Delete block which meybe deleted by accident.
     LOG(WARNING) << "Cache block file not found, delete the corresponding "
                     "key from lru, path=`"

@@ -175,34 +175,36 @@ Status CacheNode::LeaveGroup() {
   return Status::OK();
 }
 
-Status CacheNode::Put(BlockHandle handle, IOBuffer block) {
+Status CacheNode::Put(BlockHandle handle, IOBuffer block, PutOption option) {
   if (!IsRunning()) {
     return Status::CacheDown("cache node is down");
   }
-  return block_cache_->Put(std::move(handle), std::move(block),
-                           {.writeback = true});
+  option.writeback = true;
+  return block_cache_->Put(std::move(handle), std::move(block), option);
 }
 
 Status CacheNode::Range(BlockHandle handle, off_t offset, size_t length,
                         IOBuffer* buffer, size_t block_length,
-                        bool* cache_hit) {
+                        bool* cache_hit, RangeOption option) {
   *cache_hit = false;
   if (!IsRunning()) {
     return Status::CacheDown("cache node is down");
   }
 
-  auto status = RetrieveCache(handle, offset, length, buffer);
+  auto status = RetrieveCache(handle, offset, length, buffer, option);
   if (status.ok()) {
     *cache_hit = true;
     return status;
   }
-  if (status.IsNotFound() && handle.FsId() != 0) {
-    status = RetrieveStorage(handle, offset, length, buffer, block_length);
+  if (status.IsNotFound() && option.retrieve_storage && handle.FsId() != 0) {
+    status =
+        RetrieveStorage(handle, offset, length, buffer, block_length, option);
   }
   return status;
 }
 
-Status CacheNode::AsyncCache(BlockHandle handle, IOBuffer block) {
+Status CacheNode::AsyncCache(BlockHandle handle, IOBuffer block,
+                             CacheOption option) {
   if (!IsRunning()) {
     LOG(ERROR) << "Cache node is down, skip async cache block, key="
                << handle.Filename();
@@ -216,7 +218,8 @@ Status CacheNode::AsyncCache(BlockHandle handle, IOBuffer block) {
                                              "status="
                                           << status.ToString();
                              }
-                           });
+                           },
+                           option);
   return Status::OK();
 }
 
@@ -235,9 +238,10 @@ Status CacheNode::AsyncPrefetch(BlockHandle handle, size_t length) {
 }
 
 Status CacheNode::RetrieveCache(const BlockHandle& handle, off_t offset,
-                                size_t length, IOBuffer* buffer) {
-  auto status = block_cache_->Range(handle, offset, length, buffer,
-                                    {.retrieve_storage = false});
+                                size_t length, IOBuffer* buffer,
+                                RangeOption option) {
+  option.retrieve_storage = false;
+  auto status = block_cache_->Range(handle, offset, length, buffer, option);
   if (status.ok()) {
     num_hit_cache_ << 1;
   } else {
@@ -248,7 +252,7 @@ Status CacheNode::RetrieveCache(const BlockHandle& handle, off_t offset,
 
 Status CacheNode::RetrieveStorage(const BlockHandle& handle, off_t offset,
                                   size_t length, IOBuffer* buffer,
-                                  size_t block_length) {
+                                  size_t block_length, RangeOption option) {
   StorageClient* storage_client;
   auto status =
       storage_client_pool_->GetStorageClient(handle.FsId(), &storage_client);
@@ -258,14 +262,19 @@ Status CacheNode::RetrieveStorage(const BlockHandle& handle, off_t offset,
 
   // Retrieve range of block: unknown block size or unreach max_range_size
   if (block_length == 0 || length < FLAGS_max_range_size_kb * kKiB) {
-    return RetrievePartBlock(handle, offset, length, buffer, block_length);
+    return RetrievePartBlock(handle, offset, length, buffer, block_length,
+                             option);
   }
 
   // Retrieve the whole block
   IOBuffer block;
   status = RetrieveWholeBlock(handle, block_length, &block);
   if (status.ok()) {
-    block.AppendTo(buffer, length, offset);
+    if (option.buffer_prepared) {
+      status = FillPreparedBuffer(block, offset, length, buffer, option);
+    } else {
+      block.AppendTo(buffer, length, offset);
+    }
   }
   return status;
 }
@@ -273,7 +282,7 @@ Status CacheNode::RetrieveStorage(const BlockHandle& handle, off_t offset,
 // TODO: Should we check download block task?
 Status CacheNode::RetrievePartBlock(const BlockHandle& handle, off_t offset,
                                     size_t length, IOBuffer* buffer,
-                                    size_t block_length) {
+                                    size_t block_length, RangeOption option) {
   StorageClient* storage_client;
   auto status =
       storage_client_pool_->GetStorageClient(handle.FsId(), &storage_client);
@@ -281,11 +290,32 @@ Status CacheNode::RetrievePartBlock(const BlockHandle& handle, off_t offset,
     return status;
   }
 
-  status = storage_client->Range(handle, offset, length, buffer);
+  if (option.buffer_prepared) {
+    IOBuffer tmp;
+    status = storage_client->Range(handle, offset, length, &tmp);
+    if (status.ok()) {
+      status = FillPreparedBuffer(tmp, 0, length, buffer, option);
+    }
+  } else {
+    status = storage_client->Range(handle, offset, length, buffer);
+  }
   if (status.ok() && block_length > 0) {
     block_cache_->AsyncPrefetch(handle, block_length, nullptr);
   }
   return status;
+}
+
+Status CacheNode::FillPreparedBuffer(const IOBuffer& src, off_t offset,
+                                     size_t length, IOBuffer* dst,
+                                     const RangeOption& option) {
+  if (!option.buffer_prepared || option.prepared_buffer == nullptr ||
+      length > option.prepared_buffer_capacity) {
+    return Status::InvalidParam("invalid prepared range buffer");
+  }
+
+  src.CopyTo(option.prepared_buffer, length, offset);
+  dst->AppendUserData(option.prepared_buffer, length, [](void*) {});
+  return Status::OK();
 }
 
 Status CacheNode::RetrieveWholeBlock(const BlockHandle& handle,

@@ -37,8 +37,10 @@
 #include <string>
 
 #include "cache/common/error.h"
+#include "cache/common/use_rdma_flag.h"
 #include "cache/remotecache/peer_connection.h"
 #include "cache/remotecache/peer_health_checker.h"
+#include "cache/remotecache/rdma_peer.h"
 #include "cache/remotecache/request.h"
 #include "common/io_buffer.h"
 #include "common/options/cache.h"
@@ -62,7 +64,9 @@ class Peer {
   std::string IP() const { return ip_; }
   uint32_t Port() const { return port_; }
   uint32_t Weight() const { return weight_; }
-  bool IsHealthy() { return health_checker_->IsHealthy(); }
+  bool IsHealthy() {
+    return rdma_ ? rdma_->IsHealthy() : health_checker_->IsHealthy();
+  }
   bool Dump(Json::Value& value) const;
 
  private:
@@ -85,6 +89,11 @@ class Peer {
   std::atomic<int> next_conn_index_{0};
   std::vector<PeerConnectionUPtr> connections_;
   PeerHealthCheckerUPtr health_checker_;
+
+  // RDMA transport. Non-null iff FLAGS_use_rdma was true at peer-construction
+  // time. When set, all Send*/health/identity methods delegate to it and the
+  // brpc connections_ / health_checker_ above stay empty.
+  RDMAPeerUPtr rdma_;
 };
 
 using PeerSPtr = std::shared_ptr<Peer>;
@@ -93,6 +102,10 @@ std::ostream& operator<<(std::ostream& os, const Peer& peer);
 
 template <typename T, typename U>
 Response<U> Peer::SendRequest(const Request<T>& request) {
+  if (rdma_) {
+    return rdma_->template SendRequest<T, U>(request);
+  }
+
   const auto* method =
       pb::cache::BlockCacheService::descriptor()->FindMethodByName(
           request.method);

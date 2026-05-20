@@ -67,12 +67,13 @@ DEFINE_validator(cache_rpc_max_timeout_ms, brpc::PassValidate);
 
 Peer::Peer(const std::string& id, const std::string& ip, uint32_t port,
            uint32_t weight)
-    : running_(false),
-      id_(id),
-      ip_(ip),
-      port_(port),
-      weight_(weight),
-      health_checker_(std::make_unique<PeerHealthChecker>(ip, port)) {
+    : running_(false), id_(id), ip_(ip), port_(port), weight_(weight) {
+  if (FLAGS_use_rdma) {
+    rdma_ = std::make_unique<RDMAPeer>(id, ip, port, weight);
+    return;
+  }
+
+  health_checker_ = std::make_unique<PeerHealthChecker>(ip, port);
   for (int i = 0; i < FLAGS_connections; ++i) {
     connections_.emplace_back(PeerConnection::New());
   }
@@ -81,6 +82,15 @@ Peer::Peer(const std::string& id, const std::string& ip, uint32_t port,
 Status Peer::Start() {
   if (running_.load(std::memory_order_relaxed)) {
     LOG(WARNING) << "Peer already started";
+    return Status::OK();
+  }
+
+  if (rdma_) {
+    auto status = rdma_->Start();
+    if (!status.ok()) {
+      return status;
+    }
+    running_.store(true, std::memory_order_relaxed);
     return Status::OK();
   }
 
@@ -107,6 +117,12 @@ Status Peer::Start() {
 }
 
 void Peer::Shutdown() {
+  if (rdma_) {
+    rdma_->Shutdown();
+    running_.store(false, std::memory_order_relaxed);
+    return;
+  }
+
   for (int i = 0; i < FLAGS_connections; ++i) {
     connections_[i]->Close();
   }
@@ -143,8 +159,14 @@ bool Peer::Dump(Json::Value& value) const {
   value["id"] = Id();
   value["endpoint"] = fmt::format("{}:{}", IP(), Port());
   value["weight"] = Weight();
-  value["connections"] = static_cast<int>(FLAGS_connections);
-  value["healthy"] = health_checker_->IsHealthy();
+  if (rdma_) {
+    value["transport"] = "rdma";
+    value["healthy"] = const_cast<RDMAPeer*>(rdma_.get())->IsHealthy();
+  } else {
+    value["transport"] = "brpc";
+    value["connections"] = static_cast<int>(FLAGS_connections);
+    value["healthy"] = health_checker_->IsHealthy();
+  }
   return true;
 }
 

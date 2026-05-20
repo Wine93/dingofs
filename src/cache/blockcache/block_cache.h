@@ -37,17 +37,50 @@ namespace dingofs {
 namespace cache {
 
 struct PutOption {
-  bool writeback{false};
-  BlockAttr block_attr{BlockAttr::kFromUnknown};
+  PutOption()
+      : writeback(false),
+        block_attr(BlockAttr::kFromUnknown),
+        source_buffer_prepared(false),
+        source_buffer(nullptr),
+        source_buffer_capacity(0),
+        source_buffer_index(-1) {}
+
+  bool writeback;
+  BlockAttr block_attr;
+  bool source_buffer_prepared;
+  const char* source_buffer;
+  size_t source_buffer_capacity;
+  int source_buffer_index;
 };
 
 struct RangeOption {
   bool retrieve_storage{true};
   size_t block_whole_length{0};
   bool is_subrequest{false};
+
+  // If true, the caller has pre-attached a contiguous destination buffer to
+  // the IOBuffer* (via IOBuffer::AppendUserData). Implementations read into
+  // that storage directly instead of allocating a fresh one — the RDMA
+  // service uses this to deliver disk reads straight into RDMA-registered
+  // memory. Default false: implementation owns the buffer allocation.
+  bool buffer_prepared{false};
+  char* prepared_buffer{nullptr};
+  size_t prepared_buffer_capacity{0};
+  int prepared_buffer_index{-1};
 };
 
-struct CacheOption {};
+struct CacheOption {
+  CacheOption()
+      : source_buffer_prepared(false),
+        source_buffer(nullptr),
+        source_buffer_capacity(0),
+        source_buffer_index(-1) {}
+
+  bool source_buffer_prepared;
+  const char* source_buffer;
+  size_t source_buffer_capacity;
+  int source_buffer_index;
+};
 struct PrefetchOption {};
 
 // async callback

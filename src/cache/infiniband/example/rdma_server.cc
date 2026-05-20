@@ -6,51 +6,230 @@
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
  */
 
+#include <brpc/closure_guard.h>
 #include <brpc/server.h>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
-#include <google/protobuf/service.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <string>
 
 #include "cache/infiniband/controller.h"
 #include "cache/infiniband/memory.h"
 #include "cache/infiniband/server.h"
-#include "dingofs/infiniband.pb.h"
+#include "dingofs/blockcache.pb.h"
 
 DEFINE_string(device, "mlx5_0", "IB device name (e.g. mlx5_0)");
 DEFINE_int32(port_num, 1, "IB HCA port, 1-based");
 DEFINE_int32(brpc_port, 8888,
              "TCP port for the connection-management brpc service");
+DEFINE_int32(attachment_pool_size, 256,
+             "Number of attachment buffers; must be >= max concurrent RPCs");
+DEFINE_int32(attachment_buffer_size, 4194304, "Attachment buffer size in bytes");
+DEFINE_string(server_verify, "full",
+              "Server-side verification mode for Put/Cache: full|markers|none");
+DEFINE_bool(server_fill_response, true,
+            "Fill Range response buffers before RDMA_WRITE");
+
+namespace {
+
+using ::dingofs::cache::infiniband::Controller;
+using ::dingofs::cache::infiniband::RDMAMemoryPool;
+
+enum class VerifyMode {
+  kFull,
+  kMarkers,
+  kNone,
+};
+
+VerifyMode ParseVerifyMode(const std::string& value) {
+  if (value == "full") return VerifyMode::kFull;
+  if (value == "markers") return VerifyMode::kMarkers;
+  if (value == "none") return VerifyMode::kNone;
+  LOG(FATAL) << "Unsupported --server_verify=" << value;
+  return VerifyMode::kFull;
+}
+
+uint64_t SeedFromHandle(const ::dingofs::pb::cache::BlockHandle& handle) {
+  if (handle.has_block_key()) {
+    return handle.block_key().id();
+  }
+  if (handle.has_tensor_key()) {
+    return std::hash<std::string>{}(handle.tensor_key().chunk_hash());
+  }
+  return 0;
+}
+
+void FillPattern(char* data, size_t size, uint64_t seed) {
+  const uint64_t pattern = seed;
+  size_t pos = 0;
+  while (pos + sizeof(pattern) <= size) {
+    std::memcpy(data + pos, &pattern, sizeof(pattern));
+    pos += sizeof(pattern);
+  }
+  if (pos < size) {
+    std::memcpy(data + pos, &pattern, size - pos);
+  }
+}
+
+bool CheckByte(const char* data, size_t pos, uint64_t seed) {
+  char pattern[sizeof(seed)];
+  std::memcpy(pattern, &seed, sizeof(seed));
+  return data[pos] == pattern[pos % sizeof(seed)];
+}
+
+bool VerifyPattern(const char* data, size_t size, uint64_t seed,
+                   VerifyMode mode) {
+  if (mode == VerifyMode::kNone || size == 0) {
+    return true;
+  }
+
+  if (mode == VerifyMode::kMarkers) {
+    return CheckByte(data, 0, seed) && CheckByte(data, size / 2, seed) &&
+           CheckByte(data, size - 1, seed);
+  }
+
+  const uint64_t pattern = seed;
+  size_t pos = 0;
+  while (pos + sizeof(pattern) <= size) {
+    uint64_t actual = 0;
+    std::memcpy(&actual, data + pos, sizeof(actual));
+    if (actual != pattern) {
+      return false;
+    }
+    pos += sizeof(pattern);
+  }
+  if (pos < size) {
+    char expected[sizeof(pattern)];
+    std::memcpy(expected, &pattern, sizeof(pattern));
+    return std::memcmp(data + pos, expected, size - pos) == 0;
+  }
+  return true;
+}
+
+class BlockCacheServiceImpl final
+    : public ::dingofs::pb::cache::BlockCacheService {
+ public:
+  BlockCacheServiceImpl(RDMAMemoryPool* pool, VerifyMode verify_mode,
+                        bool fill_response)
+      : pool_(pool), verify_mode_(verify_mode), fill_response_(fill_response) {}
+
+  void Ping(::google::protobuf::RpcController* /*controller*/,
+            const ::dingofs::pb::cache::PingRequest* /*request*/,
+            ::dingofs::pb::cache::PingResponse* /*response*/,
+            ::google::protobuf::Closure* done) override {
+    brpc::ClosureGuard done_guard(done);
+  }
+
+  void Put(::google::protobuf::RpcController* controller,
+           const ::dingofs::pb::cache::PutRequest* request,
+           ::dingofs::pb::cache::PutResponse* response,
+           ::google::protobuf::Closure* done) override {
+    brpc::ClosureGuard done_guard(done);
+    auto* cntl = static_cast<Controller*>(controller);
+
+    auto* buf = pool_->Require();
+    if (buf == nullptr) {
+      response->set_status(::dingofs::pb::cache::BlockCacheErrFailure);
+      return;
+    }
+    cntl->SetOnDestroy([this, buf]() { pool_->Release(buf); });
+
+    if (request->block_size() > buf->capacity) {
+      response->set_status(::dingofs::pb::cache::BlockCacheErrInvalidParam);
+      return;
+    }
+
+    auto status = cntl->ReadRequestAttachment(buf, request->block_size());
+    if (!status.ok()) {
+      response->set_status(::dingofs::pb::cache::BlockCacheErrFailure);
+      return;
+    }
+
+    const uint64_t seed = SeedFromHandle(request->handle());
+    response->set_status(
+        VerifyPattern(buf->data, request->block_size(), seed, verify_mode_)
+            ? ::dingofs::pb::cache::BlockCacheOk
+            : ::dingofs::pb::cache::BlockCacheErrInvalidParam);
+  }
+
+  void Cache(::google::protobuf::RpcController* controller,
+             const ::dingofs::pb::cache::CacheRequest* request,
+             ::dingofs::pb::cache::CacheResponse* response,
+             ::google::protobuf::Closure* done) override {
+    brpc::ClosureGuard done_guard(done);
+    auto* cntl = static_cast<Controller*>(controller);
+
+    auto* buf = pool_->Require();
+    if (buf == nullptr) {
+      response->set_status(::dingofs::pb::cache::BlockCacheErrFailure);
+      return;
+    }
+    cntl->SetOnDestroy([this, buf]() { pool_->Release(buf); });
+
+    if (request->block_size() > buf->capacity) {
+      response->set_status(::dingofs::pb::cache::BlockCacheErrInvalidParam);
+      return;
+    }
+
+    auto status = cntl->ReadRequestAttachment(buf, request->block_size());
+    if (!status.ok()) {
+      response->set_status(::dingofs::pb::cache::BlockCacheErrFailure);
+      return;
+    }
+
+    const uint64_t seed = SeedFromHandle(request->handle());
+    response->set_status(
+        VerifyPattern(buf->data, request->block_size(), seed, verify_mode_)
+            ? ::dingofs::pb::cache::BlockCacheOk
+            : ::dingofs::pb::cache::BlockCacheErrInvalidParam);
+  }
+
+  void Range(::google::protobuf::RpcController* controller,
+             const ::dingofs::pb::cache::RangeRequest* request,
+             ::dingofs::pb::cache::RangeResponse* response,
+             ::google::protobuf::Closure* done) override {
+    brpc::ClosureGuard done_guard(done);
+    auto* cntl = static_cast<Controller*>(controller);
+
+    auto* buf = pool_->Require();
+    if (buf == nullptr) {
+      response->set_status(::dingofs::pb::cache::BlockCacheErrFailure);
+      return;
+    }
+    cntl->SetOnDestroy([this, buf]() { pool_->Release(buf); });
+
+    if (request->length() > buf->capacity) {
+      response->set_status(::dingofs::pb::cache::BlockCacheErrInvalidParam);
+      return;
+    }
+
+    if (fill_response_) {
+      FillPattern(buf->data, request->length(), request->offset());
+    }
+    buf->length = static_cast<uint32_t>(request->length());
+    cntl->SetResponseAttachment(buf);
+
+    response->set_status(::dingofs::pb::cache::BlockCacheOk);
+    response->set_cache_hit(true);
+  }
+
+ private:
+  RDMAMemoryPool* pool_;
+  VerifyMode verify_mode_;
+  bool fill_response_;
+};
+
+}  // namespace
 
 int main(int argc, char** argv) {
-  // Perf-friendly logging defaults:
-  // - INFO -> buffered log file under FLAGS_log_dir (default /tmp),
-  //   flushed every FLAGS_logbufsecs. No syscall per LOG on hot paths.
-  // - WARNING+ -> file (immediate) AND stderr (so failures are visible live).
-  // Override on the command line as needed, e.g.:
-  //   --logtostderr=true   force everything back to stderr (debugging)
-  //   --log_dir=...        change log directory
-  //   --logbufsecs=N       change flush cadence (default 1s)
-  //   --v=N                enable VLOG(<=N) lines
-  // FLAGS_logtostderr = false;
-  // FLAGS_alsologtostderr = false;
-  // FLAGS_stderrthreshold = google::WARNING;
-  // FLAGS_logbuflevel = google::INFO;
-  // FLAGS_logbufsecs = 1;
-  // FLAGS_max_log_size = 256;
-
   google::ParseCommandLineFlags(&argc, &argv, true);
-  // google::InitGoogleLogging(argv[0]);
 
   using namespace dingofs::cache::infiniband;  // NOLINT
-  namespace pb_ib = dingofs::pb::infiniband;
 
   brpc::Server brpc_server;
   Server rdma_server;
@@ -62,41 +241,25 @@ int main(int argc, char** argv) {
   ServerOptions options;
   options.brpc_server = &brpc_server;
 
-  // Start rdma_server first so the listener's PD is allocated. The PD must
-  // exist before we create any RDMA memory pool that gets advertised via
-  // wr.sgl.lkey on this connection — otherwise WRITE WRs from this side
-  // would fail with LOC_PROT_ERR (lkey doesn't belong to the QP's PD).
   auto status = rdma_server.Start(ep, &options);
   if (!status.ok()) {
     LOG(ERROR) << "Fail to start RDMA server: " << status.ToString();
     return 1;
   }
 
-  // Allocate from the *same* PD that backs server's QPs.
-  auto mem_pool =
-      RDMAMemoryPool::Create(rdma_server.GetProtectDomain(), 4194304, 2);
+  auto mem_pool = RDMAMemoryPool::Create(rdma_server.GetProtectDomain(),
+                                         FLAGS_attachment_buffer_size,
+                                         FLAGS_attachment_pool_size);
   CHECK_NOTNULL(mem_pool);
-  auto* buffer = mem_pool->Require();
-  CHECK_NOTNULL(buffer);
 
-  // Register RangeRequest handler: echo back num + 1. Registered after Start
-  // (PD/listener ready) and before brpc_server.Start (no client can connect
-  // yet), so no handler-less request can slip through.
-  rdma_server.RegisterHandler(
-      [buffer](Controller* cntl, const pb_ib::RangeRequest* req,
-               pb_ib::RangeResponse* resp, google::protobuf::Closure* done) {
-        uint64_t in = req->num();
-        uint64_t out = in + 1;
-        resp->set_num(out);
-        *reinterpret_cast<uint64_t*>(buffer->data) = out;
-        *reinterpret_cast<uint64_t*>(buffer->data + buffer->capacity -
-                                     sizeof(uint64_t)) = out;
-        buffer->length = buffer->capacity;
-
-        cntl->response_attachment = buffer;
-
-        done->Run();
-      });
+  const VerifyMode verify_mode = ParseVerifyMode(FLAGS_server_verify);
+  BlockCacheServiceImpl service(mem_pool.get(), verify_mode,
+                                FLAGS_server_fill_response);
+  status = rdma_server.AddService(&service);
+  if (!status.ok()) {
+    LOG(ERROR) << "Fail to add service: " << status.ToString();
+    return 1;
+  }
 
   brpc::ServerOptions brpc_options;
   if (brpc_server.Start(FLAGS_brpc_port, &brpc_options) != 0) {
@@ -107,7 +270,10 @@ int main(int argc, char** argv) {
   LOG(INFO) << "RDMA server is up: device=" << FLAGS_device
             << " port_num=" << FLAGS_port_num
             << " brpc_port=" << FLAGS_brpc_port
-            << " (waiting for incoming connections...)";
+            << " attachment_buffer_size=" << FLAGS_attachment_buffer_size
+            << " attachment_pool_size=" << FLAGS_attachment_pool_size
+            << " server_verify=" << FLAGS_server_verify
+            << " server_fill_response=" << FLAGS_server_fill_response;
 
   brpc_server.RunUntilAskedToQuit();
   return 0;

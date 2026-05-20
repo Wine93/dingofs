@@ -23,22 +23,17 @@
 #ifndef DINGOFS_SRC_CACHE_INFINIBAND_CONNECTION_H_
 #define DINGOFS_SRC_CACHE_INFINIBAND_CONNECTION_H_
 
-#include <brpc/server.h>
-#include <infiniband/verbs.h>
+#include <gflags/gflags_declare.h>
 
+#include <cstdint>
 #include <functional>
 #include <memory>
-#include <utility>
-#include <variant>
+#include <string>
 #include <vector>
 
-#include "cache/infiniband/controller.h"
-#include "cache/infiniband/event.h"
 #include "cache/infiniband/infiniband.h"
 #include "cache/infiniband/memory.h"
-#include "cache/infiniband/messenger.h"
 #include "common/status.h"
-#include "dingofs/infiniband.pb.h"
 
 namespace dingofs {
 namespace cache {
@@ -58,11 +53,6 @@ enum class OpCode : uint8_t {
   kRecv = 2,
   kRDMAWrite = 3,
   kRDMARead = 4,
-};
-
-struct WorkRequestCtx {
-  OpCode opcode{OpCode::kUnknown};
-  void* ctx{nullptr};
 };
 
 struct SendWorkRequest {

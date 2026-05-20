@@ -29,6 +29,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstring>
 #include <memory>
 #include <string>
 
@@ -37,6 +38,7 @@
 #include "cache/blockcache/disk_cache_layout.h"
 #include "cache/blockcache/disk_health_checker.h"
 #include "cache/common/macro.h"
+#include "cache/infiniband/rdma_memory.h"
 #include "cache/iutil/buffer_pool.h"
 #include "cache/iutil/file_util.h"
 #include "cache/iutil/inflight_tracker.h"
@@ -58,8 +60,6 @@ LocalFileSystem::LocalFileSystem(DiskCacheLayoutSPtr layout)
       read_buffer_pool_(std::make_unique<BufferPool>(4 * kMiB, FLAGS_iodepth,
                                                      kAlignedIOBlockSize)),
       inflight_(FLAGS_iodepth),
-      aio_queue_(std::make_unique<AioQueue>(write_buffer_pool_->Fetch(),
-                                            read_buffer_pool_->Fetch())),
       health_checker_(std::make_unique<DiskHealthChecker>(layout)) {}
 
 Status LocalFileSystem::Start() {
@@ -70,10 +70,30 @@ Status LocalFileSystem::Start() {
 
   LOG(INFO) << "LocalFileSystem is starting...";
 
+  auto fixed_write_buffers = write_buffer_pool_->Fetch();
+  auto fixed_read_buffers = read_buffer_pool_->Fetch();
+  const int rdma_write_index_base = static_cast<int>(fixed_write_buffers.size());
+  const int rdma_read_index_base = static_cast<int>(fixed_read_buffers.size());
+  auto rdma_buffers =
+      infiniband::RDMAFixedBufferRegistry::Instance().CollectIovecs();
+  fixed_write_buffers.insert(fixed_write_buffers.end(), rdma_buffers.begin(),
+                             rdma_buffers.end());
+  fixed_read_buffers.insert(fixed_read_buffers.end(),
+                            rdma_buffers.begin(),
+                            rdma_buffers.end());
+
+  aio_queue_ =
+      std::make_unique<AioQueue>(fixed_write_buffers, fixed_read_buffers);
   auto status = aio_queue_->Start();
   if (!status.ok()) {
     LOG(ERROR) << "Fail to start AioQueue";
     return status;
+  }
+  if (!rdma_buffers.empty()) {
+    infiniband::RDMAFixedBufferRegistry::Instance().FinalizeIndexAssignment(
+        rdma_read_index_base, rdma_write_index_base);
+    LOG(INFO) << "Registered " << rdma_buffers.size()
+              << " RDMA buffers as io_uring fixed read/write buffers";
   }
 
   health_checker_->Start();
@@ -98,6 +118,7 @@ Status LocalFileSystem::Shutdown() {
     LOG(ERROR) << "Fail to shutdown AioQueue";
     return status;
   }
+  aio_queue_.reset();
 
   running_.store(false, std::memory_order_relaxed);
   LOG(INFO) << "LocalFilesystem is down";
@@ -217,6 +238,113 @@ Status LocalFileSystem::ReadFile(const std::string& path, off_t offset,
   return status;
 }
 
+Status LocalFileSystem::WriteFile(const std::string& path, const char* data,
+                                  size_t length, int buf_index) {
+  DCHECK_RUNNING("LocalFilesystem");
+
+  if (!health_checker_->IsHealthy()) {
+    return Status::CacheUnhealthy("disk is unhealthy");
+  }
+
+  Status status;
+  BRPC_SCOPE_EXIT {
+    if (status.ok()) {
+      health_checker_->IOSuccess();
+    } else {
+      health_checker_->IOError();
+    }
+  };
+
+  size_t aligned_length = AlignLength(length);
+  if (aligned_length != length) {
+    // Caller-provided RDMA buffers are sized to block_size (4MB), which is
+    // already aligned. If a future caller passes a non-aligned length they'd
+    // need to either pre-zero past `length` or expose an aligned capacity.
+    return Status::InvalidParam(
+        "WriteFile zero-copy path requires aligned length");
+  }
+
+  auto tmppath = TempFilepath(path);
+  status = iutil::MkDirs(iutil::ParentDir(tmppath));
+  if (!status.ok() && !status.IsExist()) {
+    return status;
+  }
+
+  int fd;
+  status = iutil::OpenFile(tmppath, O_CREAT | O_WRONLY | O_TRUNC | O_DIRECT,
+                           0644, &fd);
+  if (!status.ok()) {
+    return status;
+  }
+  BRPC_SCOPE_EXIT {
+    iutil::Close(fd);
+    if (!status.ok()) {
+      iutil::Unlink(tmppath);
+    }
+  };
+
+  status = AioWrite(fd, const_cast<char*>(data), aligned_length, buf_index);
+  if (!status.ok() && buf_index >= 0) {
+    LOG(WARNING) << "Fixed-buffer write failed, retry with non-fixed io_uring: "
+                 << status.ToString() << ", path=" << path
+                 << ", buf_index=" << buf_index;
+    status = AioWrite(fd, const_cast<char*>(data), aligned_length, -1);
+  }
+  if (!status.ok()) {
+    return status;
+  }
+
+  return iutil::Rename(tmppath, path);
+}
+
+Status LocalFileSystem::ReadFile(const std::string& path, off_t offset,
+                                 size_t length, char* data,
+                                 size_t data_capacity, int buf_index) {
+  DCHECK_RUNNING("LocalFilesystem");
+
+  if (!health_checker_->IsHealthy()) {
+    return Status::CacheUnhealthy("disk is unhealthy");
+  }
+
+  Status status;
+  BRPC_SCOPE_EXIT {
+    if (status.ok()) {
+      health_checker_->IOSuccess();
+    } else {
+      health_checker_->IOError();
+    }
+  };
+
+  off_t aligned_offset = AlignOffset(offset);
+  size_t aligned_length = AlignLength(length + offset - aligned_offset);
+  if (aligned_length > data_capacity) {
+    return Status::InvalidParam("read buffer too small for aligned range");
+  }
+
+  int fd;
+  status = iutil::OpenFile(path, O_RDONLY | O_DIRECT, &fd);
+  if (!status.ok()) {
+    return status;
+  }
+  BRPC_SCOPE_EXIT { iutil::Close(fd); };
+
+  status = AioRead(fd, aligned_offset, aligned_length, data, buf_index);
+  if (!status.ok() && buf_index >= 0) {
+    LOG(WARNING) << "Fixed-buffer read failed, retry with non-fixed io_uring: "
+                 << status.ToString() << ", path=" << path
+                 << ", buf_index=" << buf_index;
+    status = AioRead(fd, aligned_offset, aligned_length, data, -1);
+  }
+  if (!status.ok()) {
+    return status;
+  }
+
+  if (aligned_offset != offset) {
+    std::memmove(data, data + (offset - aligned_offset), length);
+  }
+  return status;
+}
+
 // The inflight for aio which use fixed buffer is controlled by buffer pool,
 // others need to be tracked here.
 struct InflightAioGuard {
@@ -283,7 +411,8 @@ int LocalFileSystem::AllocateAlignedMemory(IOBuffer* buffer,
     return -1;
   }
 
-  // use fixed buffer
+  // Use fixed buffer. IOUring::FixedBuffers::GetIndex applies the write/read
+  // offset internally, so callers pass an index local to the selected pool.
   if (for_read) {
     char* data = read_buffer_pool_->Alloc();
     buffer->AppendUserData(data, aligned_length, [this](void* ptr) {

@@ -50,19 +50,19 @@ Upstream::Upstream()
       builder_(std::make_unique<PeerGroupBuilder>()),
       vars_(std::make_unique<UpstreamVarsCollector>()) {}
 
-void Upstream::Start() {
+Status Upstream::Start() {
   if (running_.load(std::memory_order_relaxed)) {
     LOG(WARNING) << "Upstream already started";
-    return;
+    return Status::OK();
   }
 
   LOG(INFO) << "Upstream is starting...";
 
   if (!SyncMembers()) {
-    LOG(FATAL)
+    LOG(ERROR)
         << "Fail to sync members from mds, is there any member in cache group="
         << FLAGS_cache_group << "?";
-    return;
+    return Status::NotFound("no member in cache group " + FLAGS_cache_group);
   }
 
   CHECK(executor_->Start());
@@ -71,6 +71,7 @@ void Upstream::Start() {
 
   running_.store(true, std::memory_order_relaxed);
   LOG(INFO) << "Upstream{mds_addr=" << FLAGS_mds_addrs << "} started";
+  return Status::OK();
 }
 
 void Upstream::Shutdown() {
@@ -111,7 +112,8 @@ Status Upstream::SendPutRequest(const BlockHandle& handle,
 
 Status Upstream::SendRangeRequest(const BlockHandle& handle, off_t offset,
                                   size_t length, IOBuffer* buffer,
-                                  size_t block_whole_length, bool* cache_hit) {
+                                  size_t block_whole_length,
+                                  bool retrieve_storage, bool* cache_hit) {
   Status status;
   UpstreamVarsRecordGuard guard("Range", length, status, vars_.get());
 
@@ -120,13 +122,16 @@ Status Upstream::SendRangeRequest(const BlockHandle& handle, off_t offset,
   raw.set_offset(offset);
   raw.set_length(length);
   raw.set_block_size(block_whole_length);
-  auto request = MakeRequest("Range", raw);
+  raw.set_retrieve_storage(retrieve_storage);
+  auto request = MakeRequest("Range", raw, nullptr, buffer);
 
   auto response =
       SendRequest<pb::cache::RangeRequest, pb::cache::RangeResponse>(request);
   status = response.status;
   if (status.ok()) {
-    *buffer = std::move(response.body);
+    if (response.body.Size() > 0) {
+      *buffer = std::move(response.body);
+    }
     if (cache_hit != nullptr) {
       *cache_hit = response.raw.cache_hit();
     }

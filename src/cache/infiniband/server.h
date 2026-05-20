@@ -24,18 +24,16 @@
 #define DINGOFS_SRC_CACHE_INFINIBAND_SERVER_H_
 
 #include <brpc/server.h>
-#include <bthread/countdown_event.h>
-#include <bthread/execution_queue.h>
-#include <bthread/execution_queue_inl.h>
+#include <google/protobuf/service.h>
 
 #include <memory>
+#include <mutex>
+#include <vector>
 
-#include "cache/common/closure.h"
 #include "cache/infiniband/connection.h"
-#include "cache/infiniband/event.h"
 #include "cache/infiniband/infiniband.h"
-#include "cache/infiniband/memory.h"
 #include "cache/infiniband/messenger.h"
+#include "cache/infiniband/server_session.h"
 #include "common/status.h"
 #include "dingofs/infiniband.pb.h"
 
@@ -49,12 +47,15 @@ class Listener {
   Status Listen(const EndPoint& ep);
   ConnectionUPtr Accept(const ConnMangmentMeta& remote_cm_meta);
 
-  ProtectDomain* GetProtectDomain() const { return protect_domain_.get(); }
+  ProtectDomain* GetProtectDomain() const { return protect_domain_; }
 
  private:
-  DeviceUPtr device_;
-  PortUPtr port_;
-  ProtectDomainUPtr protect_domain_;
+  // Borrowed pointers — Device/Port/PD are owned by the process-wide
+  // DeviceRegistry in rdma_memory.cc, so a single PD per device is shared by
+  // the listener QPs and any RDMAMemoryPool registered for this device.
+  Device* device_{nullptr};
+  Port* port_{nullptr};
+  ProtectDomain* protect_domain_{nullptr};
 };
 
 using ListenerUPtr = std::unique_ptr<Listener>;
@@ -62,15 +63,19 @@ using ListenerUPtr = std::unique_ptr<Listener>;
 class InfinibandServiceImpl final : public pb::infiniband::InfinibandService {
  public:
   InfinibandServiceImpl(Listener* listener, Messenger* messenger);
+  ~InfinibandServiceImpl() override;
 
   void Sync(google::protobuf::RpcController* controller,
             const pb::infiniband::SyncRequest* request,
             pb::infiniband::SyncResponse* response,
             google::protobuf::Closure* done) override;
+  Status ShutdownSessions();
 
  private:
   Listener* listener_;
   Messenger* messenger_;
+  std::mutex sessions_mutex_;
+  std::vector<ServerSessionUPtr> sessions_;
 };
 
 struct ServerOptions {
@@ -83,17 +88,21 @@ class Server {
   Status Start(const EndPoint& ep, ServerOptions* options);
   Status Shutdown();
 
-  ProtectDomain* GetProtectDomain() const { return listener_->GetProtectDomain(); }
+  ProtectDomain* GetProtectDomain() const {
+    return listener_->GetProtectDomain();
+  }
 
-  template <typename F>
-  void RegisterHandler(F&& handler) {
-    messenger_->RegisterHandler(std::forward<F>(handler));
+  // brpc-style: derive from a protobuf-generated Service (e.g.
+  // pb::cache::BlockCacheService), implement the virtual methods, then add
+  // it here. Caller retains ownership; the service must outlive the Server.
+  Status AddService(::google::protobuf::Service* service) {
+    return messenger_->AddService(service);
   }
 
  private:
   ListenerUPtr listener_;
   MessengerUPtr messenger_;
-  std::unique_ptr<pb::infiniband::InfinibandService> service_;
+  std::unique_ptr<InfinibandServiceImpl> service_;
 };
 
 }  // namespace infiniband

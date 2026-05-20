@@ -23,6 +23,7 @@
 #ifndef DINGOFS_SRC_CACHE_CACHEGROUP_NODE_H_
 #define DINGOFS_SRC_CACHE_CACHEGROUP_NODE_H_
 
+#include <functional>
 #include <ostream>
 
 #include "cache/blockcache/block_cache.h"
@@ -44,13 +45,15 @@ class CacheNode {
   Status Start();
   Status Shutdown();
 
-  Status Put(BlockHandle handle, IOBuffer block);
+  Status Put(BlockHandle handle, IOBuffer block, PutOption option = {});
   // `cache_hit` (out): true iff the request was satisfied from the local cache
   // (not from the storage fallback). Used by the RPC handler to set the
   // response's cache_hit field.
   Status Range(BlockHandle handle, off_t offset, size_t length,
-               IOBuffer* buffer, size_t block_length, bool* cache_hit);
-  Status AsyncCache(BlockHandle handle, IOBuffer block);
+               IOBuffer* buffer, size_t block_length, bool* cache_hit,
+               RangeOption option = {});
+  Status AsyncCache(BlockHandle handle, IOBuffer block,
+                    CacheOption option = {});
   Status AsyncPrefetch(BlockHandle handle, size_t length);
 
  private:
@@ -60,13 +63,17 @@ class CacheNode {
   Status LeaveGroup();
 
   Status RetrieveCache(const BlockHandle& handle, off_t offset, size_t length,
-                       IOBuffer* buffer);
+                       IOBuffer* buffer, RangeOption option);
   Status RetrieveStorage(const BlockHandle& handle, off_t offset, size_t length,
-                         IOBuffer* buffer, size_t block_length);
+                         IOBuffer* buffer, size_t block_length,
+                         RangeOption option);
   Status RetrievePartBlock(const BlockHandle& handle, off_t offset,
-                           size_t length, IOBuffer* buffer, size_t block_length);
+                           size_t length, IOBuffer* buffer, size_t block_length,
+                           RangeOption option);
   Status RetrieveWholeBlock(const BlockHandle& handle, size_t block_length,
                             IOBuffer* buffer);
+  Status FillPreparedBuffer(const IOBuffer& src, off_t offset, size_t length,
+                            IOBuffer* dst, const RangeOption& option);
   Status RunTask(StorageClient* storage_client, DownloadTaskSPtr task);
   Status WaitTask(DownloadTaskSPtr task);
 

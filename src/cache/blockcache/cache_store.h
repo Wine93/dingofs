@@ -89,17 +89,50 @@ inline std::ostream& operator<<(std::ostream& os, const BlockAttr& attr) {
 class CacheStore {
  public:
   struct StageOption {
+    StageOption()
+        : block_attr(),
+          source_buffer_prepared(false),
+          source_buffer(nullptr),
+          source_buffer_capacity(0),
+          source_buffer_index(-1) {}
+
     BlockAttr block_attr;
+    bool source_buffer_prepared;
+    const char* source_buffer;
+    size_t source_buffer_capacity;
+    int source_buffer_index;
   };
 
   struct RemoveStageOption {
     BlockAttr block_attr;
   };
 
-  struct CacheOption {};
+  struct CacheOption {
+    CacheOption()
+        : source_buffer_prepared(false),
+          source_buffer(nullptr),
+          source_buffer_capacity(0),
+          source_buffer_index(-1) {}
+
+    bool source_buffer_prepared;
+    const char* source_buffer;
+    size_t source_buffer_capacity;
+    int source_buffer_index;
+  };
 
   struct LoadOption {
+    LoadOption()
+        : block_attr(),
+          buffer_prepared(false),
+          prepared_buffer(nullptr),
+          prepared_buffer_capacity(0),
+          prepared_buffer_index(-1) {}
+
     BlockAttr block_attr;
+    bool buffer_prepared;
+    char* prepared_buffer;
+    size_t prepared_buffer_capacity;
+    int prepared_buffer_index;
   };
 
   using UploadFunc = std::function<void(BlockHandle handle, size_t length,
@@ -117,7 +150,7 @@ class CacheStore {
   virtual Status Cache(BlockHandle handle, IOBuffer block,
                        CacheOption option = {}) = 0;
   virtual Status Load(BlockHandle handle, off_t offset, size_t length,
-                      IOBuffer* buffer, LoadOption option = {}) = 0;
+                      IOBuffer* buffer, LoadOption option = LoadOption()) = 0;
 
   virtual std::string Id() const = 0;
   virtual bool IsRunning() const = 0;

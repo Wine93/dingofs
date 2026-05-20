@@ -72,7 +72,11 @@ Status RemoteBlockCacheImpl::Start() {
   LOG(INFO) << "RemoteBlockCache is starting...";
 
   joiner_->Start();
-  upstream_->Start();
+  auto status = upstream_->Start();
+  if (!status.ok()) {
+    joiner_->Shutdown();
+    return status;
+  }
 
   running_.store(true, std::memory_order_relaxed);
   LOG(INFO) << "RemoteBlockCache is up";
@@ -113,8 +117,9 @@ Status RemoteBlockCacheImpl::Range(BlockHandle handle, off_t offset,
 
   Status status;
   bool cache_hit = false;
-  status = upstream_->SendRangeRequest(handle, offset, length, buffer,
-                                       option.block_whole_length, &cache_hit);
+  status = upstream_->SendRangeRequest(
+      handle, offset, length, buffer, option.block_whole_length,
+      option.retrieve_storage, &cache_hit);
   if (status.ok()) {
     if (cache_hit) {
       vars_->cache_hit_count << 1;

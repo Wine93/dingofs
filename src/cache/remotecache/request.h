@@ -38,6 +38,7 @@ struct Request {
   std::string method;
   T raw;
   const IOBuffer* body;
+  IOBuffer* response_body;
 };
 
 template <typename U>
@@ -49,8 +50,9 @@ struct Response {
 
 template <typename T>
 inline Request<T> MakeRequest(const std::string& method, const T& raw,
-                              const IOBuffer* body = nullptr) {
-  return Request<T>{method, raw, body};
+                              const IOBuffer* body = nullptr,
+                              IOBuffer* response_body = nullptr) {
+  return Request<T>{method, raw, body, response_body};
 }
 
 template <typename T>

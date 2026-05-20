@@ -137,8 +137,13 @@ Status BlockCacheImpl::Put(BlockHandle handle, IOBuffer block,
   DCHECK_RUNNING("BlockCacheImpl");
 
   size_t length = block.Size();
-  auto status = store_->Stage(handle, std::move(block),
-                              {.block_attr = option.block_attr});
+  CacheStore::StageOption stage_option;
+  stage_option.block_attr = option.block_attr;
+  stage_option.source_buffer_prepared = option.source_buffer_prepared;
+  stage_option.source_buffer = option.source_buffer;
+  stage_option.source_buffer_capacity = option.source_buffer_capacity;
+  stage_option.source_buffer_index = option.source_buffer_index;
+  auto status = store_->Stage(handle, std::move(block), stage_option);
   if (status.ok()) {
     return status;
   } else if (status.IsCacheFull()) {
@@ -153,18 +158,28 @@ Status BlockCacheImpl::Put(BlockHandle handle, IOBuffer block,
 }
 
 Status BlockCacheImpl::Range(BlockHandle handle, off_t offset, size_t length,
-                             IOBuffer* buffer, RangeOption /*option*/) {
+                             IOBuffer* buffer, RangeOption option) {
   DCHECK_RUNNING("BlockCacheImpl");
 
-  return store_->Load(std::move(handle), offset, length, buffer);
+  CacheStore::LoadOption load_option;
+  load_option.buffer_prepared = option.buffer_prepared;
+  load_option.prepared_buffer = option.prepared_buffer;
+  load_option.prepared_buffer_capacity = option.prepared_buffer_capacity;
+  load_option.prepared_buffer_index = option.prepared_buffer_index;
+  return store_->Load(std::move(handle), offset, length, buffer, load_option);
 }
 
 Status BlockCacheImpl::Cache(BlockHandle handle, IOBuffer block,
-                             CacheOption /*option*/) {
+                             CacheOption option) {
   DCHECK_RUNNING("BlockCacheImpl");
 
   size_t length = block.Size();
-  auto status = store_->Cache(handle, std::move(block));
+  CacheStore::CacheOption cache_option;
+  cache_option.source_buffer_prepared = option.source_buffer_prepared;
+  cache_option.source_buffer = option.source_buffer;
+  cache_option.source_buffer_capacity = option.source_buffer_capacity;
+  cache_option.source_buffer_index = option.source_buffer_index;
+  auto status = store_->Cache(handle, std::move(block), cache_option);
   if (status.IsCacheFull()) {
     LOG_EVERY_SECOND(WARNING)
         << "Cache block failed: key = " << handle.Filename()

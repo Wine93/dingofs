@@ -20,7 +20,7 @@
  * Author: AI
  */
 
-#include "cache/infiniband/device.h"
+#include "cache/infiniband/infiniband.h"
 
 #include <gtest/gtest.h>
 #include <infiniband/verbs.h>
@@ -32,14 +32,18 @@ namespace infiniband {
 class DeviceTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    int num_devices = 0;
-    ibv_device** devices = ibv_get_device_list(&num_devices);
-    has_hardware_ = (devices != nullptr) && (num_devices > 0);
-    if (devices != nullptr) {
-      ibv_free_device_list(devices);
+    devices_ = ibv_get_device_list(&num_devices_);
+    has_hardware_ = (devices_ != nullptr) && (num_devices_ > 0);
+  }
+
+  void TearDown() override {
+    if (devices_ != nullptr) {
+      ibv_free_device_list(devices_);
     }
   }
 
+  ibv_device** devices_{nullptr};
+  int num_devices_{0};
   bool has_hardware_ = false;
 };
 
@@ -48,57 +52,40 @@ TEST_F(DeviceTest, Open) {
     GTEST_SKIP() << "no infiniband device available";
   }
 
-  int num_devices = 0;
-  ibv_device** devices = ibv_get_device_list(&num_devices);
-  ASSERT_NE(devices, nullptr);
-  ASSERT_GT(num_devices, 0);
-
-  Device device(devices[0]);
-  EXPECT_TRUE(device.Open().ok());
-
-  ibv_free_device_list(devices);
+  auto device = Device::Open(ibv_get_device_name(devices_[0]));
+  EXPECT_NE(device, nullptr);
 }
 
-class ManagerTest : public ::testing::Test {
- protected:
-  void SetUp() override {
-    int num_devices = 0;
-    ibv_device** devices = ibv_get_device_list(&num_devices);
-    has_hardware_ = (devices != nullptr) && (num_devices > 0);
-    if (devices != nullptr) {
-      ibv_free_device_list(devices);
-    }
+TEST_F(DeviceTest, AllocProtectDomain) {
+  if (!has_hardware_) {
+    GTEST_SKIP() << "no infiniband device available";
   }
 
-  bool has_hardware_ = false;
-};
+  auto device = Device::Open(ibv_get_device_name(devices_[0]));
+  ASSERT_NE(device, nullptr);
 
-TEST_F(ManagerTest, Start) {
-  Manager manager;
-  auto status = manager.Start();
-
-  if (has_hardware_) {
-    EXPECT_TRUE(status.ok());
-  } else {
-    EXPECT_FALSE(status.ok());
-    EXPECT_TRUE(status.IsInternal());
-  }
+  auto pd = ProtectDomain::Alloc(device.get());
+  EXPECT_NE(pd, nullptr);
 }
 
-TEST_F(ManagerTest, Shutdown) {
-  {
-    Manager manager;
-    EXPECT_TRUE(manager.Shutdown().ok());
+TEST_F(DeviceTest, QueryActivePortIfAvailable) {
+  if (!has_hardware_) {
+    GTEST_SKIP() << "no infiniband device available";
   }
 
-  {
-    Manager manager;
-    if (has_hardware_) {
-      ASSERT_TRUE(manager.Start().ok());
+  auto device = Device::Open(ibv_get_device_name(devices_[0]));
+  ASSERT_NE(device, nullptr);
+
+  ibv_device_attr attr;
+  ASSERT_EQ(ibv_query_device(device->GetIbContext(), &attr), 0);
+  for (uint8_t port_num = 1; port_num <= attr.phys_port_cnt; ++port_num) {
+    auto port = Port::Query(device.get(), port_num);
+    if (port != nullptr && port->GetPortState() == PortState::kActive) {
+      EXPECT_NE(port->GetLinkLayer(), LinkLayer::kUnspecified);
+      return;
     }
-    EXPECT_TRUE(manager.Shutdown().ok());
-    EXPECT_TRUE(manager.Shutdown().ok());
   }
+  GTEST_SKIP() << "no active infiniband port available";
 }
 
 }  // namespace infiniband

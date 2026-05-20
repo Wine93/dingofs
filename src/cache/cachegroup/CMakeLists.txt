@@ -22,4 +22,5 @@ target_link_libraries(cache_cachegroup
     cache_common
     cache_iutil
     cache_blockcache
+    cache_infiniband
 )

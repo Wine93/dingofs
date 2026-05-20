@@ -95,7 +95,7 @@ struct UpstreamVarsRecordGuard {
 class Upstream {
  public:
   Upstream();
-  void Start();
+  Status Start();
   void Shutdown();
 
   Status SendPutRequest(const BlockHandle& handle, const IOBuffer& block);
@@ -103,7 +103,8 @@ class Upstream {
   // satisfied the request from its local cache (vs falling through to S3).
   Status SendRangeRequest(const BlockHandle& handle, off_t offset,
                           size_t length, IOBuffer* buffer,
-                          size_t block_whole_length, bool* cache_hit);
+                          size_t block_whole_length, bool retrieve_storage,
+                          bool* cache_hit);
   Status SendCacheRequest(const BlockHandle& handle, const IOBuffer& block);
   Status SendPrefetchRequest(const BlockHandle& handle, size_t length);
 
