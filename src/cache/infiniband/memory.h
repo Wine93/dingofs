@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <ostream>
 #include <vector>
 
 #include "cache/infiniband/infiniband.h"
@@ -39,25 +40,18 @@ class RDMAMemoryPool;
 using RDMAMemoryPoolUPtr = std::unique_ptr<RDMAMemoryPool>;
 
 struct Buffer {
-  int index{0};
   char* data{nullptr};
   uint32_t capacity{0};
   uint32_t length{0};
   uint32_t lkey{0};
   uint32_t rkey{0};
+  int index{0};
 };
 
-// RDMA-aware wrapper around MemoryPool: the inner pool owns the
-// buffer storage and the lock-free freelist; this layer adds MR registration
-// and exposes Chunk metadata (data/bytes/lkey/rkey) that posted work requests
-// need.
 class RDMAMemoryPool {
  public:
-  RDMAMemoryPool(MemoryPoolUPtr pool, ibv_mr* mr, std::vector<Buffer> buffers);
+  RDMAMemoryPool(ibv_mr* mr, MemoryPoolUPtr pool, std::vector<Buffer> buffers);
   ~RDMAMemoryPool();
-
-  static RDMAMemoryPoolUPtr Create(std::string& device_name, size_t buffer_size,
-                                   size_t buffer_count);
   static RDMAMemoryPoolUPtr Create(ProtectDomain* protect_domain,
                                    size_t buffer_size, size_t buffer_count);
 
@@ -66,13 +60,9 @@ class RDMAMemoryPool {
   void Release(Buffer* buffer);
 
  private:
-  // Owned only when created via Create(device_name, ...); nullptr when the
-  // protect domain is borrowed. Declared first so they outlive mr_/pool_.
-  DeviceUPtr device_;
-  ProtectDomainUPtr pd_;
   ibv_mr* mr_;
-  std::vector<Buffer> buffers_;
   MemoryPoolUPtr pool_;
+  std::vector<Buffer> buffers_;
 };
 
 }  // namespace infiniband

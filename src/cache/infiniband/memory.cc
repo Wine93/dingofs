@@ -24,19 +24,19 @@
 
 #include <glog/logging.h>
 
+#include <memory>
+
 namespace dingofs {
 namespace cache {
 namespace infiniband {
 
-RDMAMemoryPool::RDMAMemoryPool(dingofs::MemoryPoolUPtr pool, ibv_mr* mr,
+RDMAMemoryPool::RDMAMemoryPool(ibv_mr* mr, MemoryPoolUPtr pool,
                                std::vector<Buffer> buffers)
-    : mr_(mr), buffers_(std::move(buffers)), pool_(std::move(pool)) {}
+    : mr_(mr), pool_(std::move(pool)), buffers_(std::move(buffers)) {}
 
 RDMAMemoryPool::~RDMAMemoryPool() {
-  // Dereg MR before the inner pool destructs and frees the underlying memory.
   if (mr_ != nullptr) {
-    int ret = ibv_dereg_mr(mr_);
-    PCHECK(ret == 0) << "ibv_dereg_mr failed: ret=" << ret;
+    PCHECK(ibv_dereg_mr(mr_) == 0) << "Fail to dereg memory region";
     mr_ = nullptr;
   }
 }
@@ -62,17 +62,22 @@ RDMAMemoryPoolUPtr RDMAMemoryPool::Create(ProtectDomain* protect_domain,
   std::vector<Buffer> buffers;
   buffers.reserve(buffer_count);
   for (int i = 0; i < buffer_count; ++i) {
-    buffers.push_back({i, pool->base() + (i * buffer_size),
-                       static_cast<uint32_t>(buffer_size), 0, mr->lkey,
-                       mr->rkey});
+    Buffer buffer;
+    buffer.data = pool->base() + (i * buffer_size);
+    buffer.capacity = static_cast<uint32_t>(buffer_size);
+    buffer.lkey = 0;
+    buffer.lkey = mr->lkey;
+    buffer.rkey = mr->rkey;
+    buffer.index = i;
+    buffers.emplace_back(buffer);
   }
 
   LOG(INFO) << "Successfully create RDMAMemoryPool{buffer_size=" << buffer_size
             << " buffer_count=" << buffer_count << " lkey=" << mr->lkey
             << " rkey=" << mr->rkey << "}";
 
-  return std::unique_ptr<RDMAMemoryPool>(
-      new RDMAMemoryPool(std::move(pool), mr, std::move(buffers)));
+  return std::make_unique<RDMAMemoryPool>(mr, std::move(pool),
+                                          std::move(buffers));
 }
 
 Buffer* RDMAMemoryPool::Require() {

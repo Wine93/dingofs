@@ -36,50 +36,30 @@ namespace dingofs {
 namespace cache {
 namespace infiniband {
 
-// Wire framing for InfiniBand RDMA SEND/RECV messages.
-//
-// On the wire each message is a fixed 8-byte header followed by a protobuf
-// payload of the size declared by the header.
 class Protocol {
  public:
-  // Bytes of framing overhead Serialize() adds on top of the protobuf payload.
   static constexpr size_t kHeaderSize = 16;
 
-  // Parse one framed message from [buffer, buffer + size). On success the
-  // protobuf message is populated.
+  static Status PeekCorrelationId(const char* buffer, size_t size,
+                                  uint64_t* correlation_id);
+
   static Status Parse(const char* buffer, size_t size,
                       pb::infiniband::InfinibandRequest* request);
   static Status Parse(const char* buffer, size_t size,
                       pb::infiniband::InfinibandResponse* response);
 
-  // Serialize one framed message into [buffer, buffer + size). 'correlation_id'
-  // is written into the header so the receiver can dispatch the completion
-  // without parsing the protobuf payload. On success *written receives the
-  // total bytes written (header + payload).
-  static Status Serialize(const pb::infiniband::InfinibandRequest& request,
-                          uint64_t correlation_id, char* buffer, size_t size,
-                          uint32_t* written);
+  static Status Serialize(uint64_t correlation_id,
+                          const pb::infiniband::InfinibandRequest& request,
+                          char* buffer, size_t size, uint32_t* nwritten);
   static Status Serialize(const pb::infiniband::InfinibandResponse& response,
                           uint64_t correlation_id, char* buffer, size_t size,
-                          uint32_t* written);
+                          uint32_t* nwritten);
 
-  // Peeks at a framed message's correlation_id without parsing the payload.
-  // Returns InvalidParam if the header is missing/malformed.
-  static Status PeekCorrelationId(const char* buffer, size_t size,
-                                  uint64_t* correlation_id);
+  static Status PackBody(const google::protobuf::Message& message,
+                         google::protobuf::Message* ib_message);
 
-  // Pack a concrete sub-message into the `body` oneof of a Request /
-  // Response envelope via protobuf reflection. The matching branch is
-  // chosen by `body.GetDescriptor()`.
-  // Returns Internal if no oneof branch matches.
-  static Status PackBody(const google::protobuf::Message& body,
-                         google::protobuf::Message* envelope);
-
-  // Unpack the currently-set `body` oneof branch of `envelope` into `*body`.
-  // Returns Internal if the oneof is unset or the set branch's type doesn't
-  // match `body->GetDescriptor()`.
-  static Status UnpackBody(const google::protobuf::Message& envelope,
-                           google::protobuf::Message* body);
+  static Status UnpackBody(const google::protobuf::Message& ib_message,
+                           google::protobuf::Message* message);
 };
 
 }  // namespace infiniband
