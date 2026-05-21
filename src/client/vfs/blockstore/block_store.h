@@ -20,7 +20,7 @@
 #include <cstdint>
 
 #include "cache/blockcache/block_cache.h"
-#include "common/block/block_context.h"
+#include "common/block/block_handle.h"
 #include "common/callback.h"
 #include "common/io_buffer.h"
 #include "common/status.h"
@@ -31,20 +31,22 @@ namespace client {
 namespace vfs {
 
 struct RangeReq {
-  BlockContext block_ctx;
+  BlockHandle handle;
   int64_t offset{0};
   int64_t length{0};
+  uint64_t block_size{0};  // total block size (file-block: key.size)
   IOBuffer* data{nullptr};
 };
 
 struct PutReq {
-  BlockContext block_ctx;
+  BlockHandle handle;
   IOBuffer data;
   bool write_back{false};
 };
 
 struct PrefetchReq {
-  BlockContext block_ctx;
+  BlockHandle handle;
+  uint64_t block_size{0};  // total block size to prefetch
 };
 
 class BlockStore {

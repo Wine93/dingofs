@@ -24,7 +24,6 @@
 #define DINGOFS_SRC_CACHE_REMOTECACHE_REMOTE_BLOCK_CACHE_H_
 
 #include "cache/blockcache/block_cache.h"
-#include "cache/common/context.h"
 #include "cache/iutil/bthread.h"
 #include "cache/remotecache/block_fetcher.h"
 #include "cache/remotecache/upstream.h"
@@ -63,33 +62,29 @@ class RemoteBlockCacheImpl final : public BlockCache {
   Status Start() override;
   Status Shutdown() override;
 
-  Status Put(ContextSPtr ctx, const BlockContext& block_ctx,
-             const Block& block, PutOption option) override;
-  Status Range(ContextSPtr ctx, const BlockContext& block_ctx, off_t offset,
-               size_t length, IOBuffer* buffer, RangeOption option) override;
-  Status Cache(ContextSPtr ctx, const BlockContext& block_ctx,
-               const Block& block, CacheOption option) override;
-  Status Prefetch(ContextSPtr ctx, const BlockContext& block_ctx,
-                  size_t length, PrefetchOption option) override;
+  Status Put(BlockHandle handle, IOBuffer block, PutOption option) override;
+  Status Range(BlockHandle handle, off_t offset, size_t length,
+               IOBuffer* buffer, RangeOption option) override;
+  Status Cache(BlockHandle handle, IOBuffer block,
+               CacheOption option) override;
+  Status Prefetch(BlockHandle handle, size_t length,
+                  PrefetchOption option) override;
 
-  void AsyncPut(ContextSPtr ctx, const BlockContext& block_ctx,
-                const Block& block, AsyncCallback cb,
+  void AsyncPut(BlockHandle handle, IOBuffer block, AsyncCallback cb,
                 PutOption option) override;
-  void AsyncRange(ContextSPtr ctx, const BlockContext& block_ctx, off_t offset,
-                  size_t length, IOBuffer* buffer, AsyncCallback cb,
+  void AsyncRange(BlockHandle handle, off_t offset, size_t length,
+                  IOBuffer* buffer, AsyncCallback cb,
                   RangeOption option) override;
-  void AsyncCache(ContextSPtr ctx, const BlockContext& block_ctx,
-                  const Block& block, AsyncCallback cb,
+  void AsyncCache(BlockHandle handle, IOBuffer block, AsyncCallback cb,
                   CacheOption option) override;
-  void AsyncPrefetch(ContextSPtr ctx, const BlockContext& block_ctx,
-                     size_t length, AsyncCallback cb,
+  void AsyncPrefetch(BlockHandle handle, size_t length, AsyncCallback cb,
                      PrefetchOption option) override;
 
   // We gurantee that cache node is always enable stage and cache.
   bool IsEnabled() const override { return !FLAGS_cache_group.empty(); }
   bool EnableStage() const override { return IsEnabled(); }
   bool EnableCache() const override { return IsEnabled(); }
-  bool IsCached(const BlockContext&) const override { return IsEnabled(); }
+  bool IsCached(const BlockHandle&) const override { return IsEnabled(); }
   bool Dump(Json::Value& value) const override {
     return upstream_->Dump(value);
   }

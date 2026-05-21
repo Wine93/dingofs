@@ -35,7 +35,6 @@
 #include <memory>
 
 #include "cache/blockcache/cache_store.h"
-#include "cache/common/context.h"
 #include "cache/iutil/bthread.h"
 #include "cache/iutil/cache.h"
 #include "cache/remotecache/upstream.h"
@@ -66,26 +65,26 @@ Segment* BlockMap::Block::GetOrCreateSegment(int index) {
   return expected;
 }
 
-BlockMap::BlockSPtr BlockMap::GetOrCreateBlock(const BlockKey& key) {
-  uint64_t slice_id = key.id;
-  uint64_t block_index = key.index;
-  auto* m = &blocks_[block_index % kBlockNum];
+BlockMap::BlockSPtr BlockMap::GetOrCreateBlock(const BlockHandle& handle) {
+  std::string filename = handle.Filename();
+  size_t h = std::hash<std::string>{}(filename);
+  auto* m = &blocks_[h % kBlockNum];
 
   {
     bthread::RWLockRdGuard guard(rwlock_);
-    auto* stat = m->seek(slice_id);
+    auto* stat = m->seek(filename);
     if (stat != nullptr) {
       return *stat;
     }
   }
 
   bthread::RWLockWrGuard guard(rwlock_);
-  auto* stat = m->seek(slice_id);
+  auto* stat = m->seek(filename);
   if (stat != nullptr) {
     return *stat;
   }
 
-  return *m->insert(slice_id, std::make_shared<Block>());
+  return *m->insert(filename, std::make_shared<Block>());
 }
 
 BlockFetcher::BlockFetcher(iutil::Cache* cache, Upstream* upstream)
@@ -113,13 +112,13 @@ void BlockFetcher::Shutdown() {
   CHECK_EQ(0, bthread::execution_queue_join(buffer_queue_id_));
 }
 
-BlockFetcher::Task* BlockFetcher::GetTaskEntry(const BlockKey& block_key,
+BlockFetcher::Task* BlockFetcher::GetTaskEntry(const BlockHandle& handle,
                                                size_t block_length,
                                                Segment* segment) {
   if (segment->SetFetching()) {  // FIXME
     segment->ResetEvent();
     auto* task = new Task();
-    task->block_key = block_key;
+    task->handle = handle;
     task->block_length = block_length;
     task->segment = segment;
     return task;
@@ -162,9 +161,8 @@ void BlockFetcher::DoFetch(Task* task) {
       std::min(task->block_length - offset, (size_t)FLAGS_segment_size);
 
   auto* buffer = new IOBuffer();
-  BlockContext block_ctx(task->block_key, /*fs_id=*/0);
-  auto status = upstream_->SendRangeRequest(NewContext(), block_ctx, offset,
-                                            length, buffer, task->block_length);
+  auto status = upstream_->SendRangeRequest(task->handle, offset, length,
+                                            buffer, task->block_length);
   if (status.ok()) {
     OnSuccess(task, status, buffer);
   } else {
@@ -177,18 +175,18 @@ void BlockFetcher::DoFetch(Task* task) {
 }
 
 void BlockFetcher::OnSuccess(Task* task, Status /*status*/, IOBuffer* buffer) {
-  LOG(INFO) << "Success to fetch segment: key = " << task->block_key.Filename()
+  LOG(INFO) << "Success to fetch segment: key = " << task->handle.Filename()
             << ", segment_index = " << task->segment->GetIndex()
             << ", length = " << buffer->Size();
 
   auto* segment = task->segment;
   auto* value = new CacheEntry{this, segment, buffer};
-  auto* handle = cache_->Insert(
-      SegmentCacheKey(task->block_key, segment->GetIndex()), value,
+  auto* cache_handle = cache_->Insert(
+      SegmentCacheKey(task->handle, segment->GetIndex()), value,
       buffer->Size(), [](const std::string_view& key, void* value) {
         HandleCacheEvict(key, value);
       });
-  cache_->Release(handle);
+  cache_->Release(cache_handle);
 
   CHECK(task->segment->SetCached());
 }
@@ -245,8 +243,8 @@ SegmentHandler::SegmentHandler(iutil::Cache* cache,
       segment_(segment),
       waiting_(waiting) {}
 
-Status SegmentHandler::Handle(const BlockKey& key, off_t offset, size_t length,
-                              IOBuffer* buffer) {
+Status SegmentHandler::Handle(const BlockHandle& handle, off_t offset,
+                              size_t length, IOBuffer* buffer) {
   if (waiting_) {
     segment_->WaitFetched();
   }
@@ -259,18 +257,19 @@ Status SegmentHandler::Handle(const BlockKey& key, off_t offset, size_t length,
   off_t off_l = std::max(boff_l, soff_l);  // offset in current request
   off_t off_r = std::min(boff_r, soff_r);
 
-  auto* handle = cache_->Lookup(SegmentCacheKey(key, index));
-  if (handle != nullptr) {
-    BRPC_SCOPE_EXIT { cache_->Release(handle); };
+  auto* cache_handle = cache_->Lookup(SegmentCacheKey(handle, index));
+  if (cache_handle != nullptr) {
+    BRPC_SCOPE_EXIT { cache_->Release(cache_handle); };
     auto* sbuffer =
-        static_cast<BlockFetcher::CacheEntry*>(cache_->Value(handle))->buffer;
+        static_cast<BlockFetcher::CacheEntry*>(cache_->Value(cache_handle))
+            ->buffer;
     sbuffer->AppendTo(buffer, off_r - off_l, off_l % FLAGS_segment_size);
     return Status::OK();
   }
 
   IOBuffer piece;
   auto status =
-      storage_client_->Range(NewContext(), key, off_l, off_r - off_l, &piece);
+      storage_client_->Range(handle, off_l, off_r - off_l, &piece);
   if (status.ok()) {
     buffer->Append(&piece);
   }
@@ -289,13 +288,14 @@ void CacheRetriever::Start() { fetcher_->Start(); }
 void CacheRetriever::Shutdown() { fetcher_->Shutdown(); }
 
 // NOTE: must gurantee takes less 50us per 128KB request
-Status CacheRetriever::Range(const BlockKey& key, off_t offset, size_t length,
-                             size_t block_length, IOBuffer* buffer) {
+Status CacheRetriever::Range(const BlockHandle& handle, off_t offset,
+                             size_t length, size_t block_length,
+                             IOBuffer* buffer) {
   CHECK_GT(block_length, 0);
 
   std::vector<SegmentHandler> handlers;
   std::vector<BlockFetcher::Task*> to_fetch;
-  const auto& block = block_map_->GetBlock(key);
+  const auto& block = block_map_->GetBlock(handle);
 
   auto lindex = SegmentIndex(offset);
   auto rindex = SegmentIndex(offset + length - 1);
@@ -318,7 +318,7 @@ Status CacheRetriever::Range(const BlockKey& key, off_t offset, size_t length,
             SegmentHandler(cache_, storage_client_, segment, true));
       }
     } else {
-      auto* task = fetcher_->GetTaskEntry(key, block_length, segment);
+      auto* task = fetcher_->GetTaskEntry(handle, block_length, segment);
       if (task != nullptr) {
         to_fetch.emplace_back(task);
       }
@@ -334,8 +334,8 @@ Status CacheRetriever::Range(const BlockKey& key, off_t offset, size_t length,
   fetcher_->SubmitTasks(to_fetch);
 
   // Handler segment by sequence
-  for (auto& handler : handlers) {
-    auto status = handler.Handle(key, offset, length, buffer);
+  for (auto& shandler : handlers) {
+    auto status = shandler.Handle(handle, offset, length, buffer);
     if (!status.ok()) {
       return status;
     }

@@ -27,7 +27,7 @@
 
 #include "cache/iutil/string_util.h"
 #include "client/vfs/data/common/common.h"
-#include "common/block/block_context.h"
+#include "common/block/block_handle.h"
 #include "client/vfs/data/common/data_utils.h"
 #include "client/vfs/data/reader/chunk_req.h"
 #include "client/vfs/hub/vfs_hub.h"
@@ -215,9 +215,10 @@ void ChunkReqReader::ProcessBlockCacheReadReq(
 
     const auto& key = block_cache_req->block_req.key.value();
     RangeReq req;
-    req.block_ctx = BlockContext(key, block_cache_req->fs_id);
+    req.handle = BlockHandle(block_cache_req->fs_id, key);
     req.offset = block_cache_req->block_req.block_offset;
     req.length = block_cache_req->block_req.len;
+    req.block_size = key.size;
     req.data = &block_cache_req->io_buffer;
 
     hub_->GetBlockStore()->RangeAsync(span_ctx, req, std::move(callback));
