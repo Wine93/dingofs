@@ -139,7 +139,7 @@ bool DiskCacheLoader::LoadOneBlock(const std::string& prefix,
   BlockKey key;
   std::string name = file.name;
   std::string path = absl::StrJoin({prefix, name}, "/");
-  if (IsTempFilepath(name) || !ParseFromFilename(name, &key)) {
+  if (IsTempFilepath(name) || !cache::ParseFromFilename(name, &key)) {
     auto status = iutil::Unlink(path);
     if (status.ok()) {
       LOG(INFO) << "Removed invalid block, path=`" << path << "'";
@@ -160,17 +160,19 @@ bool DiskCacheLoader::LoadOneBlock(const std::string& prefix,
       auto pos = remainder.find('/');
       auto fs_id_str =
           (pos != std::string::npos) ? remainder.substr(0, pos) : remainder;
-      fs_id = static_cast<uint32_t>(std::strtoul(fs_id_str.c_str(), nullptr,
-                                                  10));
+      fs_id =
+          static_cast<uint32_t>(std::strtoul(fs_id_str.c_str(), nullptr, 10));
     }
 
-    BlockContext block_ctx(key, fs_id);
-    manager_->Add(key, CacheValue(file.size, file.atime), BlockPhase::kStaging);
-    uploader_(NewContext(), block_ctx, file.size,
+    BlockHandle handle(fs_id, key);
+    manager_->Add(handle, CacheValue(file.size, file.atime),
+                  BlockPhase::kStaging);
+    uploader_(handle, file.size,
               BlockAttr(BlockAttr::kFromReload, disk_id_));
   } else if (type == BlockType::kCacheBlock) {
     if (file.nlink == 1) {
-      manager_->Add(key, CacheValue(file.size, file.atime),
+      BlockHandle handle(0, key);
+      manager_->Add(handle, CacheValue(file.size, file.atime),
                     BlockPhase::kCached);
     }
   } else {

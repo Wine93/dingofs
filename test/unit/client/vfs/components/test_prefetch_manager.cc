@@ -116,9 +116,9 @@ TEST_F(PrefetchManagerTest, SubmitTask_VerifyBlockKeyFields) {
   waiter.Wait();
 
   ASSERT_EQ(captured.size(), 1u);
-  // BlockKey must carry a valid (non-zero) id and the actual block size.
-  EXPECT_NE(captured[0].block_ctx.key.id, 0u);
-  EXPECT_GT(captured[0].block_ctx.key.size, 0);
+  // Handle must carry a valid (non-zero) id and the actual block size.
+  EXPECT_NE(captured[0].handle.Id(), "0");
+  EXPECT_GT(captured[0].block_size, 0u);
 }
 
 TEST_F(PrefetchManagerTest, SubmitTask_TriggersPrefetchAsync) {

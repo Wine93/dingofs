@@ -72,7 +72,7 @@ void BlockStoreImpl::RangeAsync(ContextSPtr ctx, RangeReq req,
                   span](Status s) {
     BlockStoreAccessLogGuard log(start_us, [&]() {
       return fmt::format("range_async ({}, {}, [{}-{})) : {}",
-                         req.block_ctx.key.Filename(), req.length, req.offset,
+                         req.handle.Filename(), req.length, req.offset,
                          (req.offset + req.length), s.ToString());
     });
     SpanScope::End(span);
@@ -82,10 +82,10 @@ void BlockStoreImpl::RangeAsync(ContextSPtr ctx, RangeReq req,
 
   cache::RangeOption option;
   option.retrieve_storage = true;
-  option.block_whole_length = req.block_ctx.key.size;
+  option.block_whole_length = req.block_size;
 
-  block_cache_->AsyncRange(cache::NewContext(), req.block_ctx, req.offset,
-                           req.length, req.data, std::move(wrapper), option);
+  block_cache_->AsyncRange(req.handle, req.offset, req.length, req.data,
+                           std::move(wrapper), option);
 }
 
 void BlockStoreImpl::PutAsync(ContextSPtr ctx, PutReq req,
@@ -100,7 +100,7 @@ void BlockStoreImpl::PutAsync(ContextSPtr ctx, PutReq req,
   auto wrapper = [this, start_us, req, cb = std::move(callback),
                   span](Status s) {
     BlockStoreAccessLogGuard log(start_us, [&]() {
-      return fmt::format("put_async ({}, {}) : {}", req.block_ctx.key.Filename(),
+      return fmt::format("put_async ({}, {}) : {}", req.handle.Filename(),
                          req.data.Size(), s.ToString());
     });
     SpanScope::End(span);
@@ -111,16 +111,14 @@ void BlockStoreImpl::PutAsync(ContextSPtr ctx, PutReq req,
 
   cache::PutOption option{.writeback = req.write_back};
 
-  block_cache_->AsyncPut(cache::NewContext(), req.block_ctx,
-                         cache::Block(req.data),
-                         std::move(wrapper), option);
+  block_cache_->AsyncPut(req.handle, req.data, std::move(wrapper), option);
 }
 
 void BlockStoreImpl::PrefetchAsync(ContextSPtr ctx, PrefetchReq req,
                                    StatusCallback callback) {
   auto span = hub_->GetTraceManager()->StartChildSpan(
       "BlockStoreImpl::PrefetchAsync", ctx->GetTraceSpan());
-  if (block_cache_->IsCached(req.block_ctx)) {
+  if (block_cache_->IsCached(req.handle)) {
     callback(Status::OK());
     return;
   }
@@ -131,16 +129,14 @@ void BlockStoreImpl::PrefetchAsync(ContextSPtr ctx, PrefetchReq req,
                   span](Status s) {
     BlockStoreAccessLogGuard log(start_us, [&]() {
       return fmt::format("prefetch_async ({}, {}) : {}",
-                         req.block_ctx.key.Filename(),
-                         req.block_ctx.key.size, s.ToString());
+                         req.handle.Filename(), req.block_size, s.ToString());
     });
     SpanScope::End(span);
     cb(s);
   };
 
   // transfer ownership of block_data to BlockDataFlushed
-  block_cache_->AsyncPrefetch(cache::NewContext(), req.block_ctx,
-                              req.block_ctx.key.size, std::move(wrapper));
+  block_cache_->AsyncPrefetch(req.handle, req.block_size, std::move(wrapper));
 }
 
 // utility

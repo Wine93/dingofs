@@ -40,8 +40,9 @@ namespace dingofs {
 
 namespace cache {
 
-inline std::string SegmentCacheKey(const BlockKey& key, int segment_index) {
-  return key.Filename() + ":" + std::to_string(segment_index);
+inline std::string SegmentCacheKey(const BlockHandle& handle,
+                                   int segment_index) {
+  return handle.Filename() + ":" + std::to_string(segment_index);
 }
 
 DECLARE_int32(segment_size);
@@ -114,17 +115,17 @@ class BlockMap {
   BlockMap() = default;
   virtual ~BlockMap() = default;
 
-  virtual BlockSPtr GetBlock(const BlockKey& key) {
-    return GetOrCreateBlock(key);
+  virtual BlockSPtr GetBlock(const BlockHandle& handle) {
+    return GetOrCreateBlock(handle);
   }
 
  private:
   static constexpr size_t kBlockNum = 16;  // 64MB/4MB
 
-  BlockSPtr GetOrCreateBlock(const BlockKey& key);
+  BlockSPtr GetOrCreateBlock(const BlockHandle& handle);
 
   bthread::RWLock rwlock_;
-  butil::FlatMap<uint64_t, BlockSPtr> blocks_[kBlockNum];  // key: slice_id
+  butil::FlatMap<std::string, BlockSPtr> blocks_[kBlockNum];  // key: filename
 };
 
 using BlockMapUPtr = std::unique_ptr<BlockMap>;
@@ -133,20 +134,21 @@ class SharedBlockMap : public BlockMap {
  public:
   SharedBlockMap() = default;
 
-  BlockSPtr GetBlock(const BlockKey& key) override {
-    return shard_[key.id % kShardNum].GetBlock(key);
+  BlockSPtr GetBlock(const BlockHandle& handle) override {
+    return shard_[std::hash<std::string>{}(handle.Filename()) % kShardNum]
+        .GetBlock(handle);
   }
 
  private:
   static constexpr size_t kShardNum = 16;
 
-  BlockMap shard_[kShardNum];  // hash by slice id
+  BlockMap shard_[kShardNum];
 };
 
 class BlockFetcher {
  public:
   struct Task {
-    BlockKey block_key;
+    BlockHandle handle;
     size_t block_length;
     Segment* segment;
   };
@@ -162,7 +164,7 @@ class BlockFetcher {
   void Start();
   void Shutdown();
 
-  Task* GetTaskEntry(const BlockKey& block_key, size_t block_length,
+  Task* GetTaskEntry(const BlockHandle& handle, size_t block_length,
                      Segment* segment);
   void SubmitTasks(const std::vector<Task*>& tasks);
 
@@ -193,7 +195,7 @@ class SegmentHandler {
   SegmentHandler(iutil::Cache* cache, StorageClient* storage_client,
                  Segment* segment, bool waiting);
 
-  Status Handle(const BlockKey& key, off_t offset, size_t length,
+  Status Handle(const BlockHandle& handle, off_t offset, size_t length,
                 IOBuffer* buffer);
 
  private:
@@ -211,7 +213,7 @@ class CacheRetriever {
   void Start();
   void Shutdown();
 
-  Status Range(const BlockKey& key, off_t offset, size_t length,
+  Status Range(const BlockHandle& handle, off_t offset, size_t length,
                size_t block_length, IOBuffer* buffer);
 
  private:
