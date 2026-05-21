@@ -14,7 +14,7 @@
 
 add_subdirectory(common)
 add_subdirectory(iutil)
-#add_subdirectory(blockcache)
+add_subdirectory(blockcache)
 #add_subdirectory(remotecache)
 #add_subdirectory(cachegroup)
 #add_subdirectory(tiercache)
@@ -26,6 +26,7 @@ add_executable(test_cache
 target_link_libraries(test_cache
     $<TARGET_OBJECTS:test_cache_common>
     $<TARGET_OBJECTS:test_cache_iutil>
+    $<TARGET_OBJECTS:test_cache_blockcache>
 
     cache_lib
 
