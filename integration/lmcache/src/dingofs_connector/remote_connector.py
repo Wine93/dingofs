@@ -171,19 +171,20 @@ class DingoFSConnector(RemoteConnector):
                     memory_obj.ref_count_down()
 
     async def put(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
+        # NOTE: we do NOT ref_count_down memory_obj here. The caller
+        # (RemoteBackend.submit_put_task) hands us a serialized
+        # ``compressed_memory_obj`` whose ref count it never up'd — its
+        # lifetime is managed by the serializer. Mirrors RedisConnector.put.
         key_str = cache_engine_key_to_native_str(key)
         size = len(memory_obj.byte_array)
         with access_log("put",
                         lambda: f"{key_str}, {_fmt_bytes(size)}") as r:
-            try:
-                ok, _ = await self._client.batch_set(
-                    [key_str], [memory_obj.byte_array]
-                )
-                if ok:
-                    self._exists_lru.add(key_str)
-                r.result = "ok" if ok else "partial_fail"
-            finally:
-                memory_obj.ref_count_down()
+            ok, _ = await self._client.batch_set(
+                [key_str], [memory_obj.byte_array]
+            )
+            if ok:
+                self._exists_lru.add(key_str)
+            r.result = "ok" if ok else "partial_fail"
 
     # ------------------------------------------------------------------
     # batched_put / batched_get
@@ -197,6 +198,9 @@ class DingoFSConnector(RemoteConnector):
         keys: List[CacheEngineKey],
         memory_objs: List[MemoryObj],
     ) -> None:
+        # NOTE: we do NOT ref_count_down memory_objs here. See put() above —
+        # these are the serializer's compressed_memory_objs whose ref counts
+        # the RemoteBackend caller never up'd. Mirrors RedisConnector.batched_put.
         n = len(keys)
         size = (len(memory_objs[0].byte_array) * n) if memory_objs else 0
         with access_log("batched_put",
@@ -209,14 +213,10 @@ class DingoFSConnector(RemoteConnector):
                 raise ValueError("keys and memory_objs length mismatch")
             key_strs = [cache_engine_key_to_native_str(k) for k in keys]
             views = [obj.byte_array for obj in memory_objs]
-            try:
-                ok, _ = await self._client.batch_set(key_strs, views)
-                if ok:
-                    self._exists_lru.add_many(key_strs)
-                r.result = "ok" if ok else "partial_fail"
-            finally:
-                for obj in memory_objs:
-                    obj.ref_count_down()
+            ok, _ = await self._client.batch_set(key_strs, views)
+            if ok:
+                self._exists_lru.add_many(key_strs)
+            r.result = "ok" if ok else "partial_fail"
 
     def support_batched_get(self) -> bool:
         return True
