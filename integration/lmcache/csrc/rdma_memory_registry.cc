@@ -14,7 +14,8 @@
 
 #include <glog/logging.h>
 
-#include "cache/infiniband/rdma_memory.h"
+#include "cache/infiniband/infiniband.h"
+#include "common/options/cache.h"
 #include "native_engine.h"
 
 namespace dingofs {
@@ -67,11 +68,48 @@ bool RdmaMemoryRegistry::Covers(const void* data, std::size_t length) const {
   return false;
 }
 
+std::uint32_t RdmaMemoryRegistry::RkeyFor(const void* p,
+                                          std::size_t n) const {
+  if (p == nullptr || n == 0) {
+    return 0;
+  }
+
+  const auto start = reinterpret_cast<std::uintptr_t>(p);
+  const auto end = start + n;
+  if (end < start) {
+    return 0;
+  }
+
+  for (const auto& region : registered_regions_) {
+    const auto region_end = region.addr + region.length;
+    if (region_end < region.addr) {
+      continue;
+    }
+    if (start >= region.addr && end <= region_end) {
+      return region.rkey;
+    }
+  }
+  return 0;
+}
+
 void RdmaMemoryRegistry::RegisterRegions(
     const std::vector<MemoryRegion>& regions) {
   registered_regions_.reserve(regions.size());
   owned_regions_.reserve(regions.size());
-  device_name_ = cache::infiniband::FLAGS_dingofs_rdma_device;
+  device_name_ = dingofs::cache::FLAGS_cache_rdma_device;
+
+  // Register against the SAME per-device singleton ProtectDomain the cache
+  // client's RDMA buffer pool and transport use (Infiniband::GetOrAlloc caches
+  // the PD by device name), so the arena's rkey is valid on those QPs.
+  cache::infiniband::Infiniband::Context ctx;
+  auto status = cache::infiniband::Infiniband::Init(
+      device_name_,
+      static_cast<uint8_t>(dingofs::cache::FLAGS_cache_rdma_port_num), &ctx);
+  if (!status.ok()) {
+    throw std::runtime_error(
+        "DingoFS LMCache RDMA: Infiniband::Init failed for device " +
+        device_name_ + ": " + status.ToString());
+  }
 
   for (const auto& region : regions) {
     if (region.addr == 0 || region.length == 0) {
@@ -80,19 +118,18 @@ void RdmaMemoryRegistry::RegisterRegions(
           RegionString(region));
     }
 
-    cache::infiniband::RDMARegionUPtr rdma_region;
-    auto status = cache::infiniband::RegisterRDMAMemory(
-        device_name_, reinterpret_cast<void*>(region.addr), region.length,
-        &rdma_region);
-    if (!status.ok()) {
+    auto mr = cache::infiniband::MemoryRegion::Register(
+        ctx.protect_domain, reinterpret_cast<void*>(region.addr),
+        region.length);
+    if (mr == nullptr) {
       throw std::runtime_error(
-          "DingoFS LMCache RDMA: RegisterRDMAMemory failed for " +
-          RegionString(region) + ": " + status.ToString());
+          "DingoFS LMCache RDMA: ibv_reg_mr failed for " +
+          RegionString(region));
     }
 
     registered_regions_.push_back(RegisteredMemoryRegion{
-        region.addr, region.length, rdma_region->lkey, rdma_region->rkey});
-    owned_regions_.push_back(std::move(rdma_region));
+        region.addr, region.length, mr->GetLkey(), mr->GetRkey()});
+    owned_regions_.push_back(std::move(mr));
   }
 
   LOG(INFO) << "DingoFS LMCache RDMA: registered "

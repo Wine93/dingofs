@@ -33,12 +33,18 @@ namespace cache {
 
 class Worker {
  public:
-  Worker(uint64_t idx, TaskFactorySPtr factory, CollectorSPtr collector);
+  // `warmed` is signaled once this worker has finished init + warmup; `go` is
+  // waited on before the measured phase so the wall clock (started by the
+  // benchmarker after all workers are warm) excludes pool registration and
+  // cold-start effects.
+  Worker(uint64_t idx, TaskFactorySPtr factory, CollectorSPtr collector,
+         bthread::CountdownEvent* warmed, bthread::CountdownEvent* go);
 
   void Start();
   void Shutdown();
 
  private:
+  void RunWarmup();
   void ExecAllTasks();
   void ExecTask(Task task);
 
@@ -47,6 +53,8 @@ class Worker {
   CollectorSPtr collector_;
   TaskContext context_;
   bthread::CountdownEvent finished_;
+  bthread::CountdownEvent* warmed_;
+  bthread::CountdownEvent* go_;
 };
 
 using WorkerUPtr = std::unique_ptr<Worker>;

@@ -34,7 +34,7 @@
 
 #include "cache/blockcache/block_cache.h"
 #include "cache/blockcache/block_cache_impl.h"
-#include "cache/cachegroup/task_tracker.h"
+#include "cache/common/task_tracker.h"
 #include "cache/common/macro.h"
 #include "cache/common/mds_client.h"
 #include "cache/common/storage_client.h"

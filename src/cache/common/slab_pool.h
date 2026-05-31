@@ -53,6 +53,7 @@ class SlabPool {
   void Free(SlabBuffer* buffer);
   int IndexOf(void* data);
   int IndexOf(SlabBuffer* buffer);
+  bool Contains(void* data);
   std::vector<iovec> Fetch();
 
   char* Base();

@@ -29,7 +29,6 @@
 #include <string>
 
 #include "cache/blockcache/block_cache.h"
-#include "cache/infiniband/memory.h"
 #include "common/block/block_handle.h"
 #include "common/block/block_key.h"
 #include "common/status.h"
@@ -68,18 +67,14 @@ struct TaskResult {
 };
 
 struct TaskContext {
-  ~TaskContext();
-
   Status Init(uint64_t worker_idx);
   IOBuffer* RequestBody() { return &request_body; }
-  IOBuffer* PreparedResponseBody();
   bool VerifyRange(const IOBuffer& buffer, uint64_t length) const;
 
-  infiniband::RDMAMemoryPoolUPtr rdma_pool;
-  infiniband::Buffer* request_buffer{nullptr};
-  infiniband::Buffer* response_buffer{nullptr};
+  // With --bench_rdma_registered_buffers (and --use_rdma), request_body is a
+  // single registered buffer from RdmaBufferManager so Put/Cache are zero-copy
+  // on the wire; its deleter returns the buffer to the pool on destruction.
   IOBuffer request_body;
-  IOBuffer response_body;
   uint64_t worker_idx{0};
 };
 

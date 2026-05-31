@@ -223,7 +223,7 @@ void ServerSession::ParseMessage(Controller* cntl, RdmaBuffer* buffer) {
 
 void ServerSession::ReadRequestAttachment(Controller* cntl) {
   const size_t attachment_size = cntl->request_attachment_size();
-  auto& slab_pool = dingofs::cache::GetGlobalSendSlabPool();
+  auto& slab_pool = dingofs::cache::GetGlobalRecvSlabPool();
   auto* buffer = slab_pool.Alloc(attachment_size);
   if (buffer == nullptr) {
     OnError(cntl, ErrorCode::NoMem, "alloc request attachment buffer failed");
@@ -284,7 +284,7 @@ void ServerSession::ReadRequestAttachment(Controller* cntl) {
   IOBuffer attachment;
   attachment.AppendUserDataWithMeta(
       buffer->data, attachment_size,
-      [buffer](void*) { dingofs::cache::GetGlobalSendSlabPool().Free(buffer); },
+      [buffer](void*) { dingofs::cache::GetGlobalRecvSlabPool().Free(buffer); },
       buffer->meta);
   cntl->request_attachment() = std::move(attachment);
 }

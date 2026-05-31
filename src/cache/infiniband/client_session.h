@@ -64,13 +64,15 @@ class ClientSession : public EventHandler {
 
   void SendRequest(Controller* cntl, std::string_view service_name,
                    std::string_view method_name,
-                   const google::protobuf::Message& request);
+                   const google::protobuf::Message& request,
+                   RdmaBuffer* send_buffer);
   void OnResponseReceived(const WorkCompletion& wc, RdmaBuffer* buffer);
   void ParseResponse(Controller* cntl, RdmaBuffer* buffer);
   void OnError(Controller* cntl, pb::infiniband::ErrorCode error_code,
                const std::string& reason);
 
   ConnectionUPtr conn_;
+  WorkRequstContext unsignaled_send_wr_context_;
   std::vector<WorkRequstContext> recv_wr_context_;
   bthread::ExecutionQueueId<WorkCompletions> handle_wc_queue_id_;
 };

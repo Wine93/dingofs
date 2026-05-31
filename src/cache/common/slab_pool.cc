@@ -98,6 +98,12 @@ int SlabPool::IndexOf(SlabBuffer* buffer) {
   return static_cast<int>(buffer->index);
 }
 
+bool SlabPool::Contains(void* data) {
+  EnsureInitialized();
+  char* base = memory_pool_->base();
+  return data >= base && data < base + ByteSize();
+}
+
 std::vector<iovec> SlabPool::Fetch() {
   EnsureInitialized();
 

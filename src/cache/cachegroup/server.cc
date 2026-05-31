@@ -25,10 +25,11 @@
 #include <atomic>
 #include <memory>
 
-#include "cache/cachegroup/rdma_service.h"
 #include "cache/cachegroup/service.h"
-#include "cache/common/use_rdma_flag.h"
+#include "cache/common/slab_pool.h"
+#include "common/options/cache.h"
 #include "cache/infiniband/connection.h"
+#include "cache/infiniband/infiniband.h"
 #include "cache/infiniband/memory.h"
 #include "cache/infiniband/server.h"
 #include "cache/iutil/string_util.h"
@@ -47,24 +48,13 @@ DEFINE_validator(listen_ip, iutil::StringValidator);
 
 DEFINE_uint32(listen_port, 9300, "port to listen on for this cache node");
 
-DEFINE_string(rdma_device, "mlx5_0",
-              "IB device the cache RDMA server listens on (matches "
-              "Listener::Listen)");
-DEFINE_uint32(rdma_port, 1,
-              "HCA port (1-based) the cache RDMA server listens on");
+DEFINE_bool(wide_access, true,
+            "listen on 0.0.0.0 instead of --listen_ip so the cache node is "
+            "reachable by remote clients");
 
-DEFINE_uint32(rdma_server_attachment_buffer_size, 4 * 1024 * 1024,
-              "Per-buffer size of the server-side RDMA attachment pool. Must "
-              "be >= the largest block_size handled.");
-DEFINE_uint32(rdma_server_attachment_pool_size, 256,
-              "Number of buffers in the server-side RDMA attachment pool. "
-              "Bounds the in-flight RDMA Range/Cache concurrency on the "
-              "server.");
-DEFINE_bool(use_rdma, false,
-            "Enable Infiniband/RDMA transport for cache RPCs. When true, the "
-            "cache server starts an RDMA service alongside brpc, and the "
-            "client routes Range/Cache RPCs through the RDMA path. Server and "
-            "client must agree on the value for the RDMA path to be used.");
+// --use_rdma, --cache_rdma_device and --cache_rdma_port_num are defined in
+// common/options/cache.h (defined in cache_common). The server-side
+// slab pool size is --cache_rdma_server_pool_size (defined in dingo_cache.cc).
 
 static void PrintReadyInfo(const std::string& addr) {
   std::cout << "\n";
@@ -97,7 +87,7 @@ Status Server::Start() {
   InstallSignal();
 
   if (FLAGS_use_rdma) {
-    auto status = StartRDMAServer();
+    auto status = StartRdmaServer();
     if (!status.ok()) {
       LOG(ERROR) << "Fail to start RDMA server: " << status.ToString();
       return status;
@@ -105,7 +95,7 @@ Status Server::Start() {
   }
 
   std::string listen_ip = FLAGS_wide_access ? "0.0.0.0" : FLAGS_listen_ip;
-  auto status = StartRpcServer(FLAGS_listen_ip, FLAGS_listen_port);
+  auto status = StartBrpcServer(listen_ip, FLAGS_listen_port);
   if (!status.ok()) {
     LOG(ERROR) << "Fail to start rpc server at " << FLAGS_listen_ip << ":"
                << FLAGS_listen_port;
@@ -178,8 +168,8 @@ void Server::InstallSignal() { CHECK(SIG_ERR != signal(SIGPIPE, SIG_IGN)); }
 
 Status Server::StartRdmaServer() {
   infiniband::EndPoint endpoint{
-      FLAGS_rdma_device,
-      static_cast<uint8_t>(FLAGS_rdma_port),
+      FLAGS_cache_rdma_device,
+      static_cast<uint8_t>(FLAGS_cache_rdma_port_num),
   };
   infiniband::ServerOptions options{.brpc_server = brpc_server_.get()};
   auto status = rdma_server_->Start(endpoint, &options);
@@ -192,9 +182,32 @@ Status Server::StartRdmaServer() {
     return status;
   }
 
-  // LOG(INFO) << "RDMA cache service is registered on device="
-  //           << FLAGS_rdma_listen_device
-  //           << " port=" << static_cast<int>(FLAGS_rdma_listen_port_num);
+  // Register both global slab pools (send = read-out path, recv = write-in
+  // path) as RDMA memory regions, so each slab is at once the io_uring fixed
+  // buffer and the RDMA read/write buffer (full server-side zero copy). The
+  // lkey is stored in each slab's meta and consumed by ServerSession.
+  infiniband::Infiniband::Context ctx;
+  status = infiniband::Infiniband::Init(
+      FLAGS_cache_rdma_device, static_cast<uint8_t>(FLAGS_cache_rdma_port_num),
+      &ctx);
+  if (!status.ok()) {
+    return status;
+  }
+
+  for (auto* slab_pool : {&GetGlobalSendSlabPool(), &GetGlobalRecvSlabPool()}) {
+    auto region = infiniband::MemoryRegion::Register(
+        ctx.protect_domain, slab_pool->Base(), slab_pool->ByteSize());
+    if (region == nullptr) {
+      return Status::Internal("register slab pool memory region failed");
+    }
+    slab_pool->SetMeta(region->GetLkey());
+    LOG(INFO) << "RDMA slab pool registered: bytes=" << slab_pool->ByteSize()
+              << " lkey=" << region->GetLkey();
+    slab_regions_.push_back(std::move(region));
+  }
+
+  LOG(INFO) << "RDMA cache service is up on device=" << FLAGS_cache_rdma_device
+            << " port_num=" << FLAGS_cache_rdma_port_num;
   return Status::OK();
 }
 

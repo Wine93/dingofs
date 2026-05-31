@@ -28,7 +28,7 @@
 #include "cache/blockcache/block_cache.h"
 #include "cache/blockcache/cache_store.h"
 #include "cache/cachegroup/heartbeat.h"
-#include "cache/cachegroup/task_tracker.h"
+#include "cache/common/task_tracker.h"
 #include "cache/common/mds_client.h"
 #include "cache/common/storage_client.h"
 #include "cache/common/storage_client_pool.h"
@@ -45,10 +45,10 @@ class CacheNode {
 
   Status Put(BlockHandle handle, IOBuffer block);
   Status Range(BlockHandle handle, off_t offset, size_t length,
-               IOBuffer* buffer);
+               IOBuffer* buffer, size_t block_length, bool* cache_hit);
 
-  // Status AsyncCache(BlockHandle handle, IOBuffer block);
-  // Status AsyncPrefetch(BlockHandle handle, size_t length);
+  Status AsyncCache(BlockHandle handle, IOBuffer block);
+  Status AsyncPrefetch(BlockHandle handle, size_t length);
 
  private:
   bool IsRunning() const { return running_.load(std::memory_order_relaxed); }

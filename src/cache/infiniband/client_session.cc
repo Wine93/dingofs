@@ -134,12 +134,24 @@ void ClientSession::DoCall(Controller* cntl, std::string_view service_name,
                            const google::protobuf::Message& request,
                            google::protobuf::Message* response) {
   cntl->Reset();
-  cntl->request_sent().reset(1);
   cntl->response_received().reset(1);
   cntl->correlation_id() = reinterpret_cast<uint64_t>(cntl);
   cntl->response() = response;
 
-  SendRequest(cntl, service_name, method_name, request);
+  auto* send_buffer_pool = conn_->GetSendBufferPool();
+  auto* send_buffer = send_buffer_pool->Alloc();
+  if (send_buffer == nullptr) {
+    LOG(ERROR) << "Fail to send request because send buffer is exhausted";
+    OnError(cntl, ErrorCode::NoMem, "alloc send buffer failed");
+    return;
+  }
+
+  // Keep the in-band request buffer reserved until the server response arrives.
+  // A response proves the peer has consumed the SEND, so we can avoid one
+  // signaled SEND completion and one per-RPC wait on the hot Range/Cache path.
+  BRPC_SCOPE_EXIT { send_buffer_pool->Free(send_buffer); };
+
+  SendRequest(cntl, service_name, method_name, request, send_buffer);
   if (cntl->Failed()) {
     return;
   }
@@ -163,17 +175,8 @@ void ClientSession::DoCall(Controller* cntl, std::string_view service_name,
 
 void ClientSession::SendRequest(Controller* cntl, std::string_view service_name,
                                 std::string_view method_name,
-                                const google::protobuf::Message& request) {
-  auto* send_buffer_pool = conn_->GetSendBufferPool();
-  auto* send_buffer = send_buffer_pool->Alloc();
-  if (send_buffer == nullptr) {
-    LOG(ERROR) << "Fail to send request because send buffer is exhausted";
-    OnError(cntl, ErrorCode::NoMem, "alloc send buffer failed");
-    return;
-  }
-
-  BRPC_SCOPE_EXIT { send_buffer_pool->Free(send_buffer); };
-
+                                const google::protobuf::Message& request,
+                                RdmaBuffer* send_buffer) {
   auto& request_meta = cntl->request_meta();
   *request_meta.mutable_service_name() = service_name;
   *request_meta.mutable_method_name() = method_name;
@@ -190,28 +193,19 @@ void ClientSession::SendRequest(Controller* cntl, std::string_view service_name,
     return;
   }
 
-  WorkRequstContext ctx;
   SendWorkRequest wr;
   wr.addr = reinterpret_cast<uint64_t>(send_buffer->data);
   wr.length = send_buffer->length;
   wr.lkey = send_buffer->lkey;
   wr.opcode = OpCode::kSend;
-  wr.signaled = true;
-  wr.ctx = &ctx;
-  wr.ctx->on_completion = [this, cntl](const WorkCompletion& wc) {
-    if (!wc.status.ok()) {
-      OnError(cntl, ErrorCode::QueuePairError, wc.status.ToString());
-    }
-    cntl->request_sent().signal();
-  };
+  wr.signaled = false;
+  wr.ctx = &unsignaled_send_wr_context_;
 
   status = conn_->PostSendWorkRequest(wr);
   if (!status.ok()) {
     OnError(cntl, ErrorCode::QueuePairError, status.ToString());
     return;
   }
-
-  cntl->request_sent().wait();
 }
 
 void ClientSession::OnResponseReceived(const WorkCompletion& wc,

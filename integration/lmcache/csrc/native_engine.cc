@@ -17,7 +17,7 @@
 #include <utility>
 
 #include "cache/blockcache/block_cache.h"
-#include "cache/common/use_rdma_flag.h"
+#include "cache/remotecache/rdma_buffer_manager.h"
 #include "cache/remotecache/remote_block_cache.h"
 #include "common/block/block_handle.h"
 #include "common/io_buffer.h"
@@ -227,14 +227,27 @@ uint64_t NativeEngine::SubmitBatchSet(std::vector<SetItem> items) {
   FanIn* fan = queue_.NewFanIn(OpType::kSet, items.size());
   uint64_t fid = fan->future_id();
 
+  // Only stamp the rkey when the cache will actually take its RDMA path
+  // (same condition it uses to pick the transport); otherwise the meta is
+  // dead weight and the TCP path copies as usual.
+  const bool rdma_on = cache::RdmaBufferManager::GetInstance().Enabled();
+
   for (size_t i = 0; i < items.size(); ++i) {
     auto& it = items[i];
     // Zero-copy handoff from Python into IOBuffer. When this memory lives in a
-    // registered LMCache pool, RDMAPeer advertises the same addr/rkey so the
-    // server RDMA_READs it directly; otherwise RDMAPeer falls back to its
-    // registered client pool.
+    // registered LMCache pool we tag the block with its rkey, so EnsureRegistered
+    // keeps it as-is and the server RDMA_READs the arena directly; otherwise the
+    // cache layer stages it into its registered client pool (single copy).
+    uint32_t rkey = (rdma_on && rdma_registry_ != nullptr)
+                        ? rdma_registry_->RkeyFor(it.data, it.size)
+                        : 0;
     IOBuffer io;
-    io.AppendUserData(const_cast<void*>(it.data), it.size, [](void*) {});
+    if (rkey != 0) {
+      io.AppendUserDataWithMeta(const_cast<void*>(it.data), it.size,
+                                [](void*) {}, rkey);
+    } else {
+      io.AppendUserData(const_cast<void*>(it.data), it.size, [](void*) {});
+    }
 
     // AsyncCache, not AsyncPut: LMCache chunks are computed in-process and
     // have no storage-backend origin. AsyncPut would trigger server-side
@@ -277,18 +290,32 @@ uint64_t NativeEngine::SubmitBatchGet(std::vector<GetItem> items) {
   cache::RangeOption opt;
   opt.retrieve_storage = false;
 
+  // Only advertise the arena destination for the server to RDMA-write into
+  // when the cache will actually take its RDMA path (same condition it uses to
+  // pick the transport); otherwise direct_rdma_get must stay 0 so the callback
+  // copies the brpc response into dst.
+  const bool rdma_on = cache::RdmaBufferManager::GetInstance().Enabled();
+
   for (size_t i = 0; i < items.size(); ++i) {
     auto& it = items[i];
     void* dst = it.dst;
     size_t size = it.size;
-    if (rdma_registry_ != nullptr && rdma_registry_->Covers(dst, size)) {
-      (*response_bufs)[i].AppendUserData(dst, size, [](void*) {});
+    uint32_t rkey = (rdma_on && rdma_registry_ != nullptr)
+                        ? rdma_registry_->RkeyFor(dst, size)
+                        : 0;
+    if (rkey != 0) {
+      // Pre-registered destination: the server RDMA_WRITEs the block straight
+      // into the arena slice. direct_rdma_get skips the post-copy in the cb.
+      (*response_bufs)[i].AppendUserDataWithMeta(dst, size, [](void*) {}, rkey);
       (*direct_rdma_get)[i] = 1;
     }
     block_cache_->AsyncRange(
         BlockHandle(it.key), 0, size, &(*response_bufs)[i],
         [fan, i, response_bufs, direct_rdma_get, dst, size](Status s) {
           if (s.ok()) {
+            // Inert on the direct path (the buffer length is pre-set to size);
+            // still guards the TCP/pooled fallback where the response length is
+            // whatever the server returned.
             const size_t actual = (*response_bufs)[i].Size();
             if (actual != size) {
               fan->Report(i, false,
@@ -297,6 +324,8 @@ uint64_t NativeEngine::SubmitBatchGet(std::vector<GetItem> items) {
                               std::to_string(actual));
               return;
             }
+            // direct_rdma_get == 1: server already RDMA-wrote into dst (arena),
+            // no copy needed. Otherwise pull the brpc/pooled response into dst.
             if ((*direct_rdma_get)[i] == 0) {
               (*response_bufs)[i].CopyTo(static_cast<char*>(dst), size);
             }

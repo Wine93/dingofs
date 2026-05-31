@@ -15,7 +15,7 @@
 #include <string>
 #include <vector>
 
-#include "cache/infiniband/rdma_memory.h"
+#include "cache/infiniband/infiniband.h"
 
 namespace dingofs {
 namespace integration {
@@ -48,6 +48,11 @@ class RdmaMemoryRegistry {
 
   bool Covers(const void* data, std::size_t length) const;
 
+  // Returns the rkey of the registered region fully covering [p, p+n), or 0
+  // when no region covers it. 0 signals "not RDMA-registered" to callers, who
+  // then fall back to the cache client's staging pool.
+  std::uint32_t RkeyFor(const void* p, std::size_t n) const;
+
  private:
   RdmaMemoryRegistry() = default;
 
@@ -55,7 +60,7 @@ class RdmaMemoryRegistry {
 
   std::string device_name_;
   std::vector<RegisteredMemoryRegion> registered_regions_;
-  std::vector<cache::infiniband::RDMARegionUPtr> owned_regions_;
+  std::vector<cache::infiniband::MemoryRegionUPtr> owned_regions_;
 };
 
 }  // namespace lmcache

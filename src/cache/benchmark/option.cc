@@ -33,6 +33,10 @@ DEFINE_uint64(fsid, 1, "filesystem id used in block handles");
 DEFINE_uint64(ino, 0, "legacy reserved block id offset");
 DEFINE_uint64(blksize, 4194304, "block size in bytes");
 DEFINE_uint64(blocks, 1, "number of blocks per worker");
+DEFINE_uint64(warmup, 0,
+              "warmup blocks per worker, run before timing and excluded from "
+              "stats; also moves RDMA pool registration out of the timed "
+              "window so qps/bandwidth reflect steady state");
 DEFINE_uint64(start_block_id, 1, "first block slice id for this run");
 DEFINE_uint64(offset, 0, "range offset inside each block");
 DEFINE_uint64(length, 4194304, "range length per request");

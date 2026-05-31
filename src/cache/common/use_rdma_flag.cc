@@ -20,9 +20,9 @@
  * Author: Jingli Chen (Wine93)
  */
 
-#include "cache/common/use_rdma_flag.h"
-
 #include <gflags/gflags.h>
+
+#include "common/options/cache.h"
 
 namespace dingofs {
 namespace cache {
@@ -30,8 +30,15 @@ namespace cache {
 DEFINE_bool(use_rdma, false,
             "Enable Infiniband/RDMA transport for cache RPCs. When true, the "
             "cache server starts an RDMA service alongside brpc, and the "
-            "client routes Range/Cache RPCs through the RDMA path. Server and "
-            "client must agree on the value for the RDMA path to be used.");
+            "client routes Range/Cache/Put RPCs through the RDMA path. Server "
+            "and client must agree on the value for the RDMA path to be used.");
+
+// Prefixed with cache_ to avoid colliding with brpc's own --rdma_device /
+// --rdma_port flags (brpc/rdma/rdma_helper.cpp).
+DEFINE_string(cache_rdma_device, "mlx5_0",
+              "IB device used by the cache RDMA path");
+DEFINE_uint32(cache_rdma_port_num, 1,
+              "HCA port (1-based) used by the cache RDMA path");
 
 }  // namespace cache
 }  // namespace dingofs

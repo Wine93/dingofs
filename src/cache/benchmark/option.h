@@ -35,6 +35,7 @@ DECLARE_uint64(fsid);
 DECLARE_uint64(ino);
 DECLARE_uint64(blksize);
 DECLARE_uint64(blocks);
+DECLARE_uint64(warmup);
 DECLARE_uint64(start_block_id);
 DECLARE_uint64(offset);
 DECLARE_uint64(length);

@@ -33,6 +33,7 @@
 #include "cache/common/block_handle_helper.h"
 #include "cache/common/error.h"
 #include "cache/common/slab_pool.h"
+#include "cache/infiniband/controller.h"
 #include "common/io_buffer.h"
 #include "common/status.h"
 
@@ -74,10 +75,54 @@ IOBuffer BlockCacheServiceImpl::GetRequestAttachment(
     auto* cntl = static_cast<brpc::Controller*>(controller);
     return IOBuffer(cntl->request_attachment().movable());
   } else if (service_type_ == ServiceType::kRDMA) {
+    // ServerSession already RDMA-read the client's source into a slab buffer
+    // and exposed it here; just take ownership.
     auto* cntl = static_cast<infiniband::Controller*>(controller);
+    return std::move(cntl->request_attachment());
   }
 
   CHECK(false) << "Unknown service type";
+  return IOBuffer();
+}
+
+void BlockCacheServiceImpl::SetResponseAttachment(
+    google::protobuf::RpcController* controller, IOBuffer* buffer) {
+  if (service_type_ == ServiceType::kBRPC) {
+    auto* cntl = static_cast<brpc::Controller*>(controller);
+    cntl->response_attachment() = buffer->IOBuf().movable();
+  } else if (service_type_ == ServiceType::kRDMA) {
+    // ServerSession RDMA-writes this slab buffer into the client's dest buffer.
+    auto* cntl = static_cast<infiniband::Controller*>(controller);
+    cntl->response_attachment() = std::move(*buffer);
+  } else {
+    CHECK(false) << "Unknown service type";
+  }
+}
+
+Status BlockCacheServiceImpl::EnsureSlabBacked(IOBuffer* buffer) {
+  if (buffer->Size() == 0) {
+    return Status::OK();
+  }
+
+  auto& slab_pool = GetGlobalSendSlabPool();
+  if (buffer->ConstIOBuf().backing_block_num() == 1 &&
+      slab_pool.Contains(buffer->Fetch1())) {
+    return Status::OK();  // already a single slab block -> stays zero copy
+  }
+
+  const size_t length = buffer->Size();
+  auto* slab = slab_pool.Alloc(length);
+  if (slab == nullptr) {
+    return Status::CacheFull("slab pool exhausted");
+  }
+  buffer->CopyTo(static_cast<char*>(slab->data), length);
+
+  IOBuffer slab_buffer;
+  slab_buffer.AppendUserDataWithMeta(
+      slab->data, length, [slab](void*) { GetGlobalSendSlabPool().Free(slab); },
+      slab->meta);
+  *buffer = std::move(slab_buffer);
+  return Status::OK();
 }
 
 void BlockCacheServiceImpl::Put(google::protobuf::RpcController* controller,
@@ -94,13 +139,6 @@ void BlockCacheServiceImpl::Put(google::protobuf::RpcController* controller,
   response->set_status(ToPBErr(status));
 }
 
-IOBuffer BlockCacheServiceImpl::AllocIOBuffer(size_t size) {
-  auto& slab_pool = GetGlobalSendSlabPool();
-
-  IOBuffer buffer;
-  buffer.AppendUserData(, size_t size, std::function<void(void*)> deleter);
-}
-
 void BlockCacheServiceImpl::Range(google::protobuf::RpcController* controller,
                                   const pb::cache::RangeRequest* request,
                                   pb::cache::RangeResponse* response,
@@ -109,56 +147,32 @@ void BlockCacheServiceImpl::Range(google::protobuf::RpcController* controller,
   auto* srv_done = new ServiceClosure(done, request, response, status);
   brpc::ClosureGuard done_guard(srv_done);
 
+  IOBuffer buffer;
+  bool cache_hit = false;
   BlockHandle handle = FromHandlePB(request->handle());
-  // 这么要考虑前后对齐, 需要对分配点内存
-  auto buffer = AllocIOBuffer(request->offset(), request->length());
+  // On a cache hit the buffer is read straight into a slab block (zero copy);
+  // on a miss it comes from object storage as plain memory.
   status = node_->Range(handle, request->offset(), request->length(), &buffer,
                         request->block_size(), &cache_hit);
-
-  // auto* cntl = static_cast<brpc::Controller*>(controller);
-
-  // IOBuffer buffer;
-  // bool cache_hit = false;
-  // if (status.ok()) {
-  //   cntl->response_attachment() = buffer.IOBuf().movable();
-  // }
-  // response->set_status(ToPBErr(status));
-  // response->set_cache_hit(cache_hit);
+  if (status.ok() && service_type_ == ServiceType::kRDMA) {
+    status = EnsureSlabBacked(&buffer);
+  }
+  if (status.ok()) {
+    SetResponseAttachment(controller, &buffer);
+  }
+  response->set_status(ToPBErr(status));
+  response->set_cache_hit(cache_hit);
 }
-
-// void BlockCacheServiceImpl::Range(google::protobuf::RpcController*
-// controller,
-//                                   const pb::cache::RangeRequest* request,
-//                                   pb::cache::RangeResponse* response,
-//                                   google::protobuf::Closure* done) {
-//   Status status;
-//   auto* cntl = static_cast<brpc::Controller*>(controller);
-//   auto* srv_done = new ServiceClosure(done, request, response, status);
-//   brpc::ClosureGuard done_guard(srv_done);
-//
-//   IOBuffer buffer;
-//   bool cache_hit = false;
-//   BlockHandle handle = FromHandlePB(request->handle());
-//   status = node_->Range(handle, request->offset(), request->length(),
-//   &buffer,
-//                         request->block_size(), &cache_hit);
-//   if (status.ok()) {
-//     cntl->response_attachment() = buffer.IOBuf().movable();
-//   }
-//   response->set_status(ToPBErr(status));
-//   response->set_cache_hit(cache_hit);
-// }
 
 void BlockCacheServiceImpl::Cache(google::protobuf::RpcController* controller,
                                   const pb::cache::CacheRequest* request,
                                   pb::cache::CacheResponse* response,
                                   google::protobuf::Closure* done) {
   Status status;
-  auto* cntl = static_cast<brpc::Controller*>(controller);
   auto* srv_done = new ServiceClosure(done, request, response, status);
   brpc::ClosureGuard done_guard(srv_done);
 
-  IOBuffer buffer = IOBuffer(cntl->request_attachment().movable());
+  IOBuffer buffer = GetRequestAttachment(controller);
   status = CheckBodySize(request->block_size(), buffer.Size());
   if (status.ok()) {
     BlockHandle handle = FromHandlePB(request->handle());
@@ -168,11 +182,10 @@ void BlockCacheServiceImpl::Cache(google::protobuf::RpcController* controller,
 }
 
 void BlockCacheServiceImpl::Prefetch(
-    google::protobuf::RpcController* controller,
+    google::protobuf::RpcController* /*controller*/,
     const pb::cache::PrefetchRequest* request,
     pb::cache::PrefetchResponse* response, google::protobuf::Closure* done) {
   Status status;
-  auto* cntl = static_cast<brpc::Controller*>(controller);
   auto* srv_done = new ServiceClosure(done, request, response, status);
   brpc::ClosureGuard done_guard(srv_done);
 

@@ -31,9 +31,10 @@
 #include <glog/logging.h>
 
 #include "cache/benchmark/option.h"
-#include "cache/infiniband/rdma_memory.h"
 #include "cache/iutil/string_util.h"
+#include "cache/remotecache/rdma_buffer_manager.h"
 #include "common/block/block_handle.h"
+#include "common/options/cache.h"
 
 namespace dingofs {
 namespace cache {
@@ -121,87 +122,44 @@ IOBuffer NewBlock(uint64_t blksize) {
   return IOBuffer(pages);
 }
 
-TaskContext::~TaskContext() {
-  if (rdma_pool != nullptr) {
-    if (request_buffer != nullptr) {
-      rdma_pool->Release(request_buffer);
-      request_buffer = nullptr;
-    }
-    if (response_buffer != nullptr) {
-      rdma_pool->Release(response_buffer);
-      response_buffer = nullptr;
-    }
-  }
-}
-
 Status TaskContext::Init(uint64_t idx) {
   worker_idx = idx;
-  if (!FLAGS_bench_rdma_registered_buffers) {
+  if (!FLAGS_bench_rdma_registered_buffers || !FLAGS_use_rdma) {
     request_body = NewBlock(FLAGS_blksize);
     return Status::OK();
   }
 
-  infiniband::PoolEndPoint ep{
-      infiniband::FLAGS_dingofs_rdma_device,
-      static_cast<uint8_t>(infiniband::FLAGS_dingofs_rdma_port_num),
-  };
-  rdma_pool = infiniband::RDMAMemoryPool::Create(ep, FLAGS_blksize, 2);
-  if (rdma_pool == nullptr) {
-    return Status::Internal("create benchmark rdma memory pool failed");
+  // Registered request buffer from the shared manager (meta=rkey), so the cache
+  // layer advertises it for a zero-copy server RDMA-read on Put/Cache.
+  auto& mgr = RdmaBufferManager::GetInstance();
+  if (!mgr.Enabled()) {
+    return Status::Internal("client rdma buffer pool is unavailable");
   }
-
-  request_buffer = rdma_pool->Require();
-  response_buffer = rdma_pool->Require();
-  if (request_buffer == nullptr || response_buffer == nullptr) {
-    return Status::Internal("benchmark rdma memory pool exhausted");
+  request_body = mgr.NewBuffer(FLAGS_blksize);
+  if (request_body.Size() == 0) {
+    return Status::Internal("alloc client rdma buffer failed");
   }
-
-  request_buffer->length = static_cast<uint32_t>(FLAGS_blksize);
-  response_buffer->length = static_cast<uint32_t>(FLAGS_blksize);
-  FillPattern(request_buffer->data, FLAGS_blksize, worker_idx);
-  std::memset(response_buffer->data, 0, FLAGS_blksize);
-
-  request_body.AppendUserData(request_buffer->data, FLAGS_blksize,
-                              [](void*) {});
-  response_body.AppendUserData(response_buffer->data, FLAGS_blksize,
-                               [](void*) {});
+  FillPattern(request_body.Fetch1(), FLAGS_blksize, worker_idx);
   return Status::OK();
-}
-
-IOBuffer* TaskContext::PreparedResponseBody() {
-  if (!FLAGS_bench_rdma_registered_buffers) {
-    return nullptr;
-  }
-  if (FLAGS_offset != 0 || FLAGS_length != FLAGS_blksize) {
-    return nullptr;
-  }
-  return &response_body;
 }
 
 bool TaskContext::VerifyRange(const IOBuffer& buffer, uint64_t length) const {
   if (FLAGS_verify == "none") {
     return true;
   }
-
-  char* data = nullptr;
-  if (FLAGS_bench_rdma_registered_buffers && response_buffer != nullptr &&
-      FLAGS_offset == 0 && FLAGS_length == FLAGS_blksize) {
-    data = response_buffer->data;
+  if (buffer.Size() < length) {
+    return false;
   }
 
+  char* data = nullptr;
   std::vector<char> copied;
-  if (data == nullptr) {
-    if (buffer.Size() < length) {
-      return false;
-    }
-    auto iovs = buffer.Fetch();
-    if (iovs.size() == 1) {
-      data = static_cast<char*>(iovs[0].iov_base);
-    } else {
-      copied.resize(length);
-      buffer.CopyTo(copied.data(), length);
-      data = copied.data();
-    }
+  auto iovs = buffer.Fetch();
+  if (iovs.size() == 1) {
+    data = static_cast<char*>(iovs[0].iov_base);
+  } else {
+    copied.resize(length);
+    buffer.CopyTo(copied.data(), length);
+    data = copied.data();
   }
 
   if (FLAGS_verify == "markers") {
@@ -269,13 +227,8 @@ TaskResult RangeTaskFactory::RangeAll(const BlockKey& key,
   uint64_t remaining = FLAGS_blksize - FLAGS_offset;
   while (remaining > 0) {
     size_t length = std::min<uint64_t>(remaining, FLAGS_length);
-    IOBuffer local_buffer;
-    IOBuffer* out = context->PreparedResponseBody();
-    if (out == nullptr) {
-      out = &local_buffer;
-    }
-
-    auto status = Range(key, offset, length, out);
+    IOBuffer out;
+    auto status = Range(key, offset, length, &out);
     if (!status.ok()) {
       return TaskResult{status, done};
     }
@@ -283,15 +236,10 @@ TaskResult RangeTaskFactory::RangeAll(const BlockKey& key,
     offset += length;
     remaining -= length;
     done += length;
-    if (out != context->PreparedResponseBody()) {
-      buffer.Append(out);
-    }
+    buffer.Append(&out);
   }
 
-  const IOBuffer& verify_buffer =
-      context->PreparedResponseBody() != nullptr ? *context->PreparedResponseBody()
-                                                 : buffer;
-  if (!context->VerifyRange(verify_buffer, done)) {
+  if (!context->VerifyRange(buffer, done)) {
     return TaskResult{Status::Internal("range verification failed"), done};
   }
   return TaskResult{Status::OK(), done};

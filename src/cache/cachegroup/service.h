@@ -78,7 +78,12 @@ class BlockCacheServiceImpl final : public pb::cache::BlockCacheService {
   }
 
   IOBuffer GetRequestAttachment(google::protobuf::RpcController* controller);
-  void SetResponseAttachment();
+  void SetResponseAttachment(google::protobuf::RpcController* controller,
+                             IOBuffer* buffer);
+  // Ensures `buffer` is a single slab-backed block so the RDMA path can write
+  // it in one shot; copies into a slab buffer only when it is not already (e.g.
+  // a cache miss served from object storage). A no-op for cache hits.
+  Status EnsureSlabBacked(IOBuffer* buffer);
 
   ServiceType service_type_;
   CacheNode* node_;

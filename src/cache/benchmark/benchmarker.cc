@@ -80,8 +80,14 @@ void Benchmarker::RunUntilFinish() {
 }
 
 void Benchmarker::StartAll() {
-  StartReporter();
+  // Launch workers; they init + warmup, then block on `go_`.
   StartWorkers();
+  // Wait until every worker is warm (pool registered, QPs primed), then start
+  // the wall clock and release the measured phase — so qps/bandwidth exclude
+  // one-time setup and reflect steady state.
+  warmed_.wait();
+  StartReporter();
+  go_.signal();
 }
 
 void Benchmarker::StopAll() {
@@ -119,8 +125,11 @@ void Benchmarker::InitFactory() {
 
 void Benchmarker::InitWorkers() {
   CHECK_EQ(thread_pool_->Start(FLAGS_threads), 0);
+  warmed_.reset(FLAGS_threads);
+  go_.reset(1);
   for (auto i = 0; i < FLAGS_threads; i++) {
-    workers_.emplace_back(std::make_unique<Worker>(i, factory_, collector_));
+    workers_.emplace_back(
+        std::make_unique<Worker>(i, factory_, collector_, &warmed_, &go_));
   }
 }
 

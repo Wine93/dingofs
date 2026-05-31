@@ -21,8 +21,8 @@ build/bin/cache-bench \
   --cache_group=group-1 \
   --mds_addrs=10.220.88.31:6900 \
   --use_rdma=true \
-  --dingofs_rdma_device=mlx5_0 \
-  --dingofs_rdma_port_num=1 \
+  --cache_rdma_device=mlx5_0 \
+  --cache_rdma_port_num=1 \
   --bench_rdma_registered_buffers=true \
   --op=range \
   --retrive=false \
@@ -44,17 +44,17 @@ Operations:
 - `put`: write-completion path. With RDMA, the server performs RDMA_READ and
   then writes the block through the stage path before returning.
 - `range`: read path. Use `--retrive=false` for cache-hit-only measurement.
-  With registered buffers and full-block reads, the client advertises a
-  prepared response buffer and the server RDMA_WRITEs directly into it.
+  The client advertises a pooled RDMA buffer and the server RDMA_WRITEs the
+  block directly into it (zero copy on a cache hit).
 
 Important flags:
 
 - `--bench_remote_only=true`: required for this benchmark client.
 - `--start_block_id=N`: first slice id for the run. Use a different value per
   case to avoid old data pollution.
-- `--bench_rdma_registered_buffers=true`: each worker uses contiguous
-  RDMA-registered request/response buffers, enabling the cache RDMA path to
-  avoid client-side bounce copies.
+- `--bench_rdma_registered_buffers=true`: each worker's request block comes
+  from the shared RDMA-registered client pool, enabling a zero-copy server
+  RDMA_READ for put/cache (range destinations are always pooled buffers).
 - `--json_result=true --result_path=...`: emit attempts, success/fail, qps,
   MiB/s, and min/mean/p50/p90/p99/max latency in microseconds.
 

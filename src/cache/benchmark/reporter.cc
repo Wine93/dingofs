@@ -30,7 +30,7 @@
 #include <sstream>
 
 #include "cache/benchmark/option.h"
-#include "cache/common/use_rdma_flag.h"
+#include "common/options/cache.h"
 #include "common/options/cache.h"
 #include "utils/executor/bthread/bthread_executor.h"
 

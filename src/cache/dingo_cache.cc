@@ -22,6 +22,8 @@
 
 #include "cache/dingo_cache.h"
 
+#include <gflags/gflags.h>
+
 #include <iostream>
 
 #include "cache/cachegroup/server.h"
@@ -37,6 +39,13 @@
 
 namespace dingofs {
 namespace cache {
+
+// Number of 4MiB buffers in the global slab pool. The slab pool backs both the
+// io_uring fixed buffers (disk IO) and, when --use_rdma is set, the RDMA
+// read/write attachments. It therefore bounds the in-flight disk + RDMA
+// concurrency on the server.
+DEFINE_uint32(cache_rdma_server_pool_size, 2048,
+              "number of 4MiB buffers in the global server slab pool");
 
 static dingofs::FlagExtraInfo extras = {
     .program = "dingo-cache",
@@ -100,7 +109,7 @@ int DingoCache::ParseFlags(int argc, char** argv) {
 }
 
 void DingoCache::GlobalInitOrDie() {
-  InitializeGlobalSlabPool();
+  InitializeGlobalSlabPool(FLAGS_cache_rdma_server_pool_size);
   Logger::Init("dingo-cache");
   LOG(INFO) << GenCurrentFlags();
 }

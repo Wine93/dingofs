@@ -27,9 +27,9 @@
 
 #include <csignal>
 #include <memory>
+#include <vector>
 
 #include "cache/cachegroup/node.h"
-#include "cache/cachegroup/rdma_service.h"
 #include "cache/infiniband/memory.h"
 #include "cache/infiniband/server.h"
 #include "dingofs/blockcache.pb.h"
@@ -57,6 +57,9 @@ class Server {
   std::unique_ptr<pb::cache::BlockCacheService> rdma_service_;
   std::unique_ptr<brpc::Server> brpc_server_;
   std::unique_ptr<infiniband::Server> rdma_server_;
+  // RDMA registrations of the global send + recv slab pools; kept alive for the
+  // whole server lifetime (deregister on destruction).
+  std::vector<infiniband::MemoryRegionUPtr> slab_regions_;
 };
 
 }  // namespace cache

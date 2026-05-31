@@ -30,11 +30,14 @@
 namespace dingofs {
 namespace cache {
 
-Worker::Worker(uint64_t idx, TaskFactorySPtr factory, CollectorSPtr collector)
+Worker::Worker(uint64_t idx, TaskFactorySPtr factory, CollectorSPtr collector,
+               bthread::CountdownEvent* warmed, bthread::CountdownEvent* go)
     : idx_(idx),
       factory_(factory),
       collector_(collector),
-      finished_(1) {}
+      finished_(1),
+      warmed_(warmed),
+      go_(go) {}
 
 void Worker::Start() {
   auto status = context_.Init(idx_);
@@ -45,15 +48,34 @@ void Worker::Start() {
       stat->Add(0, 0, false);
       total->Add(0, 0, false);
     });
+    warmed_->signal();  // release the barrier so the benchmarker doesn't hang
     finished_.signal();
     return;
   }
+
+  RunWarmup();        // init + warmup happen before the wall clock starts
+  warmed_->signal();  // this worker is warm
+  go_->wait();        // wait until all workers are warm and timing has begun
 
   ExecAllTasks();
   finished_.signal();
 }
 
 void Worker::Shutdown() { finished_.wait(); }
+
+void Worker::RunWarmup() {
+  if (FLAGS_warmup == 0) {
+    return;
+  }
+  BlockKeyIterator iter(idx_, FLAGS_blksize, FLAGS_blocks);
+  uint64_t done = 0;
+  while (done < FLAGS_warmup) {
+    for (iter.SeekToFirst(); iter.Valid() && done < FLAGS_warmup; iter.Next()) {
+      factory_->GenTask(iter.Key(), &context_)();  // untimed, not collected
+      ++done;
+    }
+  }
+}
 
 void Worker::ExecAllTasks() {
   BlockKeyIterator iter(idx_, FLAGS_blksize, FLAGS_blocks);

@@ -114,10 +114,9 @@ start_remote_node() {
     numactl --cpunodebind=0 --membind=0 \
     '$DEPLOY_DIR/dingo-cache' --conf '$REMOTE_RESULT_DIR/node.conf' \
       --use_rdma=${USE_RDMA} \
-      --rdma_listen_device='${RDMA_DEVICE}' \
-      --rdma_listen_port_num='${RDMA_PORT_NUM}' \
-      --rdma_server_attachment_buffer_size='${SERVER_POOL_BUFFER_SIZE}' \
-      --rdma_server_attachment_pool_size='${SERVER_POOL_SIZE}' \
+      --cache_rdma_device='${RDMA_DEVICE}' \
+      --cache_rdma_port_num='${RDMA_PORT_NUM}' \
+      --cache_rdma_server_pool_size='${SERVER_POOL_SIZE}' \
     < /dev/null > '$REMOTE_RESULT_DIR/dingo-cache.stdout' 2> '$REMOTE_RESULT_DIR/dingo-cache.stderr'"
 }
 
@@ -184,10 +183,10 @@ client_common_flags() {
     --mds_addrs="$MDS_ADDRS" \
     --fsid="$FSID" \
     --use_rdma="$USE_RDMA" \
-    --dingofs_rdma_device="$RDMA_DEVICE" \
-    --dingofs_rdma_port_num="$RDMA_PORT_NUM" \
-    --rdma_client_pool_size="$CLIENT_POOL_SIZE" \
-    --rdma_client_pool_buffer_size="$size" \
+    --cache_rdma_device="$RDMA_DEVICE" \
+    --cache_rdma_port_num="$RDMA_PORT_NUM" \
+    --cache_rdma_client_pool_size="$CLIENT_POOL_SIZE" \
+    --cache_rdma_client_pool_buffer_size="$size" \
     --bench_rdma_registered_buffers="$REGISTERED_BUFFERS" \
     --blksize="$size" \
     --offset=0 \
