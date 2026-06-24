@@ -50,7 +50,7 @@ struct ServiceClosure : public google::protobuf::Closure {
   void Run() override {
     std::unique_ptr<ServiceClosure<T, U>> self_guard(this);
 
-    if (response->status() != pb::cache::BlockCacheOk) {
+    if (response->status().errcode() != pb::error::OK) {
       LOG(ERROR) << "Fail to process rpc request="
                  << request->ShortDebugString()
                  << ", response=" << response->ShortDebugString();
@@ -115,7 +115,7 @@ void BlockCacheServiceImpl::Put(google::protobuf::RpcController* controller,
   BlockHandle handle = FromHandlePB(request->handle());
   IOBuffer block = GetRequestAttachment(controller);
   status = node_->Put(std::move(handle), std::move(block));
-  response->set_status(ToPBErr(status));
+  StatusToPB(status, response->mutable_status());
 }
 
 void BlockCacheServiceImpl::Range(google::protobuf::RpcController* controller,
@@ -132,7 +132,7 @@ void BlockCacheServiceImpl::Range(google::protobuf::RpcController* controller,
   status = node_->Range(handle, request->offset(), request->length(), &buffer,
                         request->block_size(), &cache_hit);
 
-  response->set_status(ToPBErr(status));
+  StatusToPB(status, response->mutable_status());
   response->set_cache_hit(cache_hit);
   if (status.ok()) {
     SetResponseAttachment(controller, &buffer);
@@ -153,7 +153,7 @@ void BlockCacheServiceImpl::Cache(google::protobuf::RpcController* controller,
     BlockHandle handle = FromHandlePB(request->handle());
     status = node_->AsyncCache(std::move(handle), std::move(buffer));
   }
-  response->set_status(ToPBErr(status));
+  StatusToPB(status, response->mutable_status());
 }
 
 void BlockCacheServiceImpl::Prefetch(
@@ -166,7 +166,7 @@ void BlockCacheServiceImpl::Prefetch(
 
   BlockHandle handle = FromHandlePB(request->handle());
   status = node_->AsyncPrefetch(handle, request->block_size());
-  response->set_status(ToPBErr(status));
+  StatusToPB(status, response->mutable_status());
 }
 
 void BlockCacheServiceImpl::Ping(

@@ -69,7 +69,7 @@ Status MDSClientImpl::Start() {
 
   if (!mds_discovery_.Init()) {
     LOG(ERROR) << "Fail to init MDSDiscovery";
-    return Status::Internal("init mds discovery failed");
+    return Status(pb::error::ENOT_CAN_CONNECTED, "init mds discovery failed");
   }
 
   LOG(INFO) << "MDSClientImpl is up";
@@ -280,7 +280,7 @@ Status MDSClientImpl::SendRequest(const std::string& service_name,
     old_mds = mds;
   }
 
-  return Status::Internal("send rpc request fail");
+  return Status(pb::error::ECACHE_NET_ERROR, "send rpc request fail");
 }
 
 std::ostream& operator<<(std::ostream& os, const CacheGroupMember& member) {

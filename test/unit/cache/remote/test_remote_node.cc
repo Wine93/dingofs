@@ -135,7 +135,7 @@ TEST_F(RemoteNodeTest, SendPutReturnsNetErrorWhenConnectedRpcFails) {
   node.Shutdown();
 }
 
-TEST_F(RemoteNodeTest, SendRangeRetriesThenReturnsInternalWhenRpcKeepsFailing) {
+TEST_F(RemoteNodeTest, SendRangeRetriesThenReturnsNetErrorWhenRpcKeepsFailing) {
   RemoteNode node("20f2fc27-2f29-4975-8d08-836ec63b8f93", "127.0.0.1", 9, 10);
   ASSERT_TRUE(node.Start().ok());
 
@@ -144,7 +144,7 @@ TEST_F(RemoteNodeTest, SendRangeRetriesThenReturnsInternalWhenRpcKeepsFailing) {
       node.SendRequest<pb::cache::RangeRequest, pb::cache::RangeResponse>(
           request);
 
-  EXPECT_TRUE(response.status.IsInternal());
+  EXPECT_TRUE(response.status.IsNetError());
   node.Shutdown();
 }
 

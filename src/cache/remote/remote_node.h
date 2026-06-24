@@ -141,7 +141,7 @@ Response<U> RemoteNode::SendRequest(const Request<T>& request) {
     }
 
     // response status is ok
-    response.status = ToStatus(response.raw.status());
+    response.status = PBToStatus(response.raw.status());
     if (!response.status.ok()) {
       LOG(ERROR) << "Fail to send " << request << " to " << EndPoint()
                  << ", because receive " << response;
@@ -156,7 +156,8 @@ Response<U> RemoteNode::SendRequest(const Request<T>& request) {
              << FLAGS_cache_rpc_max_retry_times << ", tooks "
              << std::setprecision(6) << timer.u_elapsed(0) / 1e6 << " seconds";
 
-  response.status = Status::Internal("rpc exceed max retry times");
+  response.status =
+      Status(pb::error::ECACHE_NET_ERROR, "rpc exceed max retry times");
   return response;
 }
 

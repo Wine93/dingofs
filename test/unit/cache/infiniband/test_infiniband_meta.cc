@@ -65,7 +65,7 @@ TEST(ConnManagementMetaTest, ParseRejectsBadGidSize) {
   pb.set_gid("too-short");  // not sizeof(ibv_gid)
 
   ConnManagementMeta out;
-  EXPECT_TRUE(ParseFromPb(pb, &out).IsInternal());
+  EXPECT_TRUE(ParseFromPb(pb, &out).IsInvalidParam());
 }
 
 }  // namespace infiniband

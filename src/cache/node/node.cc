@@ -159,7 +159,7 @@ Status CacheNode::JoinGroup() {
                                   FLAGS_group_name, FLAGS_group_weight);
   if (!status.ok()) {
     LOG(ERROR) << "Fail to send JoinCacheGroup rpc request";
-    return Status::Internal("join cache group failed");
+    return status;
   }
 
   LOG(INFO) << "Successfully join " << *this
@@ -174,7 +174,7 @@ Status CacheNode::LeaveGroup() {
       FLAGS_id, FLAGS_listen_ip, FLAGS_listen_port, FLAGS_group_name);
   if (!status.ok()) {
     LOG(ERROR) << "Fail to send LeaveCacheGroup rpc request";
-    return Status::Internal("leave cache group failed");
+    return status;
   }
 
   LOG(INFO) << "Successfully leave " << *this
@@ -370,7 +370,7 @@ Status CacheNode::WaitTask(DownloadTaskSPtr task) {
   LOG(WARNING) << "Wait " << task
                << " timeout=" << FLAGS_retrieve_storage_lock_timeout_ms
                << " ms";
-  return Status::Internal("wait download task timeout");
+  return Status(pb::error::ETIMEOUT, "wait download task timeout");
 }
 
 void CacheNode::AllocSlabBuffer(IOBuffer* buffer, size_t length) {

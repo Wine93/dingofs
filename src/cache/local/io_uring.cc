@@ -117,7 +117,7 @@ Status IOUring::InitIOUring() {
   int rc = io_uring_queue_init(options_.entries, &io_uring_, flags);
   if (rc != 0) {
     LOG(ERROR) << "Fail to init io_uring queue: " << strerror(-rc);
-    return Status::Internal("init io_uring failed");
+    return Status(pb::error::ECACHE_IO_ERROR, "init io_uring failed");
   }
   return Status::OK();
 }
@@ -131,7 +131,7 @@ Status IOUring::RegisterBuffers() {
                                      fixed_buffers_.size());
   if (rc < 0) {
     LOG(ERROR) << "Fail to register buffers: " << strerror(-rc);
-    return Status::Internal("register buffers failed");
+    return Status(pb::error::ECACHE_IO_ERROR, "register buffers failed");
   }
   return Status::OK();
 }
@@ -140,7 +140,7 @@ Status IOUring::SetupEpoll() {
   epoll_fd_ = epoll_create1(0);
   if (epoll_fd_ < 0) {
     PLOG(ERROR) << "Fail to create epoll";
-    return Status::Internal("create epoll failed");
+    return Status(pb::error::ECACHE_IO_ERROR, "create epoll failed");
   }
 
   struct epoll_event ev;
@@ -149,7 +149,7 @@ Status IOUring::SetupEpoll() {
   int rc = epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, io_uring_.ring_fd, &ev);
   if (rc != 0) {
     PLOG(ERROR) << "Fail to add epoll event";
-    return Status::Internal("add epoll event failed");
+    return Status(pb::error::ECACHE_IO_ERROR, "add epoll event failed");
   }
   return Status::OK();
 }
@@ -209,7 +209,7 @@ Status IOUring::SubmitIO() {
   int n = io_uring_submit(&io_uring_);
   if (n < 0) {
     LOG(ERROR) << "Fail to submit io: " << strerror(-n);
-    return Status::Internal("submit io failed");
+    return Status(pb::error::ECACHE_IO_ERROR, "submit io failed");
   }
   return Status::OK();
 }

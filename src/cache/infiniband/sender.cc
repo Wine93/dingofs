@@ -112,7 +112,8 @@ Status ResponseSender::CheckAttachment(const IOBuffer& src,
     return Status::InvalidParam(
         "response attachment exceeds advertised rdma length");
   } else if (dest.addr == 0 || dest.rkey == 0) {
-    return Status::Internal("response rdma memory context is missing");
+    return Status(pb::error::EILLEGAL_PARAMTETER,
+                  "response rdma memory context is missing");
   }
   return Status::OK();
 }

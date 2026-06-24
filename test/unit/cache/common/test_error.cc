@@ -22,6 +22,9 @@
 
 #include <gtest/gtest.h>
 
+#include <utility>
+#include <vector>
+
 #include "cache/common/error.h"
 
 namespace dingofs {
@@ -29,105 +32,161 @@ namespace cache {
 
 class ErrorTest : public ::testing::Test {};
 
-TEST_F(ErrorTest, ToPBErr) {
-  EXPECT_EQ(ToPBErr(Status::OK()), pb::cache::BlockCacheOk);
-  EXPECT_EQ(ToPBErr(Status::InvalidParam("")),
-            pb::cache::BlockCacheErrInvalidParam);
-  EXPECT_EQ(ToPBErr(Status::NotFound("")), pb::cache::BlockCacheErrNotFound);
-  EXPECT_EQ(ToPBErr(Status::Internal("")), pb::cache::BlockCacheErrFailure);
-  EXPECT_EQ(ToPBErr(Status::IoError("")), pb::cache::BlockCacheErrIOError);
-  EXPECT_EQ(ToPBErr(Status::Exist("")), pb::cache::BlockCacheErrUnknown);
-}
+// Each named constructor fills errno_ with its dingofs.pb.error.Errno, and
+// StatusToPB writes that errno_ to the wire. This pins down the
+// classification -> wire-code mapping for every status the cache can produce.
+TEST_F(ErrorTest, StatusToPB) {
+  std::vector<std::pair<Status, pb::error::Errno>> cases = {
+      {Status::OK(), pb::error::OK},
+      {Status::Internal("m"), pb::error::EINTERNAL},
+      {Status::Unknown("m"), pb::error::ECACHE_UNKNOWN},
+      {Status::Exist("m"), pb::error::EEXISTED},
+      {Status::NotExist("m"), pb::error::ECACHE_NOT_EXIST},
+      {Status::NoSpace("m"), pb::error::ECACHE_NO_SPACE},
+      {Status::BadFd("m"), pb::error::ECACHE_BAD_FD},
+      {Status::InvalidParam("m"), pb::error::EILLEGAL_PARAMTETER},
+      {Status::NoPermission("m"), pb::error::ENO_PERMISSION},
+      {Status::NotEmpty("m"), pb::error::ENOT_EMPTY},
+      {Status::NoFlush("m"), pb::error::ECACHE_NO_FLUSH},
+      {Status::NotSupport("m"), pb::error::ENOT_SUPPORT},
+      {Status::NameTooLong("m"), pb::error::ECACHE_NAME_TOO_LONG},
+      {Status::MountPointExist("m"), pb::error::ECACHE_MOUNTPOINT_EXIST},
+      {Status::MountFailed("m"), pb::error::ECACHE_MOUNT_FAILED},
+      {Status::OutOfRange("m"), pb::error::EOUT_OF_RANGE},
+      {Status::NoData("m"), pb::error::ENO_DATA},
+      {Status::IoError("m"), pb::error::ECACHE_IO_ERROR},
+      {Status::Stale("m"), pb::error::ECACHE_STALE},
+      {Status::NoSys("m"), pb::error::ECACHE_NO_SYS},
+      {Status::NoPermitted("m"), pb::error::ECACHE_NO_PERMITTED},
+      {Status::NetError("m"), pb::error::ECACHE_NET_ERROR},
+      {Status::NotFound("m"), pb::error::ENOT_FOUND},
+      {Status::NotDirectory("m"), pb::error::ECACHE_NOT_DIRECTORY},
+      {Status::FileTooLarge("m"), pb::error::ECACHE_FILE_TOO_LARGE},
+      {Status::EndOfFile("m"), pb::error::ECACHE_END_OF_FILE},
+      {Status::Abort("m"), pb::error::ECACHE_ABORT},
+      {Status::CacheDown("m"), pb::error::ECACHE_DOWN},
+      {Status::CacheUnhealthy("m"), pb::error::ECACHE_UNHEALTHY},
+      {Status::CacheFull("m"), pb::error::ECACHE_FULL},
+      {Status::Stop("m"), pb::error::ECACHE_STOP},
+      {Status::NotFit("m"), pb::error::ECACHE_NOT_FIT},
+      {Status::Timeout("m"), pb::error::ETIMEOUT},
+      {Status::OutOfMemory("m"), pb::error::ECACHE_OUT_OF_MEMORY},
+  };
 
-TEST_F(ErrorTest, ToStatus) {
-  EXPECT_TRUE(ToStatus(pb::cache::BlockCacheOk).ok());
-  EXPECT_TRUE(ToStatus(pb::cache::BlockCacheErrInvalidParam).IsInvalidParam());
-  EXPECT_TRUE(ToStatus(pb::cache::BlockCacheErrNotFound).IsNotFound());
-  EXPECT_TRUE(ToStatus(pb::cache::BlockCacheErrFailure).IsInternal());
-  EXPECT_TRUE(ToStatus(pb::cache::BlockCacheErrIOError).IsIoError());
-  EXPECT_TRUE(ToStatus(pb::cache::BlockCacheErrUnknown).IsInternal());
-}
-
-TEST_F(ErrorTest, RoundTrip) {
-  {
-    Status original = Status::OK();
-    auto pb_err = ToPBErr(original);
-    Status converted = ToStatus(pb_err);
-    EXPECT_TRUE(converted.ok());
+  for (const auto& [status, want] : cases) {
+    pb::error::Error pb;
+    StatusToPB(status, &pb);
+    EXPECT_EQ(pb.errcode(), want) << "status=" << status.ToString();
   }
+}
 
-  {
-    Status original = Status::NotFound("test");
-    auto pb_err = ToPBErr(original);
-    Status converted = ToStatus(pb_err);
-    EXPECT_TRUE(converted.IsNotFound());
+TEST_F(ErrorTest, PBToStatus) {
+  auto from = [](pb::error::Errno code) {
+    pb::error::Error pb;
+    pb.set_errcode(code);
+    return PBToStatus(pb);
+  };
+
+  EXPECT_TRUE(from(pb::error::OK).ok());
+  EXPECT_TRUE(from(pb::error::EINTERNAL).IsInternal());
+  EXPECT_TRUE(from(pb::error::ENOT_FOUND).IsNotFound());
+  EXPECT_TRUE(from(pb::error::ECACHE_IO_ERROR).IsIoError());
+  EXPECT_TRUE(from(pb::error::ECACHE_DOWN).IsCacheDown());
+
+  // A code with no Status equivalent reconstructs gracefully: not ok, falls
+  // back to a coarse Internal, but the raw wire code is preserved in errno_.
+  Status unknown = from(static_cast<pb::error::Errno>(99999));
+  EXPECT_FALSE(unknown.ok());
+  EXPECT_TRUE(unknown.IsInternal());
+  EXPECT_EQ(unknown.Errno(), 99999);
+}
+
+// The primary way to raise a precise error: Status(pb::error::Errno, msg). The
+// exact code lands in errno_, the coarse Code is derived so Is##Name() /
+// ToSysErrNo() keep working.
+TEST_F(ErrorTest, ConstructFromPBErrno) {
+  Status io(pb::error::ECACHE_IO_ERROR, "disk read failed");
+  EXPECT_FALSE(io.ok());
+  EXPECT_TRUE(io.IsIoError());
+  EXPECT_EQ(io.Errno(), pb::error::ECACHE_IO_ERROR);
+  EXPECT_NE(io.ToString().find("disk read failed"), std::string::npos);
+
+  // A code mapping to a shared (non-cache) classification still works.
+  Status nf(pb::error::ENOT_FOUND, "block missing");
+  EXPECT_TRUE(nf.IsNotFound());
+  EXPECT_EQ(nf.Errno(), pb::error::ENOT_FOUND);
+
+  // An errcode with no cache classification: exact code preserved in errno_,
+  // coarse Code falls back to Internal.
+  Status other(pb::error::EBUSYING, "busy");
+  EXPECT_TRUE(other.IsInternal());
+  EXPECT_EQ(other.Errno(), pb::error::EBUSYING);
+
+  // The generic ctor and the named shortcut agree for the same code.
+  EXPECT_TRUE(Status(pb::error::EINTERNAL, "x").IsInternal());
+}
+
+TEST_F(ErrorTest, ErrmsgPassthrough) {
+  pb::error::Error pb;
+  StatusToPB(Status::IoError("disk read failed"), &pb);
+  EXPECT_NE(pb.errmsg().find("disk read failed"), std::string::npos);
+
+  Status status = PBToStatus(pb);
+  EXPECT_TRUE(status.IsIoError());
+  EXPECT_NE(status.ToString().find("disk read failed"), std::string::npos);
+}
+
+// Every Status code must survive a Status -> Error -> Status round-trip.
+TEST_F(ErrorTest, RoundTripPreservesAllCodes) {
+  std::vector<Status> all = {
+      Status::OK(),
+      Status::Internal("m"),
+      Status::Unknown("m"),
+      Status::Exist("m"),
+      Status::NotExist("m"),
+      Status::NoSpace("m"),
+      Status::BadFd("m"),
+      Status::InvalidParam("m"),
+      Status::NoPermission("m"),
+      Status::NotEmpty("m"),
+      Status::NoFlush("m"),
+      Status::NotSupport("m"),
+      Status::NameTooLong("m"),
+      Status::MountPointExist("m"),
+      Status::MountFailed("m"),
+      Status::OutOfRange("m"),
+      Status::NoData("m"),
+      Status::IoError("m"),
+      Status::Stale("m"),
+      Status::NoSys("m"),
+      Status::NoPermitted("m"),
+      Status::NetError("m"),
+      Status::NotFound("m"),
+      Status::NotDirectory("m"),
+      Status::FileTooLarge("m"),
+      Status::EndOfFile("m"),
+      Status::Abort("m"),
+      Status::CacheDown("m"),
+      Status::CacheUnhealthy("m"),
+      Status::CacheFull("m"),
+      Status::Stop("m"),
+      Status::NotFit("m"),
+      Status::Timeout("m"),
+      Status::OutOfMemory("m"),
+  };
+
+  for (const auto& original : all) {
+    pb::error::Error pb;
+    StatusToPB(original, &pb);
+    Status converted = PBToStatus(pb);
+    EXPECT_TRUE(original == converted)
+        << "original=" << original.ToString()
+        << ", converted=" << converted.ToString();
+    // The precise wire code survives too, not just the coarse classification.
+    EXPECT_EQ(original.Errno(), converted.Errno())
+        << "original=" << original.ToString()
+        << ", converted=" << converted.ToString();
   }
-
-  {
-    Status original = Status::IoError("test");
-    auto pb_err = ToPBErr(original);
-    Status converted = ToStatus(pb_err);
-    EXPECT_TRUE(converted.IsIoError());
-  }
-
-  {
-    Status original = Status::Internal("test");
-    auto pb_err = ToPBErr(original);
-    Status converted = ToStatus(pb_err);
-    EXPECT_TRUE(converted.IsInternal());
-  }
-}
-
-TEST_F(ErrorTest, ToPBErrWithMessage) {
-  // Verify error messages don't affect error code mapping
-  EXPECT_EQ(ToPBErr(Status::NotFound("file not found")),
-            pb::cache::BlockCacheErrNotFound);
-  EXPECT_EQ(ToPBErr(Status::NotFound("")), pb::cache::BlockCacheErrNotFound);
-  EXPECT_EQ(ToPBErr(Status::NotFound("some long error message with details")),
-            pb::cache::BlockCacheErrNotFound);
-}
-
-TEST_F(ErrorTest, IoErrorVsInternal) {
-  // This is the bug fix verification - IoError and Internal should map
-  // differently
-  auto io_err = ToPBErr(Status::IoError("io error"));
-  auto internal_err = ToPBErr(Status::Internal("internal error"));
-
-  EXPECT_NE(io_err, internal_err);
-  EXPECT_EQ(io_err, pb::cache::BlockCacheErrIOError);
-  EXPECT_EQ(internal_err, pb::cache::BlockCacheErrFailure);
-}
-
-TEST_F(ErrorTest, UnknownErrCodeDefaultsToInternal) {
-  // An errcode outside the known enum hits the switch default.
-  EXPECT_TRUE(
-      ToStatus(static_cast<pb::cache::BlockCacheErrCode>(9999)).IsInternal());
-}
-
-TEST_F(ErrorTest, UnknownStatusTypes) {
-  // Status types not in the mapping should return Unknown
-  EXPECT_EQ(ToPBErr(Status::Exist("exists")), pb::cache::BlockCacheErrUnknown);
-  EXPECT_EQ(ToPBErr(Status::OutOfRange("range")),
-            pb::cache::BlockCacheErrUnknown);
-}
-
-TEST_F(ErrorTest, ToStatusPreservesType) {
-  // Verify ToStatus returns correct status types
-  auto ok_status = ToStatus(pb::cache::BlockCacheOk);
-  EXPECT_TRUE(ok_status.ok());
-  EXPECT_FALSE(ok_status.IsNotFound());
-  EXPECT_FALSE(ok_status.IsIoError());
-  EXPECT_FALSE(ok_status.IsInternal());
-
-  auto not_found = ToStatus(pb::cache::BlockCacheErrNotFound);
-  EXPECT_FALSE(not_found.ok());
-  EXPECT_TRUE(not_found.IsNotFound());
-  EXPECT_FALSE(not_found.IsIoError());
-
-  auto io_error = ToStatus(pb::cache::BlockCacheErrIOError);
-  EXPECT_FALSE(io_error.ok());
-  EXPECT_TRUE(io_error.IsIoError());
-  EXPECT_FALSE(io_error.IsNotFound());
 }
 
 }  // namespace cache

@@ -99,7 +99,7 @@ Status Dialer::SyncConnManagementMeta(const std::string& address,
   butil::EndPoint ep;
   if (butil::str2endpoint(address.c_str(), &ep) != 0) {
     LOG(ERROR) << "Fail to parse address=" << address;
-    return Status::Internal("str2endpoint failed");
+    return Status(pb::error::EILLEGAL_PARAMTETER, "str2endpoint failed");
   }
 
   brpc::Channel channel;
@@ -108,7 +108,7 @@ Status Dialer::SyncConnManagementMeta(const std::string& address,
   options.timeout_ms = 3000;
   if (channel.Init(ep, &options) != 0) {
     LOG(ERROR) << "Fail to init channel for address=" << address;
-    return Status::Internal("init channel failed");
+    return Status(pb::error::ECACHE_NET_ERROR, "init channel failed");
   }
 
   pb::infiniband::SyncRequest request;
@@ -146,7 +146,7 @@ Status Client::Connect(const std::string& address) {
   auto conn = dialer_->Dial(address);
   if (nullptr == conn) {
     LOG(ERROR) << "Fail to connect peer=" << address;
-    return Status::Internal("dial peer failed");
+    return Status(pb::error::ECACHE_NET_ERROR, "dial peer failed");
   }
 
   int fd = conn->GetFd();

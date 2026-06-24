@@ -176,7 +176,7 @@ Status DiskCache::LoadOrCreateLockFile() {
   } else if (uuid_.empty()) {
     LOG(ERROR) << "Load lock file success but the uuid in it is broken, file="
                << lock_path;
-    return Status::Internal("invalid disk id");
+    return Status(pb::error::EILLEGAL_PARAMTETER, "invalid disk id");
   }
 
   return status;
