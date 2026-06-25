@@ -86,7 +86,7 @@ Status EventDispatcher::Start() {
   epoll_fd_ = epoll_create1(EPOLL_CLOEXEC);
   if (epoll_fd_ < 0) {
     PLOG(ERROR) << "Fail to create epoll fd";
-    return Status::Internal("create epoll fd failed");
+    return Status(pb::error::ECACHE_RDMA_ERROR, "create epoll fd failed");
   }
 
   running_.store(true, std::memory_order_release);
@@ -138,7 +138,7 @@ Status EventDispatcher::AddEvent(int fd, EventType type,
   if (rc != 0) {
     DeleteHandler(fd);
     PLOG(ERROR) << "Fail to add event to epoll, fd=" << fd;
-    return Status::Internal("add event failed");
+    return Status(pb::error::ECACHE_RDMA_ERROR, "add event failed");
   }
   return Status::OK();
 }
@@ -148,7 +148,7 @@ Status EventDispatcher::DelEvent(int fd) {
   DeleteHandler(fd);
   if (rc != 0) {
     PLOG(ERROR) << "Fail to del event from epoll, fd=" << fd;
-    return Status::Internal("del event failed");
+    return Status(pb::error::ECACHE_RDMA_ERROR, "del event failed");
   }
   return Status::OK();
 }

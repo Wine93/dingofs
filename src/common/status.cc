@@ -50,6 +50,87 @@ Status::Status(Code code, int32_t p_errno, const StringSlice& msg,
   state_.reset(result);
 }
 
+Status::Status(pb::error::Errno code, const StringSlice& msg,
+               const StringSlice& msg2)
+    : Status(PBErrnoToCode(code), static_cast<int32_t>(code), msg, msg2) {}
+
+Status::Code Status::PBErrnoToCode(pb::error::Errno code) {
+  switch (code) {
+    case pb::error::OK:
+      return kOk;
+    case pb::error::EINTERNAL:
+      return kInternal;
+    case pb::error::ECACHE_UNKNOWN:
+      return kUnknown;
+    case pb::error::EEXISTED:
+      return kExist;
+    case pb::error::ECACHE_NOT_EXIST:
+      return kNotExist;
+    case pb::error::ECACHE_NO_SPACE:
+      return kNoSpace;
+    case pb::error::ECACHE_BAD_FD:
+      return kBadFd;
+    case pb::error::EILLEGAL_PARAMTETER:
+      return kInvalidParam;
+    case pb::error::ENO_PERMISSION:
+      return kNoPermission;
+    case pb::error::ENOT_EMPTY:
+      return kNotEmpty;
+    case pb::error::ECACHE_NO_FLUSH:
+      return kNoFlush;
+    case pb::error::ENOT_SUPPORT:
+      return kNotSupport;
+    case pb::error::ECACHE_NAME_TOO_LONG:
+      return kNameTooLong;
+    case pb::error::ECACHE_MOUNTPOINT_EXIST:
+      return kMountPointExist;
+    case pb::error::ECACHE_MOUNT_FAILED:
+      return kMountFailed;
+    case pb::error::EOUT_OF_RANGE:
+      return kOutOfRange;
+    case pb::error::ENO_DATA:
+      return kNoData;
+    case pb::error::ECACHE_IO_ERROR:
+      return kIoError;
+    case pb::error::ECACHE_STALE:
+      return kStale;
+    case pb::error::ECACHE_NO_SYS:
+      return kNoSys;
+    case pb::error::ECACHE_NO_PERMITTED:
+      return kNoPermitted;
+    case pb::error::ECACHE_NET_ERROR:
+      return kNetError;
+    case pb::error::ETIMEOUT:
+      return kTimeout;
+    case pb::error::ENOT_FOUND:
+      return kNotFound;
+    case pb::error::ECACHE_NOT_DIRECTORY:
+      return kNotDirectory;
+    case pb::error::ECACHE_FILE_TOO_LARGE:
+      return kFileTooLarge;
+    case pb::error::ECACHE_END_OF_FILE:
+      return kEndOfFile;
+    case pb::error::ECACHE_ABORT:
+      return kAbort;
+    case pb::error::ECACHE_DOWN:
+      return kCacheDown;
+    case pb::error::ECACHE_UNHEALTHY:
+      return kCacheUnhealthy;
+    case pb::error::ECACHE_FULL:
+      return kCacheFull;
+    case pb::error::ECACHE_STOP:
+      return kStop;
+    case pb::error::ECACHE_NOT_FIT:
+      return kNotFit;
+    case pb::error::ECACHE_OUT_OF_MEMORY:
+      return kOutOfMemory;
+    default:
+      // An errcode without a cache classification (e.g. an MDS-only code):
+      // keep the exact code in errno_ and fall back to a coarse Internal.
+      return kInternal;
+  }
+}
+
 std::string Status::ToString() const {
   if (state_ == nullptr) {
     return "OK";

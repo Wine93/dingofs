@@ -245,7 +245,8 @@ Status QueuePair::ModifyQpToInit() {
   int rc = ibv_modify_qp(qp_, &qp_attr, attr_mask);
   if (rc != 0) {
     PLOG(ERROR) << "Fail to modify " << this << " to init state";
-    return Status::Internal("modify qp to init state failed");
+    return Status(pb::error::ECACHE_RDMA_ERROR,
+                  "modify qp to init state failed");
   }
 
   LOG(INFO) << "Successfully modify " << *this << " to init state";
@@ -304,7 +305,8 @@ Status QueuePair::ModifyQpToRtr(ConnManagementMeta remote_cm_meta) {
   int rc = ibv_modify_qp(qp_, &qp_attr, attr_mask);
   if (rc != 0) {
     PLOG(ERROR) << "Fail to modify " << *this << " to rtr state";
-    return Status::Internal("modify qp to rtr state failed");
+    return Status(pb::error::ECACHE_RDMA_ERROR,
+                  "modify qp to rtr state failed");
   }
 
   LOG(INFO) << "Successfully modify " << *this << " to rtr state";
@@ -327,7 +329,8 @@ Status QueuePair::ModifyQpToRts() {
   int rc = ibv_modify_qp(qp_, &qp_attr, attr_mask);
   if (rc != 0) {
     PLOG(ERROR) << "Fail to modify " << *this << " to rts state";
-    return Status::Internal("modify qp to rts state failed");
+    return Status(pb::error::ECACHE_RDMA_ERROR,
+                  "modify qp to rts state failed");
   }
 
   LOG(INFO) << "Successfully modify " << *this << " to rts state";
@@ -342,7 +345,8 @@ Status QueuePair::ModifyQpToError() {
   int rc = ibv_modify_qp(qp_, &qp_attr, IBV_QP_STATE);
   if (rc != 0) {
     PLOG(ERROR) << "Fail to modify " << this << " to error state";
-    return Status::Internal("modify qp to error state failed");
+    return Status(pb::error::ECACHE_RDMA_ERROR,
+                  "modify qp to error state failed");
   }
 
   LOG(INFO) << "Successfully modify " << this << " to error state";
@@ -492,28 +496,28 @@ Status Infiniband::Init(const std::string& device_name, uint8_t port_num,
   auto* device = Infiniband::GetOrOpen(device_name);
   if (nullptr == device) {
     LOG(ERROR) << "Fail to open device=" << device_name;
-    return Status::Internal("open device failed");
+    return Status(pb::error::ECACHE_RDMA_ERROR, "open device failed");
   }
 
   auto* port = Infiniband::GetOrQuery(device, port_num);
   if (nullptr == port) {
     LOG(ERROR) << "Fail to query port=" << (int)port_num
                << " of device=" << device_name;
-    return Status::Internal("query port failed");
+    return Status(pb::error::ECACHE_RDMA_ERROR, "query port failed");
   } else if (port->GetPortState() != PortState::kActive) {
     LOG(ERROR) << "Port=" << (int)port_num << " of device=" << device_name
                << " is not active";
-    return Status::Internal("port is not active");
+    return Status(pb::error::ECACHE_RDMA_ERROR, "port is not active");
   } else if (port->GetLinkLayer() == LinkLayer::kUnspecified) {
     LOG(ERROR) << "Port=" << (int)port_num << " of device=" << device_name
                << " has unspecified link layer";
-    return Status::Internal("unspecified link layer");
+    return Status(pb::error::ECACHE_RDMA_ERROR, "unspecified link layer");
   }
 
   auto* protect_domain = Infiniband::GetOrAlloc(device);
   if (nullptr == protect_domain) {
     LOG(ERROR) << "Fail to alloc protect domain of device=" << device_name;
-    return Status::Internal("alloc protect domain failed");
+    return Status(pb::error::ECACHE_RDMA_ERROR, "alloc protect domain failed");
   }
 
   context->device = device;
@@ -537,7 +541,8 @@ Status ParseFromPb(const pb::infiniband::ConnManagementMeta& pb_cm_meta,
   if (pb_cm_meta.gid().size() != sizeof(cm_meta->gid)) {
     LOG(ERROR) << "Invalid gid size=" << pb_cm_meta.gid().size()
                << " in connection management meta";
-    return Status::Internal("invalid gid size in connection management meta");
+    return Status(pb::error::EILLEGAL_PARAMTETER,
+                  "invalid gid size in connection management meta");
   }
 
   cm_meta->qpn = pb_cm_meta.qpn();

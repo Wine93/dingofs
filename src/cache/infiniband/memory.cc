@@ -134,18 +134,19 @@ Status RegisterMemoryForRDMA(const std::string& device_name, void* addr,
 
   auto* device = Infiniband::GetOrOpen(device_name);
   if (device == nullptr) {
-    return Status::Internal("open device failed");
+    return Status(pb::error::ECACHE_RDMA_ERROR, "open device failed");
   }
 
   auto* protect_domain = Infiniband::GetOrAlloc(device);
   if (protect_domain == nullptr) {
-    return Status::Internal("alloc protect domain failed");
+    return Status(pb::error::ECACHE_RDMA_ERROR, "alloc protect domain failed");
   }
 
   auto memory_region = MemoryRegion::Register(protect_domain, addr, size);
   if (memory_region == nullptr) {
     PLOG(ERROR) << "Fail to register memory region";
-    return Status::Internal("register memory region failed");
+    return Status(pb::error::ECACHE_RDMA_ERROR,
+                  "register memory region failed");
   }
 
   g_usr_mrs.emplace(key, std::move(memory_region));
@@ -192,7 +193,8 @@ uint64_t GetRkey(const std::string& device_name, void* addr, size_t length) {
 Status RegisterGlobalSlabPoolsForRDMA() {
   for (auto* pool : {GetGlobalReadSlabPool(), GetGlobalWriteSlabPool()}) {
     if (pool == nullptr) {
-      return Status::Internal("global slab pool not initialized");
+      return Status(pb::error::EINVALID_STATE,
+                    "global slab pool not initialized");
     }
 
     void* addr = pool->BaseAddr();

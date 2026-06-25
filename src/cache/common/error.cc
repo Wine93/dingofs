@@ -25,39 +25,25 @@
 namespace dingofs {
 namespace cache {
 
-pb::cache::BlockCacheErrCode ToPBErr(Status status) {
-  if (status.ok()) {
-    return pb::cache::BlockCacheOk;
-  } else if (status.IsInvalidParam()) {
-    return pb::cache::BlockCacheErrInvalidParam;
-  } else if (status.IsNotFound()) {
-    return pb::cache::BlockCacheErrNotFound;
-  } else if (status.IsIoError()) {
-    return pb::cache::BlockCacheErrIOError;
-  } else if (status.IsInternal()) {
-    return pb::cache::BlockCacheErrFailure;
+// A Status already carries the precise dingofs.pb.error.Errno in errno_ (see
+// common/status.h), so serialization is just a copy of Errno() plus the
+// message; the coarse Status::Code never touches the wire.
+void StatusToPB(const Status& status, pb::error::Error* pb) {
+  pb->set_errcode(static_cast<pb::error::Errno>(status.Errno()));
+  if (!status.ok()) {
+    pb->set_errmsg(status.ToString());
   }
-  return pb::cache::BlockCacheErrUnknown;
 }
 
-Status ToStatus(pb::cache::BlockCacheErrCode errcode) {
-  switch (errcode) {
-    case pb::cache::BlockCacheOk:
-      return Status::OK();
-    case pb::cache::BlockCacheErrInvalidParam:
-      return Status::InvalidParam("");
-    case pb::cache::BlockCacheErrNotFound:
-      return Status::NotFound("");
-    case pb::cache::BlockCacheErrIOError:
-      return Status::IoError("");
-    case pb::cache::BlockCacheErrFailure:
-      return Status::Internal("");
-    case pb::cache::BlockCacheErrUnknown:
-      return Status::Internal("Unknown error code");
-    default:
-      break;
+// Reconstruct a Status from the wire. The Status(pb::error::Errno, msg)
+// constructor carries the exact errcode in errno_ (so the original error type
+// round-trips losslessly) and derives the coarse Code for Is##Name() /
+// ToSysErrNo(); see Status::PBErrnoToCode in common/status.cc.
+Status PBToStatus(const pb::error::Error& pb) {
+  if (pb.errcode() == pb::error::OK) {
+    return Status::OK();
   }
-  return Status::Internal("Unknown error code");
+  return Status(pb.errcode(), pb.errmsg());
 }
 
 }  // namespace cache

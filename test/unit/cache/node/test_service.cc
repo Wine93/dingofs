@@ -31,6 +31,7 @@
 #include "common/block/block_handle.h"
 #include "common/block/block_key.h"
 #include "common/options/cache.h"
+#include "dingofs/error.pb.h"
 
 namespace dingofs {
 namespace cache {
@@ -88,7 +89,7 @@ TEST_F(BlockCacheServiceImplTest, PutReturnsCacheDownWhenNodeIsDown) {
 
   service.Put(&controller, &request, &response, &done);
 
-  EXPECT_EQ(response.status(), pb::cache::BlockCacheErrUnknown);
+  EXPECT_EQ(response.status().errcode(), pb::error::ECACHE_DOWN);
   EXPECT_EQ(done.count, 1);
 }
 
@@ -107,7 +108,7 @@ TEST_F(BlockCacheServiceImplTest, RangeReturnsCacheDownWhenNodeIsDown) {
 
   service.Range(&controller, &request, &response, &done);
 
-  EXPECT_EQ(response.status(), pb::cache::BlockCacheErrUnknown);
+  EXPECT_EQ(response.status().errcode(), pb::error::ECACHE_DOWN);
   EXPECT_FALSE(response.cache_hit());
   EXPECT_EQ(controller.response_attachment().length(), 0u);
   EXPECT_EQ(done.count, 1);
@@ -127,7 +128,7 @@ TEST_F(BlockCacheServiceImplTest, CacheRejectsMismatchedBodySize) {
 
   service.Cache(&controller, &request, &response, &done);
 
-  EXPECT_EQ(response.status(), pb::cache::BlockCacheErrInvalidParam);
+  EXPECT_EQ(response.status().errcode(), pb::error::EILLEGAL_PARAMTETER);
   EXPECT_EQ(done.count, 1);
 }
 
@@ -145,7 +146,7 @@ TEST_F(BlockCacheServiceImplTest, CacheUsesRdmaAttachment) {
 
   service.Cache(&controller, &request, &response, &done);
 
-  EXPECT_EQ(response.status(), pb::cache::BlockCacheErrUnknown);
+  EXPECT_EQ(response.status().errcode(), pb::error::ECACHE_DOWN);
   EXPECT_EQ(done.count, 1);
 }
 
@@ -162,7 +163,7 @@ TEST_F(BlockCacheServiceImplTest, PrefetchReturnsCacheDownWhenNodeIsDown) {
 
   service.Prefetch(&controller, &request, &response, &done);
 
-  EXPECT_EQ(response.status(), pb::cache::BlockCacheErrUnknown);
+  EXPECT_EQ(response.status().errcode(), pb::error::ECACHE_DOWN);
   EXPECT_EQ(done.count, 1);
 }
 

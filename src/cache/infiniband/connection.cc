@@ -124,7 +124,8 @@ Status Connection::PostSendWorkRequest(const SendWorkRequest& entry) {
       ibv_post_send(queue_pair_->GetIbQp(), &work_request, &bad_work_request);
   if (rc != 0 || bad_work_request != nullptr) {
     PLOG(ERROR) << "Fail to post send work request";
-    return Status::Internal("post send work request failed");
+    return Status(pb::error::ECACHE_RDMA_ERROR,
+                  "post send work request failed");
   }
   return Status::OK();
 }
@@ -159,7 +160,8 @@ Status Connection::PostSendWorkRequests(
                          &bad_work_request);
   if (rc != 0 || bad_work_request != nullptr) {
     PLOG(ERROR) << "Fail to post send work requests";
-    return Status::Internal("post send work requests failed");
+    return Status(pb::error::ECACHE_RDMA_ERROR,
+                  "post send work requests failed");
   }
   return Status::OK();
 }
@@ -174,7 +176,8 @@ Status Connection::PostRecvWorkRequest(const RecvWorkRequest& entry) {
       ibv_post_recv(queue_pair_->GetIbQp(), &work_request, &bad_work_request);
   if (rc != 0 || bad_work_request != nullptr) {
     PLOG(ERROR) << "Fail to post receive work request";
-    return Status::Internal("post receive work request failed");
+    return Status(pb::error::ECACHE_RDMA_ERROR,
+                  "post receive work request failed");
   }
   return Status::OK();
 }
@@ -204,7 +207,8 @@ Status Connection::PostRecvWorkRequests(
                          &bad_work_request);
   if (rc != 0 || bad_work_request != nullptr) {
     PLOG(ERROR) << "Fail to post receive work requests";
-    return Status::Internal("post receive work requests failed");
+    return Status(pb::error::ECACHE_RDMA_ERROR,
+                  "post receive work requests failed");
   }
   return Status::OK();
 }
@@ -244,7 +248,8 @@ bool Connection::PollCompletionQueue(CompletionHandler handler) {
           wc.status = Status::OK();
           break;
         default:
-          wc.status = Status::Internal(ibv_wc_status_str(cqe[i].status));
+          wc.status = Status(pb::error::ECACHE_NET_ERROR,
+                             ibv_wc_status_str(cqe[i].status));
           LOG(ERROR) << "[DBG] WR failed: wr_id=0x" << std::hex << cqe[i].wr_id
                      << " opcode=" << std::dec << cqe[i].opcode
                      << " vendor_err=0x" << std::hex << cqe[i].vendor_err

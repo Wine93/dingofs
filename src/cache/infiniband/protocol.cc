@@ -60,13 +60,13 @@ Status Protocol::Serialize(uint64_t correlation_id,
   // meta
   char* ptr = buffer->data + kHeaderSize;
   if (!meta.SerializeToArray(ptr, static_cast<int>(meta_len))) {
-    return Status::Internal("serialize meta failed");
+    return Status(pb::error::ECACHE_SERIALIZE_ERROR, "serialize meta failed");
   }
 
   // data
   if (data_len > 0 &&
       !data->SerializeToArray(ptr + meta_len, static_cast<int>(data_len))) {
-    return Status::Internal("serialize data failed");
+    return Status(pb::error::ECACHE_SERIALIZE_ERROR, "serialize data failed");
   }
 
   buffer->length = static_cast<uint32_t>(total);
@@ -203,7 +203,7 @@ Status RequestParser::Parse(RDMABuffer* buffer, Result* result, Option option) {
   auto* request = service->GetRequestPrototype(method).New(option.arena);
   auto* response = service->GetResponsePrototype(method).New(option.arena);
   if (!request->ParseFromArray(request_view.data(), request_view.size())) {
-    return Status::Internal("parse request failed");
+    return Status(pb::error::ECACHE_SERIALIZE_ERROR, "parse request failed");
   }
 
   result->service = service;
@@ -241,7 +241,7 @@ Status ResponseParser::Parse(RDMABuffer* buffer, Result* result,
   result->attachment_size = response_meta.attachment_size();
   if (result->error_code == ErrorCode::Ok) {
     if (!response->ParseFromArray(response_view.data(), response_view.size())) {
-      return Status::Internal("parse response failed");
+      return Status(pb::error::ECACHE_SERIALIZE_ERROR, "parse response failed");
     }
   }
 

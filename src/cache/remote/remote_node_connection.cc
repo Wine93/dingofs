@@ -69,7 +69,7 @@ Status TCPConnection::Connect(const std::string& ip, uint32_t port,
   int rc = butil::str2endpoint(ip.c_str(), port, &ep);
   if (rc != 0) {
     LOG(ERROR) << "Fail to str2endpoint(" << ip << ":" << port << ")";
-    return Status::Internal("str2endpoint failed");
+    return Status(pb::error::EILLEGAL_PARAMTETER, "str2endpoint failed");
   }
 
   brpc::ChannelOptions options;
@@ -79,7 +79,7 @@ Status TCPConnection::Connect(const std::string& ip, uint32_t port,
   rc = channel->Init(ep, &options);
   if (rc != 0) {
     LOG(ERROR) << "Fail to init channel for address=" << ip << ":" << port;
-    return Status::Internal("init channel failed");
+    return Status(pb::error::ECACHE_NET_ERROR, "init channel failed");
   }
 
   channel_ = std::move(channel);
@@ -156,7 +156,7 @@ Status RDMAConnection::Connect(const std::string& ip, uint32_t port,
                           static_cast<uint8_t>(FLAGS_cache_rdma_port_num)};
   auto client = infiniband::Client::Create(ep);
   if (client == nullptr) {
-    return Status::Internal("create rdma client failed");
+    return Status(pb::error::ECACHE_RDMA_ERROR, "create rdma client failed");
   }
   auto status = client->Connect(ip + ":" + std::to_string(port));
   if (!status.ok()) {

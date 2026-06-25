@@ -168,7 +168,7 @@ Status CacheServer::StartBrpcServer(const std::string& listen_ip,
   if (rc != 0) {
     LOG(ERROR) << "Fail to str2endpoint(" << listen_ip << "," << listen_port
                << ")";
-    return Status::Internal("str2endpoint() failed");
+    return Status(pb::error::EILLEGAL_PARAMTETER, "str2endpoint() failed");
   }
 
   rc = brpc_server_->AddService(brpc_service_.get(),

@@ -75,7 +75,7 @@ TEST_F(RemoteNodeConnectionTest, TcpConnectRejectsBadEndpoint) {
   TCPConnection conn;
   EXPECT_FALSE(conn.IsConnected());
 
-  EXPECT_TRUE(conn.Connect("not-an-ip", 9999, 1).IsInternal());
+  EXPECT_TRUE(conn.Connect("not-an-ip", 9999, 1).IsInvalidParam());
   EXPECT_FALSE(conn.IsConnected());
 }
 

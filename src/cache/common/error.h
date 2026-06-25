@@ -26,13 +26,17 @@
 #include <glog/logging.h>
 
 #include "common/status.h"
-#include "dingofs/blockcache.pb.h"
+#include "dingofs/error.pb.h"
 
 namespace dingofs {
 namespace cache {
 
-pb::cache::BlockCacheErrCode ToPBErr(Status status);
-Status ToStatus(pb::cache::BlockCacheErrCode errcode);
+// Serialize a Status into a pb::error::Error (errcode + errmsg) for the wire,
+// and reconstruct it on the peer side. The precise dingofs.pb.error.Errno is
+// carried in Status::Errno(), so the error type round-trips losslessly while
+// the coarse Status::Code is recovered for Is##Name() / ToSysErrNo().
+void StatusToPB(const Status& status, pb::error::Error* pb);
+Status PBToStatus(const pb::error::Error& pb);
 
 }  // namespace cache
 }  // namespace dingofs
