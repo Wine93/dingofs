@@ -33,10 +33,10 @@ struct LocalRegion {
 
 struct __attribute__((packed)) RemoteRegion {
   uint64_t addr;
-  uint32_t len;
+  uint64_t len;
   uint32_t rkey;
 };
-static_assert(sizeof(RemoteRegion) == 16,
+static_assert(sizeof(RemoteRegion) == 20,
               "RemoteRegion is a protocol structure");
 
 inline uint64_t GetLength(std::span<const RemoteRegion> regions) {

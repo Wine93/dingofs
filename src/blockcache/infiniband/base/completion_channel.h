@@ -19,6 +19,8 @@
 
 #include <infiniband/verbs.h>
 
+#include <memory>
+
 #include "blockcache/common/status.h"
 #include "blockcache/infiniband/base/device.h"
 
@@ -58,6 +60,8 @@ class CompletionChannel {
 
   ibv_comp_channel* channel_ = nullptr;
 };
+
+using CompletionChannelUPtr = std::unique_ptr<CompletionChannel>;
 
 }  // namespace infiniband
 }  // namespace blockcache

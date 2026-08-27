@@ -63,6 +63,8 @@ class BufferPool {
   uint32_t rkey_ = 0;
 };
 
+using BufferPoolUPtr = std::unique_ptr<BufferPool>;
+
 }  // namespace infiniband
 }  // namespace blockcache
 }  // namespace dingofs

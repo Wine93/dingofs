@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <utility>
 
 #include "blockcache/common/status.h"
@@ -54,6 +55,8 @@ class MemoryRegistry {
   ibv_pd* pd_ = nullptr;
   std::deque<MemoryRegion> regions_;
 };
+
+using MemoryRegistryUPtr = std::unique_ptr<MemoryRegistry>;
 
 }  // namespace infiniband
 }  // namespace blockcache

@@ -20,6 +20,7 @@
 #include <infiniband/verbs.h>
 
 #include <cstdint>
+#include <memory>
 
 #include "blockcache/common/status.h"
 #include "blockcache/infiniband/base/completion_channel.h"
@@ -88,6 +89,8 @@ class CompletionQueue {
   uint32_t num_reserved_ = 0;
   unsigned num_unacked_ = 0;
 };
+
+using CompletionQueueUPtr = std::unique_ptr<CompletionQueue>;
 
 }  // namespace infiniband
 }  // namespace blockcache
