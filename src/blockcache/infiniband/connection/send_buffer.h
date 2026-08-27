@@ -66,14 +66,13 @@ class SendBufferPool {
     Task* task_ = nullptr;
   };
 
-  SendBufferPool() = default;
+  explicit SendBufferPool(BufferPool* pool) : pool_(pool) {}
   ~SendBufferPool();
 
   SendBufferPool(const SendBufferPool&) = delete;
   SendBufferPool& operator=(const SendBufferPool&) = delete;
 
-  Status Init(BufferPool* pool, uint32_t buffer_size, uint32_t buffer_count,
-              void* owner);
+  Status Init(uint32_t buffer_size, uint32_t buffer_count, void* owner);
 
   SendBuffer* TryAcquire() {
     SendBuffer* buffer = free_;
@@ -110,7 +109,7 @@ class SendBufferPool {
  private:
   void NotifyWaiter(Waiter* waiter) { ThisReactor().Schedule(waiter->task_); }
 
-  BufferPool* pool_ = nullptr;
+  BufferPool* pool_;
   uint32_t buffer_size_ = 0;
   std::vector<SendBuffer> buffers_;
   SendBuffer* free_ = nullptr;

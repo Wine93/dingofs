@@ -33,11 +33,11 @@ namespace dingofs {
 namespace blockcache {
 
 struct BlockHandle {
-  bool operator==(const BlockHandle& o) const {
+  bool operator==(BlockHandle o) const {
     return id == o.id && index == o.index && size == o.size;
   }
 
-  bool operator!=(const BlockHandle& o) const { return !(*this == o); }
+  bool operator!=(BlockHandle o) const { return !(*this == o); }
 
   static BlockHandle FromPb(const pb::cache::v2::BlockHandle& pb) {
     return {.fs_id = pb.fs_id(),
@@ -88,12 +88,12 @@ struct BlockHandle {
 };
 
 struct BlockHandleHash {
-  size_t operator()(const BlockHandle& h) const {
+  size_t operator()(BlockHandle h) const {
     return static_cast<size_t>(h.Hash());
   }
 };
 
-inline std::ostream& operator<<(std::ostream& os, const BlockHandle& handle) {
+inline std::ostream& operator<<(std::ostream& os, BlockHandle handle) {
   os << "BlockHandle{fs_id=" << handle.fs_id << " id=" << handle.id
      << " index=" << handle.index << " size=" << handle.size << "}";
   return os;

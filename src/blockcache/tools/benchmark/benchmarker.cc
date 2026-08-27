@@ -41,6 +41,11 @@ Benchmarker::Benchmarker()
 
 Status Benchmarker::Start() { return InitAll(); }
 
+void Benchmarker::RunUntilFinish() {
+  StartAll();
+  StopAll();
+}
+
 Status Benchmarker::InitAll() {
   auto initers = std::vector<std::function<Status()>>{
       [this]() { return InitMdsClient(); },
@@ -65,23 +70,6 @@ Status Benchmarker::InitAll() {
   }
 
   return Status::OK();
-}
-
-void Benchmarker::RunUntilFinish() {
-  StartAll();
-  StopAll();
-}
-
-void Benchmarker::StartAll() {
-  StartReporter();
-  StartWorkers();
-}
-
-void Benchmarker::StopAll() {
-  StopWorkers();
-  StopReporter();
-  StopCollector();
-  StopBlockCache();
 }
 
 Status Benchmarker::InitMdsClient() {
@@ -143,6 +131,11 @@ void Benchmarker::InitWorkers() {
   }
 }
 
+void Benchmarker::StartAll() {
+  StartReporter();
+  StartWorkers();
+}
+
 void Benchmarker::StartReporter() {
   auto status = reporter_->Start();
   CHECK(status.ok()) << "Start reporter failed: " << status.ToString();
@@ -152,6 +145,13 @@ void Benchmarker::StartWorkers() {
   for (auto& worker : workers_) {
     thread_pool_->Enqueue([&worker]() { worker->Start(); });
   }
+}
+
+void Benchmarker::StopAll() {
+  StopWorkers();
+  StopReporter();
+  StopCollector();
+  StopBlockCache();
 }
 
 void Benchmarker::StopWorkers() {

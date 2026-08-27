@@ -26,24 +26,20 @@
 #include "blockcache/common/flag_decls.h"
 #include "blockcache/common/route.h"
 #include "blockcache/core/runtime/smp.h"
-#include "blockcache/net/brpc/client.h"
-#include "blockcache/net/rdma/connection.h"
-#include "blockcache/net/server/client_domain.h"
-#include "blockcache/net/server/controller.h"
+#include "blockcache/net/controller.h"
+#include "blockcache/net/dialer.h"
+#include "blockcache/remote/dialers.h"
 
 namespace dingofs {
 namespace blockcache {
 
 thread_local unsigned tls_open_connections = 0;
 
-static BrpcClient::Option GenBrpcOption(const std::string& node_id,
-                                        const std::string& server) {
-  BrpcClient::Option option;
+static net::DialOption GenDialOption(const std::string& node_id,
+                                     const std::string& server) {
+  net::DialOption option;
   option.server = server;
-  option.timeout_ms = static_cast<int>(FLAGS_remote_rpc_timeout_ms);
-  option.connect_timeout_ms = static_cast<int>(FLAGS_remote_connect_timeout_ms);
-  option.connection_group =
-      "remote-" + std::to_string(ThisShardId()) + "-" + node_id;
+  option.tag = "remote-" + std::to_string(ThisShardId()) + "-" + node_id;
   return option;
 }
 
@@ -72,18 +68,15 @@ Future<> NodeProber::Shutdown() {
 }
 
 Future<Status> NodeProber::GetNodeInfo() {
-  StatusOr<std::unique_ptr<BrpcClient>> c =
-      BrpcClient::Create(ThisShardId(), GenBrpcOption(node_id_, address_));
-  if (!c.ok()) {
-    co_return c.status();
+  net::Dialer* dialer = Dialers::OfThisShard(false);
+  StatusOr<net::Channel*> channel =
+      co_await dialer->Dial(GenDialOption(node_id_, address_));
+  if (!channel.ok()) {
+    co_return channel.status();
   }
-  std::unique_ptr<BrpcClient> client = std::move(c).value();
+  CacheStub stub(channel.value());
 
-  Channel channel;
-  channel.Borrow(client.get());
-  CacheStub stub(&channel);
-
-  Controller cntl;
+  net::Controller cntl;
   pb::cache::v2::GetNodeInfoRequest request;
   pb::cache::v2::GetNodeInfoResponse response;
   Status status = co_await stub.GetNodeInfo(&cntl, &request, &response);
@@ -91,8 +84,7 @@ Future<Status> NodeProber::GetNodeInfo() {
     status = ToStatus(response.status());
   }
 
-  co_await channel.Shutdown();
-  client->Shutdown();
+  co_await dialer->Close(channel.value());
 
   if (!status.ok()) {
     co_return status;
@@ -117,15 +109,6 @@ Future<Status> NodeProber::GetNodeInfo() {
   co_return Status::OK();
 }
 
-uint64_t NodeProber::FirstHintOf(unsigned shard, unsigned shards) {
-  if (shard == 0 || shards <= 1) {
-    return 0;
-  }
-  const __uint128_t scaled =
-      (static_cast<__uint128_t>(shard) << 64) + shards - 1;
-  return static_cast<uint64_t>(scaled / shards);
-}
-
 NodeProber::RemoteShardRange NodeProber::GetRemoteShardRange(
     unsigned local_shard_id, unsigned local_shards, unsigned remote_shards) {
   remote_shards = std::max(1U, remote_shards);
@@ -146,10 +129,19 @@ NodeProber::RemoteShardRange NodeProber::GetRemoteShardRange(
   return RemoteShardRange{.base = base, .count = highest - base + 1};
 }
 
+uint64_t NodeProber::FirstHintOf(unsigned shard, unsigned shards) {
+  if (shard == 0 || shards <= 1) {
+    return 0;
+  }
+  const __uint128_t scaled =
+      (static_cast<__uint128_t>(shard) << 64) + shards - 1;
+  return static_cast<uint64_t>(scaled / shards);
+}
+
 NodeConnection::NodeConnection(Option option) : option_(std::move(option)) {}
 
 Future<Status> NodeConnection::Open() {
-  if (stub_ != nullptr) {
+  if (IsConnected()) {
     co_return Status::OK();
   }
   co_return co_await opening_.Do([this] { return Establish(); });
@@ -160,64 +152,50 @@ Future<> NodeConnection::Close() {
     --tls_open_connections;
   }
   stub_.reset();
-  co_await channel_.Shutdown();
+  if (channel_ == nullptr) {
+    co_return;
+  }
+  net::Channel* channel = std::exchange(channel_, nullptr);
+  net::Dialer* dialer = std::exchange(dialer_, nullptr);
+  co_await dialer->Close(channel);
+}
+
+bool NodeConnection::IsConnected() const {
+  return stub_ != nullptr && channel_ != nullptr && channel_->Alive();
 }
 
 Future<Status> NodeConnection::Establish() {
-  if (!option_.use_rdma) {
-    return EstablishForBrpc();
+  if (IsConnected()) {
+    co_return Status::OK();
   }
-  return EstablishForRdma();
-}
-
-Future<Status> NodeConnection::EstablishForBrpc() {
-  StatusOr<std::unique_ptr<BrpcClient>> client = BrpcClient::Create(
-      ThisShardId(), GenBrpcOption(option_.node_id, option_.server));
-  if (!client.ok()) {
-    co_return client.status();
-  }
-  channel_.Adopt(std::move(client).value());
-  stub_ = std::make_unique<CacheStub>(&channel_);
-  co_return Status::OK();
-}
-
-Future<Status> NodeConnection::EstablishForRdma() {
-  RdmaDomain* domain = ClientDomain::DomainOfThisShard();
-  if (domain == nullptr) {
-    co_return Status::Internal("no client rdma domain on this shard");
+  if (stub_ != nullptr) {
+    co_await Close();
   }
 
-  StatusOr<std::unique_ptr<BrpcClient>> client = BrpcClient::Create(
-      ThisShardId(), GenBrpcOption(option_.node_id, option_.server));
-  if (!client.ok()) {
-    co_return client.status();
-  }
-  std::unique_ptr<BrpcClient> brpc_client = std::move(client).value();
-
-  const Status status = co_await channel_.Dial(
-      domain, brpc_client.get(),
-      HintForShard(option_.remote_shard, option_.remote_shard_count));
-  brpc_client->Shutdown();
-  if (!status.ok()) {
-    co_return status;
+  net::DialOption option = GenDialOption(option_.node_id, option_.server);
+  if (option_.use_rdma) {
+    option.routing_key =
+        HintForShard(option_.remote_shard, option_.remote_shard_count);
+    option.expected_shard = option_.remote_shard;
   }
 
-  RdmaConnection* peer = channel_.connection();
-  if (peer != nullptr && peer->peer_shard() != option_.remote_shard) {
-    LOG_EVERY_N(WARNING, 100)
-        << "Cache node " << option_.node_id
-        << " answered the handshake from shard " << peer->peer_shard()
-        << ", not " << option_.remote_shard
-        << "; its shard count changed under us";
+  net::Dialer* dialer = Dialers::OfThisShard(option_.use_rdma);
+  StatusOr<net::Channel*> channel = co_await dialer->Dial(std::move(option));
+  if (!channel.ok()) {
+    co_return channel.status();
   }
-  stub_ = std::make_unique<CacheStub>(&channel_);
+  dialer_ = dialer;
+  channel_ = channel.value();
+  stub_ = std::make_unique<CacheStub>(channel_);
 
-  LOG_IF(ERROR, ++tls_open_connections > FLAGS_remote_rdma_max_connections)
-      << "Shard " << ThisShardId() << " now holds " << tls_open_connections
-      << " rdma connections but its registered pool is sized for "
-      << FLAGS_remote_rdma_max_connections
-      << "; raise --remote_rdma_max_connections or connections will fail to "
-         "carve a frame buffer";
+  if (option_.use_rdma) {
+    LOG_IF(ERROR, ++tls_open_connections > FLAGS_rdma_max_connections)
+        << "Shard " << ThisShardId() << " now holds " << tls_open_connections
+        << " rdma connections but its registered pool is sized for "
+        << FLAGS_rdma_max_connections
+        << "; raise --rdma_max_connections or connections will fail to "
+           "carve a frame buffer";
+  }
   co_return Status::OK();
 }
 

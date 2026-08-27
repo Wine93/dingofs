@@ -21,7 +21,7 @@
 #include "blockcache/core/memory/buffer.h"
 #include "blockcache/core/memory/buffer_view.h"
 #include "blockcache/core/runtime/smp.h"
-#include "blockcache/net/body.h"
+#include "blockcache/net/types.h"
 #include "blockcache/store/local_filesystem.h"
 #include "blockcache/utils/align.h"
 
@@ -29,7 +29,7 @@ namespace dingofs {
 namespace blockcache {
 
 CacheService::CacheService(ShardedLocalCache* block_cache)
-    : ProtoService(pb::cache::v2::CacheService::descriptor()),
+    : infiniband::ProtoService(pb::cache::v2::CacheService::descriptor()),
       block_cache_(block_cache) {
   AddMethod("Put", &CacheService::Put);
   AddMethod("Get", &CacheService::Get);
@@ -39,7 +39,7 @@ CacheService::CacheService(ShardedLocalCache* block_cache)
   AddMethod("GetNodeInfo", &CacheService::GetNodeInfo);
 }
 
-Future<> CacheService::Put(Controller* cntl,
+Future<> CacheService::Put(net::Controller* cntl,
                            const pb::cache::v2::PutRequest* request,
                            pb::cache::v2::PutResponse* response) {
   Status status =
@@ -59,7 +59,7 @@ Future<> CacheService::Put(Controller* cntl,
   co_return;
 }
 
-Future<> CacheService::Get(Controller* cntl,
+Future<> CacheService::Get(net::Controller* cntl,
                            const pb::cache::v2::GetRequest* request,
                            pb::cache::v2::GetResponse* response) {
   const uint64_t offset = request->offset();
@@ -96,7 +96,7 @@ Future<> CacheService::Get(Controller* cntl,
   co_return;
 }
 
-Future<> CacheService::Prefetch(Controller* /*cntl*/,
+Future<> CacheService::Prefetch(net::Controller* /*cntl*/,
                                 const pb::cache::v2::PrefetchRequest* request,
                                 pb::cache::v2::PrefetchResponse* response) {
   Status status = CheckHandle(request->handle());
@@ -112,7 +112,7 @@ Future<> CacheService::Prefetch(Controller* /*cntl*/,
   co_return;
 }
 
-Future<> CacheService::Delete(Controller* /*cntl*/,
+Future<> CacheService::Delete(net::Controller* /*cntl*/,
                               const pb::cache::v2::DeleteRequest* request,
                               pb::cache::v2::DeleteResponse* response) {
   Status status = CheckHandle(request->handle());
@@ -128,14 +128,14 @@ Future<> CacheService::Delete(Controller* /*cntl*/,
   co_return;
 }
 
-Future<> CacheService::Ping(Controller* /*cntl*/,
+Future<> CacheService::Ping(net::Controller* /*cntl*/,
                             const pb::cache::v2::PingRequest*,
                             pb::cache::v2::PingResponse*) {
   return MakeReadyFuture<>();
 }
 
 Future<> CacheService::GetNodeInfo(
-    Controller* /*cntl*/, const pb::cache::v2::GetNodeInfoRequest*,
+    net::Controller* /*cntl*/, const pb::cache::v2::GetNodeInfoRequest*,
     pb::cache::v2::GetNodeInfoResponse* response) {
   response->set_status(pb::error::OK);
   response->set_id(FLAGS_id);
@@ -153,7 +153,7 @@ CacheService::AlignedRange CacheService::AlignRequest(uint64_t offset,
 }
 
 Status CacheService::CheckHandle(const pb::cache::v2::BlockHandle& handle) {
-  if (handle.size() == 0 || handle.size() > kMaxBodyBytes) {
+  if (handle.size() == 0 || handle.size() > net::kMaxAttachmentBytes) {
     return Status::InvalidParam("block size out of range");
   }
   return Status::OK();

@@ -52,7 +52,7 @@ class QueuePairGroup {
   QueuePair* GetMsgQueuePair() { return &msg_.queue_pair; }
   SendQueue* NextBulkQueue();
 
-  uint32_t Inflights() const;
+  uint32_t bulk_inflights() const;
   uint8_t qp_count() const { return static_cast<uint8_t>(1 + bulks_.size()); }
   std::vector<QueuePairInfo> GetInfos() const;
 

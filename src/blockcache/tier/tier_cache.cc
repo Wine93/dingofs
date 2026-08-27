@@ -154,10 +154,6 @@ Future<Status> TierCache::Get(BlockHandle handle, uint64_t offset,
     co_return Status::NotFound("block is not cached");
   }
 
-  // if (HasLocal()) {
-  //   co_return co_await local_cache_->Get(handle, offset, length, buffer,
-  //                                        {.retrieve_storage = true});
-  // }
   co_return co_await storage_->Get(handle, offset, length, buffer,
                                    {.retry_notfound = true});
 }
@@ -206,9 +202,6 @@ Future<CacheStats> TierCache::GetStats() {
 
 BlockCacheUPtr TierCache::MakeLocal(ObjectStorage* storage) {
   if (FLAGS_cache_store != "disk") {
-    LOG_IF(ERROR, FLAGS_cache_store != "none")
-        << "--cache_store is disk | none, not " << FLAGS_cache_store
-        << "; running without a local cache";
     return nullptr;
   }
   return std::make_unique<LocalCache>(storage);
@@ -221,7 +214,7 @@ BlockCacheUPtr TierCache::MakeRemote(MDSClient* mds_client) {
   return std::make_unique<RemoteCache>(mds_client);
 }
 
-void TierCache::LogTierMiss(const char* tier, const BlockHandle& handle,
+void TierCache::LogTierMiss(const char* tier, BlockHandle handle,
                             const Status& status) {
   if (status.IsNotFound()) {
     return;

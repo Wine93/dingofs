@@ -26,7 +26,7 @@
 
 #include "blockcache/common/route.h"
 #include "blockcache/core/runtime/smp.h"
-#include "blockcache/net/server/controller.h"
+#include "blockcache/net/controller.h"
 
 namespace dingofs {
 namespace blockcache {
@@ -35,7 +35,7 @@ template <typename Method>
 struct RpcTraits;
 
 template <typename Request, typename Response>
-struct RpcTraits<Future<Status> (CacheStub::*)(Controller*, const Request*,
+struct RpcTraits<Future<Status> (CacheStub::*)(net::Controller*, const Request*,
                                                Response*)> {
   using RequestType = Request;
   using ResponseType = Response;
@@ -133,8 +133,13 @@ Future<Status> RemoteNode::SendRequest(Method method, uint64_t key,
     co_return status;
   }
 
-  Controller cntl;
-  cntl.set_route_hint(key);
+  // Over brpc the server reads the key from here; over rdma the connection
+  // already chose a shard, so it costs a few bytes and nothing else.
+  if constexpr (requires { request.mutable_context(); }) {
+    request.mutable_context()->set_routing_key(key);
+  }
+
+  net::Controller cntl;
   if (!attachment.send.empty()) {
     cntl.set_borrowed_request(attachment.send);
   } else if (attachment.receive.data != nullptr) {

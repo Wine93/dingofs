@@ -160,11 +160,6 @@ class Waker final : public Event {
   int eventfd_ = -1;
 };
 
-struct DispatcherOption {
-  unsigned queue_len = 32;
-  std::chrono::microseconds task_quota{500};
-};
-
 class Dispatcher {
  public:
   class RunScope {
@@ -179,7 +174,7 @@ class Dispatcher {
     Dispatcher& dispatcher_;
   };
 
-  explicit Dispatcher(const DispatcherOption& option = {});
+  Dispatcher();
   ~Dispatcher();
 
   Dispatcher(const Dispatcher&) = delete;
@@ -196,6 +191,9 @@ class Dispatcher {
 
  private:
   static constexpr unsigned kCqBatch = 256;
+  // Submission slots for arm/disarm traffic; events outlive their SQE, so
+  // this bounds a burst, not the number of registered events.
+  static constexpr unsigned kEventRingLen = 32;
 
   void Arm(Event* ev);
   void Disarm(Event* ev);  // asks; the event retires when -ECANCELED lands

@@ -20,28 +20,30 @@
 #include <cstdint>
 
 #include "blockcache/block/sharded.h"
-#include "blockcache/net/protocol/proto_service.h"
+#include "blockcache/infiniband/server/service.h"
 #include "dingofs/cache.pb.h"
 
 namespace dingofs {
 namespace blockcache {
 
-class CacheService : public ProtoService {
+class CacheService : public infiniband::ProtoService {
  public:
   explicit CacheService(ShardedLocalCache* block_cache);
 
-  Future<> Put(Controller* cntl, const pb::cache::v2::PutRequest* request,
+  Future<> Put(net::Controller* cntl, const pb::cache::v2::PutRequest* request,
                pb::cache::v2::PutResponse* response);
-  Future<> Get(Controller* cntl, const pb::cache::v2::GetRequest* request,
+  Future<> Get(net::Controller* cntl, const pb::cache::v2::GetRequest* request,
                pb::cache::v2::GetResponse* response);
-  Future<> Prefetch(Controller* cntl,
+  Future<> Prefetch(net::Controller* cntl,
                     const pb::cache::v2::PrefetchRequest* request,
                     pb::cache::v2::PrefetchResponse* response);
-  Future<> Delete(Controller* cntl, const pb::cache::v2::DeleteRequest* request,
+  Future<> Delete(net::Controller* cntl,
+                  const pb::cache::v2::DeleteRequest* request,
                   pb::cache::v2::DeleteResponse* response);
-  Future<> Ping(Controller* cntl, const pb::cache::v2::PingRequest* request,
+  Future<> Ping(net::Controller* cntl,
+                const pb::cache::v2::PingRequest* request,
                 pb::cache::v2::PingResponse* response);
-  Future<> GetNodeInfo(Controller* cntl,
+  Future<> GetNodeInfo(net::Controller* cntl,
                        const pb::cache::v2::GetNodeInfoRequest* request,
                        pb::cache::v2::GetNodeInfoResponse* response);
 

@@ -24,8 +24,7 @@
 
 #include "blockcache/common/status.h"
 #include "blockcache/core/runtime/smp.h"
-#include "blockcache/net/rdma/option.h"
-#include "blockcache/net/server/client_domain.h"
+#include "blockcache/remote/dialers.h"
 #include "blockcache/utils/gate.h"
 
 namespace dingofs {
@@ -35,8 +34,6 @@ DEFINE_string(cache_group, "", "cache group; empty disables it");
 
 DEFINE_bool(remote_rdma, false, "use rdma");
 DEFINE_string(remote_rdma_device, "", "rdma device; empty picks the first");
-DEFINE_uint32(remote_rdma_port_num, 1, "rdma port number");
-DEFINE_uint32(remote_rdma_max_connections, 64, "max connections per shard");
 
 DEFINE_uint32(remote_rpc_timeout_ms, 30000, "rpc timeout");
 DEFINE_validator(remote_rpc_timeout_ms, brpc::PassValidate);
@@ -59,7 +56,7 @@ Future<> RemoteCache::Start() {
 
   LOG(INFO) << "RemoteCache{shard=" << ThisShardId() << "} is starting...";
 
-  co_await InitRdma();
+  co_await InitDialers();
   co_await nodes_->Start();
 
   running_ = true;
@@ -81,60 +78,10 @@ Future<> RemoteCache::Shutdown() {
 
   ShutdownSyncer();
   co_await nodes_->Shutdown();
-  co_await ShutdownRdma();
+  co_await ShutdownDialers();
 
   LOG(INFO) << "Successfully shutdown RemoteCache{shard=" << ThisShardId()
             << "}";
-}
-
-Future<> RemoteCache::InitRdma() {
-  if (!FLAGS_remote_rdma) {
-    co_return;
-  }
-
-  RdmaOption option;
-  option.device = FLAGS_remote_rdma_device;
-  option.port_num = static_cast<uint8_t>(FLAGS_remote_rdma_port_num);
-  option.max_connections = FLAGS_remote_rdma_max_connections;
-
-  const Status status = co_await ClientDomain::InitOnThisShard(option);
-  LOG_IF(FATAL, !status.ok())
-      << "Fail to open the rdma dialling domain on shard " << ThisShardId()
-      << ": " << status.ToString();
-}
-
-Future<> RemoteCache::ShutdownRdma() {
-  if (!FLAGS_remote_rdma) {
-    co_return;
-  }
-  co_await ClientDomain::ShutdownOnThisShard();
-}
-
-void RemoteCache::StartSyncer() {
-  if (ThisShardId() != 0) {
-    return;
-  }
-
-  syncer_ = std::make_unique<CacheGroupMemberSyncer>(mds_client_);
-  syncer_->Start();
-}
-
-void RemoteCache::ShutdownSyncer() {
-  if (ThisShardId() != 0) {
-    return;
-  }
-
-  syncer_->Shutdown();
-  syncer_.reset();
-}
-
-Future<> RemoteCache::WaitForMembersSynced() {
-  static constexpr uint64_t kFirstSyncWaitMs = 10000;
-  co_await SleepWhile([this] { return nodes_->empty(); }, kFirstSyncWaitMs);
-  LOG_IF(FATAL, nodes_->empty())
-      << "Fail to sync member of cache group=" << FLAGS_cache_group
-      << " from the mds in " << kFirstSyncWaitMs
-      << " ms; is the mds alive and does the group have online members?";
 }
 
 Future<Status> RemoteCache::Put(BlockHandle handle, BufferViews body,
@@ -186,17 +133,42 @@ Future<CacheStats> RemoteCache::GetStats() {
   return MakeReadyFuture<CacheStats>(
       CacheStats{.hits = hits_, .misses = misses_});
 }
+Future<> RemoteCache::InitDialers() {
+  const Status status = co_await Dialers::InitOnThisShard();
+  LOG_IF(FATAL, !status.ok())
+      << "Fail to open the rdma dialling context on shard " << ThisShardId()
+      << ": " << status.ToString();
+}
 
-Members RemoteCache::GetMembers() {
-  if (ShardCount() == 0) {
-    return {};
+Future<> RemoteCache::ShutdownDialers() {
+  co_await Dialers::ShutdownOnThisShard();
+}
+
+void RemoteCache::StartSyncer() {
+  if (ThisShardId() != 0) {
+    return;
   }
 
-  return RunOnAndWait(0, []() -> Future<Members> {
-    RemoteNodeGroup* node_group = ThisNodeGroup();
-    return MakeReadyFuture<Members>(
-        node_group == nullptr ? Members{} : node_group->members());
-  });
+  syncer_ = std::make_unique<CacheGroupMemberSyncer>(mds_client_);
+  syncer_->Start();
+}
+
+void RemoteCache::ShutdownSyncer() {
+  if (ThisShardId() != 0) {
+    return;
+  }
+
+  syncer_->Shutdown();
+  syncer_.reset();
+}
+
+Future<> RemoteCache::WaitForMembersSynced() {
+  static constexpr uint64_t kFirstSyncWaitMs = 10000;
+  co_await SleepWhile([this] { return nodes_->empty(); }, kFirstSyncWaitMs);
+  LOG_IF(FATAL, nodes_->empty())
+      << "Fail to sync member of cache group=" << FLAGS_cache_group
+      << " from the mds in " << kFirstSyncWaitMs
+      << " ms; is the mds alive and does the group have online members?";
 }
 
 }  // namespace blockcache

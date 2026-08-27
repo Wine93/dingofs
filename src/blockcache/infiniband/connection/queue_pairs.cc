@@ -85,25 +85,6 @@ StatusOr<QueuePairGroup> QueuePairGroup::Create(
   return group;
 }
 
-StatusOr<QueuePairGroup::QpRail> QueuePairGroup::CreateQpRail(
-    Device* device, CompletionQueue* completion_queue,
-    const QueuePairOption& option) {
-  StatusOr<QueuePair> queue_pair =
-      QueuePair::Create(*device, completion_queue->get(), option);
-  if (!queue_pair.ok()) {
-    return queue_pair.status();
-  }
-
-  QpRail rail;
-  rail.queue_pair = std::move(queue_pair).value();
-  rail.queue = SendQueue(&rail.queue_pair, option.max_send_wr);
-  Status status = rail.queue_pair.ModifyToInit();
-  if (!status.ok()) {
-    return status;
-  }
-  return rail;
-}
-
 Status QueuePairGroup::ModifyToReady(std::span<const QueuePairInfo> peers) {
   CHECK_EQ(peers.size(), bulks_.size() + 1) << "one peer info per queue pair";
 
@@ -158,8 +139,8 @@ SendQueue* QueuePairGroup::NextBulkQueue() {
   return queue;
 }
 
-uint32_t QueuePairGroup::Inflights() const {
-  uint32_t total = msg_.queue.inflights();
+uint32_t QueuePairGroup::bulk_inflights() const {
+  uint32_t total = 0;
   for (const QpRail& bulk : bulks_) {
     total += bulk.queue.inflights();
   }
@@ -174,6 +155,25 @@ std::vector<QueuePairInfo> QueuePairGroup::GetInfos() const {
     infos.push_back(bulk.queue_pair.GetInfo());
   }
   return infos;
+}
+
+StatusOr<QueuePairGroup::QpRail> QueuePairGroup::CreateQpRail(
+    Device* device, CompletionQueue* completion_queue,
+    const QueuePairOption& option) {
+  StatusOr<QueuePair> queue_pair =
+      QueuePair::Create(*device, completion_queue->get(), option);
+  if (!queue_pair.ok()) {
+    return queue_pair.status();
+  }
+
+  QpRail rail;
+  rail.queue_pair = std::move(queue_pair).value();
+  rail.queue = SendQueue(&rail.queue_pair, option.max_send_wr);
+  Status status = rail.queue_pair.ModifyToInit();
+  if (!status.ok()) {
+    return status;
+  }
+  return rail;
 }
 
 }  // namespace infiniband

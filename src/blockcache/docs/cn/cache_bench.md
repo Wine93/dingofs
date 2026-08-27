@@ -7,7 +7,7 @@
 ```bash
 --remote_rdma=true
 --remote_rdma_device=mlx5_0
---remote_rdma_port_num=1
+--rdma_port_num=1
 --fsid=10000
 
 --shards=8

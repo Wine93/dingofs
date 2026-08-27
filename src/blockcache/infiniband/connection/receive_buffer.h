@@ -37,14 +37,13 @@ struct alignas(8) ReceiveBuffer {
 
 class ReceiveBufferPool {
  public:
-  ReceiveBufferPool() = default;
+  explicit ReceiveBufferPool(BufferPool* pool) : pool_(pool) {}
   ~ReceiveBufferPool();
 
   ReceiveBufferPool(const ReceiveBufferPool&) = delete;
   ReceiveBufferPool& operator=(const ReceiveBufferPool&) = delete;
 
-  Status Init(BufferPool* pool, uint32_t buffer_size, uint32_t buffer_count,
-              void* owner);
+  Status Init(uint32_t buffer_size, uint32_t buffer_count, void* owner);
 
   ReceiveBuffer& Get(uint32_t index) { return buffers_[index]; }
 
@@ -54,7 +53,7 @@ class ReceiveBufferPool {
   uint32_t lkey() const { return pool_->lkey(); }
 
  private:
-  BufferPool* pool_ = nullptr;
+  BufferPool* pool_;
   std::vector<ReceiveBuffer> buffers_;
 };
 

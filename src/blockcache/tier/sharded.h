@@ -18,18 +18,16 @@
 #define DINGOFS_BLOCKCACHE_TIER_SHARDED_H_
 
 #include <memory>
-#include <utility>
 
+#include "blockcache/block/sharded_block_cache.h"
 #include "blockcache/common/mds_client.h"
-#include "blockcache/common/route.h"
-#include "blockcache/core/runtime/sharded.h"
 #include "blockcache/object/object.h"
 #include "blockcache/tier/tier_cache.h"
 
 namespace dingofs {
 namespace blockcache {
 
-class ShardedTierCache {
+class ShardedTierCache final : public ShardedBlockCache<TierCache> {
  public:
   ShardedTierCache(MDSClient* mds_client, ObjectStorageUPtr storage);
   ~ShardedTierCache();
@@ -40,24 +38,9 @@ class ShardedTierCache {
   Status Start();
   void Shutdown();
 
-  Future<Status> Put(BlockHandle handle, BufferViews block,
-                     PutOption option = {});
-  Future<Status> Get(BlockHandle handle, uint64_t offset, uint32_t length,
-                     char* buffer, GetOption option = {});
-  Future<Status> Prefetch(BlockHandle handle, PrefetchOption option = {});
-  Future<Status> Delete(BlockHandle handle, DeleteOption option = {});
-  Future<CacheStats> GetStats();
-
  private:
-  template <typename Fn>
-  auto InvokeOnOwner(const BlockHandle& handle, Fn fn) {
-    return tiers_.InvokeOn(OwnerShard(handle), std::move(fn));
-  }
-
-  bool running_ = false;
   MDSClient* mds_client_;
   ObjectStorageUPtr storage_;
-  Sharded<TierCache> tiers_;
 };
 
 using ShardedTierCacheUPtr = std::unique_ptr<ShardedTierCache>;

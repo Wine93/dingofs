@@ -27,10 +27,9 @@
 #include "blockcache/api/task.h"
 #include "blockcache/common/flag_decls.h"
 #include "blockcache/common/route.h"
-#include "blockcache/core/memory/buffer.h"
 #include "blockcache/core/runtime/shard_inbox.h"
 #include "blockcache/core/runtime/smp.h"
-#include "blockcache/net/server/client_domain.h"
+#include "blockcache/infiniband/client/client.h"
 
 namespace dingofs {
 namespace blockcache {
@@ -46,15 +45,15 @@ BlockCacheImpl::~BlockCacheImpl() { Shutdown(); }
 
 Status BlockCacheImpl::Start() {
   CHECK(!HasReactor()) << "Start on a shard thread";
-  CHECK(runtime_ == nullptr) << "BlockCacheImpl started twice";
+  CHECK(!ProcessRuntimeStarted()) << "BlockCacheImpl started twice";
 
   LOG(INFO) << "BlockCacheImpl is starting...";
 
-  StartRuntime();
+  StartProcessRuntime();
 
   Status status = StartTierCache();
   if (!status.ok()) {
-    StopRuntime();
+    StopProcessRuntime();
     return status;
   }
 
@@ -71,7 +70,7 @@ Status BlockCacheImpl::Start() {
 void BlockCacheImpl::Shutdown() {
   CHECK(!HasReactor()) << "Shutdown on a shard thread";
 
-  if (runtime_ == nullptr) {
+  if (!ProcessRuntimeStarted()) {
     return;
   }
 
@@ -81,63 +80,9 @@ void BlockCacheImpl::Shutdown() {
 
   DrainInflight();
   StopTierCache();
-  StopRuntime();
+  StopProcessRuntime();
 
   LOG(INFO) << "Successfully shutdown BlockCacheImpl";
-}
-
-void BlockCacheImpl::StartRuntime() {
-  RuntimeOption option;
-  option.shard_count = FLAGS_shards;
-  option.cpuset = FLAGS_cpuset;
-  option.pin_to_cpu = FLAGS_pin_cpu;
-  option.reactor.poll_mode = FLAGS_poll_mode;
-  runtime_ = std::make_unique<Runtime>(option);
-  runtime_->Start();
-
-  Status status = BufferPool::InitOnAllShards(FLAGS_buffer_pool_mb << 20);
-  CHECK(status.ok()) << "Fail to create the buffer pools: "
-                     << status.ToString();
-
-  worker_pool_ = std::make_unique<WorkerPool>(WorkerPool::Option{});
-  worker_pool_->Start();
-}
-
-Status BlockCacheImpl::StartTierCache() {
-  const bool with_remote = !FLAGS_cache_group.empty();
-  LOG(INFO) << "BlockCacheImpl local=" << (FLAGS_cache_store == "disk")
-            << " remote=" << with_remote
-            << " rdma=" << (FLAGS_remote_rdma && with_remote)
-            << " storage=" << (storage_ != nullptr);
-
-  tier_cache_ =
-      std::make_unique<ShardedTierCache>(mds_client_, std::move(storage_));
-  Status status = tier_cache_->Start();
-  if (!status.ok()) {
-    LOG(ERROR) << "Fail to start the tier cache: " << status.ToString();
-    tier_cache_.reset();
-  }
-  return status;
-}
-
-void BlockCacheImpl::DrainInflight() {
-  while (throttle_->Inflights() != 0) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
-}
-
-void BlockCacheImpl::StopTierCache() {
-  tier_cache_->Shutdown();
-  tier_cache_.reset();
-}
-
-void BlockCacheImpl::StopRuntime() {
-  worker_pool_->Shutdown();
-  worker_pool_.reset();
-  BufferPool::ShutdownOnAllShards();
-  runtime_->Shutdown();
-  runtime_->Join();
-  runtime_.reset();
 }
 
 bool BlockCacheImpl::AsyncPut(BlockHandle handle, BufferViews block,
@@ -192,7 +137,35 @@ Status BlockCacheImpl::RegisterBuffers(void* base, size_t bytes) {
   if (!FLAGS_remote_rdma || mds_client_ == nullptr) {
     return Status::OK();
   }
-  return ClientDomain::RegisterOnAllShards(base, bytes);
+  return infiniband::Client::RegisterOnAllShards(base, bytes);
+}
+
+Status BlockCacheImpl::StartTierCache() {
+  const bool with_remote = !FLAGS_cache_group.empty();
+  LOG(INFO) << "BlockCacheImpl local=" << (FLAGS_cache_store == "disk")
+            << " remote=" << with_remote
+            << " rdma=" << (FLAGS_remote_rdma && with_remote)
+            << " storage=" << (storage_ != nullptr);
+
+  tier_cache_ =
+      std::make_unique<ShardedTierCache>(mds_client_, std::move(storage_));
+  Status status = tier_cache_->Start();
+  if (!status.ok()) {
+    LOG(ERROR) << "Fail to start the tier cache: " << status.ToString();
+    tier_cache_.reset();
+  }
+  return status;
+}
+
+void BlockCacheImpl::StopTierCache() {
+  tier_cache_->Shutdown();
+  tier_cache_.reset();
+}
+
+void BlockCacheImpl::DrainInflight() {
+  while (throttle_->Inflights() != 0) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
 }
 
 bool BlockCacheImpl::Check(BlockHandle handle, unsigned* shard) {
@@ -269,7 +242,7 @@ Future<> BlockCacheImpl::AwaitTask(InboxTask* context, Future<Status> future) {
 void BlockCacheImpl::FinishTask(InboxTask* context, Status status) {
   context->status = std::move(status);
   context->run = &BlockCacheImpl::CompleteTask;
-  worker_pool_->Post(context);
+  GetGlobalWorkers()->Post(context);
 }
 
 void BlockCacheImpl::CompleteTask(InboxWork* base) {

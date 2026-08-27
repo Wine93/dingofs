@@ -17,9 +17,13 @@
 #ifndef DINGOFS_BLOCKCACHE_NODE_NODE_H_
 #define DINGOFS_BLOCKCACHE_NODE_NODE_H_
 
+#include <memory>
+#include <vector>
+
 #include "blockcache/block/sharded.h"
 #include "blockcache/common/mds_client.h"
-#include "blockcache/net/server/server.h"
+#include "blockcache/infiniband/server/server.h"
+#include "blockcache/net/brpc_server.h"
 #include "blockcache/node/heartbeat.h"
 #include "blockcache/node/membership.h"
 #include "blockcache/node/service.h"
@@ -40,15 +44,28 @@ class CacheNode {
   void RunUntilAskedToQuit();
 
  private:
-  friend class CacheNodeBuilder;
   explicit CacheNode(MDSClientUPtr mds_client);
 
-  Status StartServer();
+  Status StartServers();
+  void ShutdownServers();
+
+  // One CacheService per shard, constructed ON that shard and owned here;
+  // the raw vector is what both servers dispatch through.
+  Status BuildServices();
+  void DropServices();
 
   bool running_ = false;
   MDSClientUPtr mds_client_;
   ShardedLocalCacheUPtr block_cache_;
-  ServerUPtr server_;
+
+  std::vector<std::unique_ptr<CacheService>> services_;
+  std::vector<CacheService*> cache_services_;
+
+  // Two servers, no shared base: brpc dispatches by method name, rdma by
+  // opcode through its own per-shard tables.
+  std::unique_ptr<infiniband::Server> rdma_server_;
+  std::unique_ptr<net::BrpcServer> brpc_server_;
+
   GroupMembershipUPtr membership_;
   HeartbeatUPtr heartbeat_;
 };

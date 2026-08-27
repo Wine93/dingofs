@@ -33,14 +33,13 @@ SendBufferPool::~SendBufferPool() {
   }
 }
 
-Status SendBufferPool::Init(BufferPool* pool, uint32_t buffer_size,
-                            uint32_t buffer_count, void* owner) {
-  pool_ = pool;
+Status SendBufferPool::Init(uint32_t buffer_size, uint32_t buffer_count,
+                            void* owner) {
   buffer_size_ = buffer_size;
   buffers_.resize(buffer_count);
 
   for (uint32_t i = 0; i < buffer_count; ++i) {
-    char* data = pool->Alloc(buffer_size);
+    char* data = pool_->Alloc(buffer_size);
     if (data == nullptr) {
       return ToStatus(ENOMEM, "alloc send buffer failed");
     }

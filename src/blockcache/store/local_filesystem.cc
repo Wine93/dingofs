@@ -34,14 +34,12 @@ Future<Status> LocalFileSystem::WriteFile(std::string path, BufferViews block) {
     co_return check;
   }
 
-  // mkdir
   const Status mkdir = co_await FileSystem::MakeDirs(
       std::filesystem::path(path).parent_path().string());
   if (!mkdir.ok()) {
     co_return Report(mkdir);
   }
 
-  // open
   const bool direct =
       block.size() == 1 && IsAligned(block[0].data, kBlockAlign);
   std::string tmp_path = DiskCacheLayout::TempPath(path);
@@ -51,7 +49,6 @@ Future<Status> LocalFileSystem::WriteFile(std::string path, BufferViews block) {
     co_return Report(open.status());
   }
 
-  // write
   File file = std::move(open).value();
   Status status = co_await WriteFile(&file, block, direct);
   const Status close = co_await file.Close();
@@ -59,7 +56,6 @@ Future<Status> LocalFileSystem::WriteFile(std::string path, BufferViews block) {
     status = close;
   }
 
-  // rename
   if (status.ok()) {
     status = co_await FileSystem::Rename(std::move(tmp_path), std::move(path));
   } else {
@@ -74,14 +70,12 @@ Future<Status> LocalFileSystem::ReadFile(std::string path, uint64_t offset,
                       IsAligned(offset, kBlockAlign) &&
                       IsAligned(length, kBlockAlign);
 
-  // open
   StatusOr<File> open =
       co_await OpenFile(std::move(path), OpenFlags::kRead, direct);
   if (!open.ok()) {
     co_return Report(open.status());
   }
 
-  // read
   File file = std::move(open).value();
   Status status = Status::OK();
   StatusOr<size_t> nread = co_await file.Read(offset, buffer, length);
@@ -91,7 +85,6 @@ Future<Status> LocalFileSystem::ReadFile(std::string path, uint64_t offset,
     status = Status::IoError("short read");
   }
 
-  // close
   const Status close = co_await file.Close();
   co_return Report(status.ok() ? close : status);
 }
@@ -113,7 +106,7 @@ Future<bool> LocalFileSystem::FileExists(std::string path) {
   co_return (co_await FileSystem::StatPath(std::move(path))).ok();
 }
 
-Status LocalFileSystem::CheckBlock(const BufferViews& block) {
+Status LocalFileSystem::CheckBlock(BufferViews block) {
   if (block.empty() || block.size() > kMaxBufferViews ||
       TotalBytes(block) == 0) {
     return Status::InvalidParam("a block is 1.." +

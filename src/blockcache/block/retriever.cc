@@ -120,7 +120,6 @@ Future<> ObjectRetriever::RunRetrieval(BlockHandle handle,
 
   InflightTracker::Waiters waiters = inflight_.TakeWaiters(handle);
 
-  // failed
   if (!status.ok()) {
     for (auto& waiter : waiters) {
       waiter.SetValue(status);
@@ -128,7 +127,6 @@ Future<> ObjectRetriever::RunRetrieval(BlockHandle handle,
     co_return;
   }
 
-  // success
   for (auto& waiter : waiters) {
     waiter.SetValue(block);
   }

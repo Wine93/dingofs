@@ -18,21 +18,18 @@
 #define DINGOFS_BLOCKCACHE_BLOCK_SHARDED_H_
 
 #include <memory>
-#include <utility>
 
 #include "blockcache/block/local_cache.h"
+#include "blockcache/block/sharded_block_cache.h"
 #include "blockcache/common/mds_client.h"
-#include "blockcache/common/route.h"
-#include "blockcache/core/runtime/sharded.h"
 #include "blockcache/object/object.h"
 
 namespace dingofs {
 namespace blockcache {
 
-class ShardedLocalCache {
+class ShardedLocalCache final : public ShardedBlockCache<LocalCache> {
  public:
   explicit ShardedLocalCache(MDSClient* mds_client);
-  explicit ShardedLocalCache(ObjectStorageUPtr storage);
   ~ShardedLocalCache();
 
   ShardedLocalCache(const ShardedLocalCache&) = delete;
@@ -41,24 +38,9 @@ class ShardedLocalCache {
   Status Start();
   void Shutdown();
 
-  Future<Status> Put(BlockHandle handle, BufferViews block,
-                     PutOption option = {});
-  Future<Status> Get(BlockHandle handle, uint64_t offset, uint32_t length,
-                     char* buffer, GetOption option = {});
-  Future<Status> Prefetch(BlockHandle handle, PrefetchOption option = {});
-  Future<Status> Delete(BlockHandle handle, DeleteOption option = {});
-  Future<CacheStats> GetStats();
-
  private:
-  template <typename Fn>
-  auto InvokeOnOwner(const BlockHandle& handle, Fn fn) {
-    return block_cache_.InvokeOn(OwnerShard(handle), std::move(fn));
-  }
-
-  bool running_ = false;
   StorageClientUPtr storage_client_;
   ObjectStorageUPtr storage_;
-  Sharded<LocalCache> block_cache_;
 };
 
 using ShardedLocalCacheUPtr = std::unique_ptr<ShardedLocalCache>;

@@ -117,6 +117,32 @@ Future<Status> LocalCache::Get(BlockHandle handle, uint64_t offset,
   co_return co_await GetWhole(handle, offset, length, buffer);
 }
 
+Future<Status> LocalCache::Prefetch(BlockHandle handle,
+                                    PrefetchOption /*option*/) {
+  if (!running_) {
+    co_return Status::CacheDown("LocalCache is down");
+  }
+
+  if (co_await store_->Exists(handle)) {
+    co_return Status::OK();
+  }
+  co_return co_await object_retriever_->Prefetch(handle);
+}
+
+Future<Status> LocalCache::Delete(BlockHandle handle, DeleteOption /*option*/) {
+  if (!running_) {
+    co_return Status::CacheDown("LocalCache is down");
+  }
+  co_return co_await store_->Delete(handle);
+}
+
+Future<CacheStats> LocalCache::GetStats() {
+  if (!running_) {
+    return MakeReadyFuture<CacheStats>(CacheStats{});
+  }
+  return store_->GetStats();
+}
+
 Future<Status> LocalCache::GetPart(BlockHandle handle, uint64_t offset,
                                    uint32_t length, char* buffer) {
   const Status status =
@@ -159,32 +185,6 @@ Future<> LocalCache::CopyBlock(SharedBlock block, uint64_t offset,
                                    std::memcpy(buffer, from, length);
                                    return Status::OK();
                                  });
-}
-
-Future<Status> LocalCache::Prefetch(BlockHandle handle,
-                                    PrefetchOption /*option*/) {
-  if (!running_) {
-    co_return Status::CacheDown("LocalCache is down");
-  }
-
-  if (co_await store_->Exists(handle)) {
-    co_return Status::OK();
-  }
-  co_return co_await object_retriever_->Prefetch(handle);
-}
-
-Future<Status> LocalCache::Delete(BlockHandle handle, DeleteOption /*option*/) {
-  if (!running_) {
-    co_return Status::CacheDown("LocalCache is down");
-  }
-  co_return co_await store_->Delete(handle);
-}
-
-Future<CacheStats> LocalCache::GetStats() {
-  if (!running_) {
-    return MakeReadyFuture<CacheStats>(CacheStats{});
-  }
-  return store_->GetStats();
 }
 
 }  // namespace blockcache

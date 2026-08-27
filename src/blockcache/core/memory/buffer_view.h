@@ -27,7 +27,7 @@ namespace dingofs {
 namespace blockcache {
 
 // Borrowed range, owns nothing. Deliberately no lkey field (per-PD state).
-// uint32_t size: RegionDesc::len and LocalBuf::len are 32-bit.
+// uint32_t size: RemoteRegion::len and LocalBuf::len are 32-bit.
 struct BufferView {
   void* data = nullptr;
   uint32_t size = 0;

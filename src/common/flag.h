@@ -52,9 +52,18 @@ struct FlagsInfo {
 // Source-file path patterns that identify dingofs SDK flags.
 // Used by both dingo-client --help and DingofsClient::ListOptions/PrintOptions.
 static const std::vector<std::string> kSdkFlagPatterns = {
-    "src/client",          "cache/common",     "cache/storage",
-    "cache/tiercache",     "cache/blockcache", "cache/remotecache",
-    "options/blockaccess", "options/client",   "options/common",
+    "src/client",
+    "cache/common",
+    "cache/storage",
+    "cache/tiercache",
+    "cache/blockcache",
+    "cache/remotecache",
+    "options/blockaccess",
+    "options/client",
+    "options/common",
+    // WITH_CLIENT_BLOCKCACHE=ON: without this only src/blockcache/common/
+    // matched, by accident, through the "cache/common" substring.
+    "src/blockcache",
 };
 
 static FlagsInfo g_flags;

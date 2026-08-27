@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-file(GLOB BLOCKCACHE_TIER_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/*.cc")
+file(GLOB BLOCKCACHE_TIER_SRCS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.cc")
 
 add_library(blockcache_tier ${BLOCKCACHE_TIER_SRCS})
 target_compile_features(blockcache_tier PRIVATE cxx_std_20)

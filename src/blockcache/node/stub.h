@@ -19,74 +19,78 @@
 
 #include <memory>
 
-#include "blockcache/net/protocol/stub.h"
+#include "blockcache/net/stub.h"
 #include "dingofs/cache.pb.h"
 
 namespace dingofs {
 namespace blockcache {
 
-class CacheStub : public Stub {
+class CacheStub : public net::Stub {
  public:
-  explicit CacheStub(Channel* channel)
-      : Stub(channel, pb::cache::v2::CacheService::descriptor()) {
+  explicit CacheStub(net::Channel* channel)
+      : net::Stub(channel, pb::cache::v2::CacheService::descriptor()) {
     CheckComplete();
   }
 
-  Future<Status> Put(Controller* cntl, const pb::cache::v2::PutRequest* request,
+  Future<Status> Put(net::Controller* cntl,
+                     const pb::cache::v2::PutRequest* request,
                      pb::cache::v2::PutResponse* response) {
     return Call(put_, request, response, cntl);
   }
 
-  Future<Status> Get(Controller* cntl, const pb::cache::v2::GetRequest* request,
+  Future<Status> Get(net::Controller* cntl,
+                     const pb::cache::v2::GetRequest* request,
                      pb::cache::v2::GetResponse* response) {
     return Call(get_, request, response, cntl);
   }
 
-  Future<Status> Prefetch(Controller* cntl,
+  Future<Status> Prefetch(net::Controller* cntl,
                           const pb::cache::v2::PrefetchRequest* request,
                           pb::cache::v2::PrefetchResponse* response) {
     return Call(prefetch_, request, response, cntl);
   }
 
-  Future<Status> Delete(Controller* cntl,
+  Future<Status> Delete(net::Controller* cntl,
                         const pb::cache::v2::DeleteRequest* request,
                         pb::cache::v2::DeleteResponse* response) {
     return Call(delete_, request, response, cntl);
   }
 
-  Future<Status> Ping(Controller* cntl,
+  Future<Status> Ping(net::Controller* cntl,
                       const pb::cache::v2::PingRequest* request,
                       pb::cache::v2::PingResponse* response) {
     return Call(ping_, request, response, cntl);
   }
 
-  Future<Status> GetNodeInfo(Controller* cntl,
+  Future<Status> GetNodeInfo(net::Controller* cntl,
                              const pb::cache::v2::GetNodeInfoRequest* request,
                              pb::cache::v2::GetNodeInfoResponse* response) {
     return Call(get_node_info_, request, response, cntl);
   }
 
  private:
-  MethodRef<pb::cache::v2::PutRequest, pb::cache::v2::PutResponse> put_ =
+  net::MethodRef<pb::cache::v2::PutRequest, pb::cache::v2::PutResponse> put_ =
       Resolve<pb::cache::v2::PutRequest, pb::cache::v2::PutResponse>("Put");
 
-  MethodRef<pb::cache::v2::GetRequest, pb::cache::v2::GetResponse> get_ =
+  net::MethodRef<pb::cache::v2::GetRequest, pb::cache::v2::GetResponse> get_ =
       Resolve<pb::cache::v2::GetRequest, pb::cache::v2::GetResponse>("Get");
 
-  MethodRef<pb::cache::v2::PrefetchRequest, pb::cache::v2::PrefetchResponse>
+  net::MethodRef<pb::cache::v2::PrefetchRequest,
+                 pb::cache::v2::PrefetchResponse>
       prefetch_ = Resolve<pb::cache::v2::PrefetchRequest,
                           pb::cache::v2::PrefetchResponse>("Prefetch");
 
-  MethodRef<pb::cache::v2::DeleteRequest, pb::cache::v2::DeleteResponse>
+  net::MethodRef<pb::cache::v2::DeleteRequest, pb::cache::v2::DeleteResponse>
       delete_ =
           Resolve<pb::cache::v2::DeleteRequest, pb::cache::v2::DeleteResponse>(
               "Delete");
 
-  MethodRef<pb::cache::v2::PingRequest, pb::cache::v2::PingResponse> ping_ =
-      Resolve<pb::cache::v2::PingRequest, pb::cache::v2::PingResponse>("Ping");
+  net::MethodRef<pb::cache::v2::PingRequest, pb::cache::v2::PingResponse>
+      ping_ = Resolve<pb::cache::v2::PingRequest, pb::cache::v2::PingResponse>(
+          "Ping");
 
-  MethodRef<pb::cache::v2::GetNodeInfoRequest,
-            pb::cache::v2::GetNodeInfoResponse>
+  net::MethodRef<pb::cache::v2::GetNodeInfoRequest,
+                 pb::cache::v2::GetNodeInfoResponse>
       get_node_info_ =
           Resolve<pb::cache::v2::GetNodeInfoRequest,
                   pb::cache::v2::GetNodeInfoResponse>("GetNodeInfo");

@@ -42,9 +42,11 @@ DEFINE_uint32(storage_get_notfound_tries, 8,
 DEFINE_validator(storage_get_notfound_tries, brpc::PassValidate);
 
 DEFINE_uint32(storage_put_backoff_base_ms, 1000,
-              "first upload retry delay, doubling up to the cap (ms)");
+              "upload retry delay, grows linearly with the try count, up to "
+              "the cap (ms)");
 DEFINE_uint32(storage_get_backoff_base_ms, 300,
-              "first retrieve retry delay, doubling up to the cap (ms)");
+              "retrieve retry delay, grows linearly with the try count, up to "
+              "the cap (ms)");
 DEFINE_uint32(storage_get_notfound_backoff_base_ms, 500,
               "first retry delay after a not-found retrieve (ms)");
 
@@ -86,55 +88,6 @@ ObjectStorage::ObjectStorage(StorageClient* client)
       num_download_retry_("dingofs_storage_download_total_retry"),
       num_download_notfound_retry_(
           "dingofs_storage_download_notfound_total_retry") {}
-
-Future<Status> ObjectStorage::PutOnce(uint64_t fs_id, const std::string& key,
-                                      const blockaccess::PutPayload& payload) {
-  return GetGlobalWorkers()->Submit([this, fs_id, &key, &payload]() -> Status {
-    blockaccess::BlockAccesser* accesser = nullptr;
-    Status status = client_->GetOrCreate(fs_id, &accesser);
-    if (!status.ok()) {
-      return status;
-    }
-
-    if (!client_->running()) {
-      return Status::Abort("object storage is shutting down");
-    }
-    return accesser->Put(key, payload);
-  });
-}
-
-Future<Status> ObjectStorage::GetOnce(uint64_t fs_id, const std::string& key,
-                                      uint64_t offset, uint32_t length,
-                                      char* buffer) {
-  return GetGlobalWorkers()->Submit(
-      [this, fs_id, &key, offset, length, buffer]() -> Status {
-        blockaccess::BlockAccesser* accesser = nullptr;
-        Status status = client_->GetOrCreate(fs_id, &accesser);
-        if (!status.ok()) {
-          return status;
-        }
-
-        if (!client_->running()) {
-          return Status::Abort("object storage is shutting down");
-        }
-
-        return accesser->Range(key, static_cast<off_t>(offset),
-                               static_cast<size_t>(length), buffer);
-      });
-}
-
-Future<bool> ObjectStorage::WaitBackoff(uint64_t backoff_ms) {
-  for (uint64_t waited = 0; waited < backoff_ms; waited += kBackoffSliceMs) {
-    if (!client_->running()) {
-      co_return false;
-    }
-
-    auto timeout = std::chrono::milliseconds(
-        std::min(kBackoffSliceMs, backoff_ms - waited));
-    co_await Sleep(timeout);
-  }
-  co_return client_->running();
-}
 
 Future<Status> ObjectStorage::Put(BlockHandle handle, BufferViews block,
                                   ObjectPutOption option) {
@@ -221,6 +174,55 @@ Future<Status> ObjectStorage::Get(BlockHandle handle, uint64_t offset,
       co_return Status::Abort("object storage is shutting down");
     }
   }
+}
+
+Future<Status> ObjectStorage::PutOnce(uint64_t fs_id, const std::string& key,
+                                      const blockaccess::PutPayload& payload) {
+  return GetGlobalWorkers()->Submit([this, fs_id, &key, &payload]() -> Status {
+    blockaccess::BlockAccesser* accesser = nullptr;
+    Status status = client_->GetOrCreate(fs_id, &accesser);
+    if (!status.ok()) {
+      return status;
+    }
+
+    if (!client_->running()) {
+      return Status::Abort("object storage is shutting down");
+    }
+    return accesser->Put(key, payload);
+  });
+}
+
+Future<Status> ObjectStorage::GetOnce(uint64_t fs_id, const std::string& key,
+                                      uint64_t offset, uint32_t length,
+                                      char* buffer) {
+  return GetGlobalWorkers()->Submit(
+      [this, fs_id, &key, offset, length, buffer]() -> Status {
+        blockaccess::BlockAccesser* accesser = nullptr;
+        Status status = client_->GetOrCreate(fs_id, &accesser);
+        if (!status.ok()) {
+          return status;
+        }
+
+        if (!client_->running()) {
+          return Status::Abort("object storage is shutting down");
+        }
+
+        return accesser->Range(key, static_cast<off_t>(offset),
+                               static_cast<size_t>(length), buffer);
+      });
+}
+
+Future<bool> ObjectStorage::WaitBackoff(uint64_t backoff_ms) {
+  for (uint64_t waited = 0; waited < backoff_ms; waited += kBackoffSliceMs) {
+    if (!client_->running()) {
+      co_return false;
+    }
+
+    auto timeout = std::chrono::milliseconds(
+        std::min(kBackoffSliceMs, backoff_ms - waited));
+    co_await Sleep(timeout);
+  }
+  co_return client_->running();
 }
 
 }  // namespace blockcache

@@ -147,12 +147,11 @@ Future<bool> HealthChecker::CheckDisk() const {
     co_return false;
   }
 
-  const uint64_t elapsed_ms = (TimestampNs() - begin_ns) / 1000000ULL;
+  const uint64_t elapsed_ms = (TimestampNs() - begin_ns) / kNsPerMs;
   co_return elapsed_ms <= FLAGS_disk_state_probe_timeout_ms;
 }
 
 Future<bool> HealthChecker::WriteProbeFile(std::string path) const {
-  // open
   StatusOr<File> open =
       co_await FileSystem::Open(path, OpenFlags::kWrite | OpenFlags::kCreate,
                                 LocalFileSystem::BlockOpenOption());
@@ -160,30 +159,25 @@ Future<bool> HealthChecker::WriteProbeFile(std::string path) const {
     co_return false;
   }
 
-  // write
   File file = std::move(open).value();
   StatusOr<size_t> nwritten =
       co_await file.Write(0, write_buffer_, kProbeBytes);
 
-  // close
   const Status close = co_await file.Close();
 
   co_return nwritten.ok() && *nwritten == kProbeBytes&& close.ok();
 }
 
 Future<bool> HealthChecker::ReadProbeFile(std::string path) const {
-  // open
   StatusOr<File> open = co_await FileSystem::Open(
       path, OpenFlags::kRead, LocalFileSystem::BlockOpenOption());
   if (!open.ok()) {
     co_return false;
   }
 
-  // read
   File file = std::move(open).value();
   StatusOr<size_t> nread = co_await file.Read(0, read_buffer_, kProbeBytes);
 
-  // close
   (void)co_await file.Close();
   if (!nread.ok() || *nread != kProbeBytes) {
     co_return false;

@@ -45,9 +45,6 @@ class TierCache final : public BlockCache {
   Future<CacheStats> GetStats() override;
 
  private:
-  friend class TierCacheTest;
-  friend class TierE2ETest;
-
   TierCache(ObjectStorage* storage, BlockCacheUPtr local,
             BlockCacheUPtr remote);
 
@@ -56,7 +53,7 @@ class TierCache final : public BlockCache {
 
   static BlockCacheUPtr MakeLocal(ObjectStorage* storage);
   static BlockCacheUPtr MakeRemote(MDSClient* mds_client);
-  static void LogTierMiss(const char* tier, const BlockHandle& handle,
+  static void LogTierMiss(const char* tier, BlockHandle handle,
                           const Status& status);
 
   bool running_ = false;

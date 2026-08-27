@@ -66,8 +66,6 @@ class Sharded {
   Sharded(const Sharded&) = delete;
   Sharded& operator=(const Sharded&) = delete;
 
-  // -- external thread ------------------------------------------------------
-
   // `factory` runs ON its shard and may vary per instance -- hand each shard
   // its own slice of whatever the launcher prepared. All shards build at once;
   // if any fails, none survive.
@@ -103,8 +101,6 @@ class Sharded {
     instances_.clear();
   }
 
-  // -- any thread -----------------------------------------------------------
-
   // Fire-and-forget `func(service)` on every shard, waiting for none of them.
   // For publishing a value the shards should pick up when they get to it -- a
   // new topology, a reloaded config -- from a thread that must not block.
@@ -121,8 +117,6 @@ class Sharded {
       }
     }
   }
-
-  // -- shard ----------------------------------------------------------------
 
   template <typename Func>
   auto InvokeOn(unsigned shard, Func func) {
