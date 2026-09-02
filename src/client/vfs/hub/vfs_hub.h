@@ -47,6 +47,8 @@ namespace client {
 namespace vfs {
 
 class WriterTable;  // forward decl; full include lives in vfs_hub.cc
+class WritePressureController;
+class ReaderRegistry;
 
 class VFSHub {
  public:
@@ -63,6 +65,8 @@ class VFSHub {
   virtual MetaWrapper* GetMetaSystem() = 0;
 
   virtual HandleManager* GetHandleManager() = 0;
+
+  virtual ReaderRegistry* GetReaderRegistry() = 0;
 
   virtual WriterTable* GetWriterTable() = 0;
 
@@ -103,7 +107,8 @@ class VFSHub {
 
 class VFSHubImpl : public VFSHub {
  public:
-  VFSHubImpl(const VFSConfig& vfs_conf, ClientId client_id);
+  VFSHubImpl(const VFSConfig& vfs_conf, ClientId client_id,
+             TraceManager& trace_manager);
 
   ~VFSHubImpl() override;
 
@@ -121,6 +126,11 @@ class VFSHubImpl : public VFSHub {
   HandleManager* GetHandleManager() override {
     CHECK_NOTNULL(handle_manager_);
     return handle_manager_.get();
+  }
+
+  ReaderRegistry* GetReaderRegistry() override {
+    CHECK_NOTNULL(reader_registry_);
+    return reader_registry_.get();
   }
 
   WriterTable* GetWriterTable() override;  // out-of-line (see vfs_hub.cc)
@@ -195,10 +205,7 @@ class VFSHubImpl : public VFSHub {
     return fs_info_;
   }
 
-  TraceManager* GetTraceManager() override {
-    CHECK_NOTNULL(trace_manager_);
-    return trace_manager_.get();
-  }
+  TraceManager* GetTraceManager() override { return &trace_manager_; }
 
   blockaccess::BlockAccessOptions GetBlockAccesserOptions() override {
     CHECK(started_.load(std::memory_order_relaxed)) << "not started";
@@ -223,16 +230,29 @@ class VFSHubImpl : public VFSHub {
 
   blockaccess::BlockAccessOptions blockaccess_options_;
 
+  TraceManager& trace_manager_;
   const ClientId client_id_;
   const VFSConfig vfs_conf_;
 
   FsInfo fs_info_;
   S3Info s3_info_;
 
-  std::unique_ptr<TraceManager> trace_manager_;
   std::unique_ptr<Compactor> compactor_;
   std::unique_ptr<MetaWrapper> meta_wrapper_;
+
+  // Destruction order is load-bearing. C++ destroys members in reverse
+  // declaration order, so keep these declarations in this order:
+  //
+  //   declared:  WriterTable -> ReaderRegistry -> HandleManager
+  //   destroyed: HandleManager -> ReaderRegistry -> WriterTable
+  //
+  // HandleManager::~HandleManager() may call Stop(), which flushes writers,
+  // invalidates and unregisters readers, and releases writer holders. Both
+  // ReaderRegistry and WriterTable must therefore remain alive until
+  // HandleManager has been destroyed, including partial-Start/error paths
+  // where the normal explicit Stop() sequence may not have completed.
   std::unique_ptr<WriterTable> writer_table_;
+  std::unique_ptr<ReaderRegistry> reader_registry_;
   std::unique_ptr<HandleManager> handle_manager_;
   std::unique_ptr<blockaccess::BlockAccesser> block_accesser_;
   std::unique_ptr<BlockStore> block_store_;
@@ -252,7 +272,9 @@ class VFSHubImpl : public VFSHub {
 
   std::unique_ptr<Executor> flush_executor_;
   std::unique_ptr<Executor> cb_executor_;
+  std::unique_ptr<Executor> write_pressure_executor_;
   std::unique_ptr<WriteMemPool> write_buffer_manager_;
+  std::unique_ptr<WritePressureController> write_pressure_controller_;
   std::unique_ptr<ReadMemPool> read_mem_pool_;
   std::unique_ptr<ReadMemPoolVars>
       read_mem_pool_vars_;  // after pool: dtor first

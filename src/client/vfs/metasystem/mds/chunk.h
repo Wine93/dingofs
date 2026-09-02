@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -28,7 +29,6 @@
 #include "absl/container/flat_hash_set.h"
 #include "client/vfs/metasystem/mds/helper.h"
 #include "client/vfs/vfs_meta.h"
-#include "common/options/client.h"
 #include "json/value.h"
 #include "mds/common/synchronization.h"
 #include "mds/common/type.h"
@@ -76,8 +76,8 @@ class Chunk {
   uint32_t GetIndex() const { return index_; }
 
   bool Put(const ChunkEntry& chunk, const char* reason);
-  bool Compact(uint32_t start_pos, uint64_t start_slice_id, uint32_t end_pos,
-               uint64_t end_slice_id, const std::vector<Slice>& new_slices);
+  bool Compact(const std::vector<Slice>& old_slices,
+               const std::vector<Slice>& new_slices);
   void AppendSlice(const std::vector<Slice>& slices);
 
   void SetNotCompleted() {
@@ -159,14 +159,16 @@ class CommitTask {
     std::vector<Slice> slices;
   };
 
-  CommitTask(uint64_t task_id, std::vector<DeltaSlice>&& delta_slices,
-             uint32_t chunk_size)
+  CommitTask(uint64_t task_id, uint64_t epoch,
+             std::vector<DeltaSlice>&& delta_slices, uint32_t chunk_size)
       : task_id_(task_id),
+        epoch_(epoch),
         delta_slices_(std::move(delta_slices)),
         chunk_size_(chunk_size),
         cond(1) {}
 
   uint64_t TaskID() const { return task_id_; }
+  uint64_t Epoch() const { return epoch_; }
   const std::vector<DeltaSlice>& DeltaSlices() const { return delta_slices_; }
 
   std::vector<uint32_t> GetChunkIndexs() const {
@@ -228,7 +230,7 @@ class CommitTask {
     return status_;
   }
 
-  bool MaybeRun() {
+  bool MaybeRun(bool retry_failed = true) {
     utils::WriteLockGuard lk(lock_);
 
     if (state_ == State::INIT) {
@@ -239,7 +241,7 @@ class CommitTask {
       return false;
 
     } else {
-      if (status_.ok()) return false;
+      if (status_.ok() || !retry_failed) return false;
 
       retries_.fetch_add(1, std::memory_order_relaxed);
       state_ = State::RUNNING;
@@ -252,7 +254,16 @@ class CommitTask {
 
   uint32_t Retries() const { return retries_.load(std::memory_order_relaxed); }
 
-  void Wait() { cond.Wait(); }
+  void Wait() {
+    waiter_count_.fetch_add(1, std::memory_order_relaxed);
+    cond.Wait();
+    waiter_count_.fetch_sub(1, std::memory_order_relaxed);
+  }
+
+  // for unit test only, return waiter count
+  uint32_t WaiterCount() const {
+    return waiter_count_.load(std::memory_order_relaxed);
+  }
 
   void Signal() { cond.DecreaseBroadcast(); }
 
@@ -269,6 +280,7 @@ class CommitTask {
   mutable utils::RWLock lock_;
 
   const uint64_t task_id_;
+  const uint64_t epoch_;
   const std::vector<DeltaSlice> delta_slices_;
 
   const uint32_t chunk_size_{0};
@@ -277,6 +289,8 @@ class CommitTask {
   Status status_;
 
   std::atomic<uint32_t> retries_{0};
+  // for unit test only, record how many waiters are waiting for this task
+  std::atomic<uint32_t> waiter_count_{0};
 
   mds::BthreadCond cond;
 };
@@ -284,74 +298,47 @@ class CommitTask {
 // chunk set per file
 class ChunkSet {
  public:
-  ChunkSet(Ino ino, uint32_t chunk_size)
-      : ino_(ino),
-        chunk_size_(chunk_size),
-        last_flush_ms_(utils::TimestampMs()),
-        last_active_s_(utils::Timestamp()) {}
-  ~ChunkSet() = default;
+  ChunkSet(Ino ino, uint32_t chunk_size);
+  ~ChunkSet();
 
   static ChunkSetSPtr New(Ino ino, uint32_t chunk_size) {
     return std::make_shared<ChunkSet>(ino, chunk_size);
   }
 
   Ino GetIno() const { return ino_; }
+  uint64_t Epoch() const;
 
-  // write memo operations
-  void SetLastWriteLength(uint64_t offset, uint64_t size) {
-    utils::WriteLockGuard lk(lock_);
-    last_write_length_ = std::max(last_write_length_, offset + size);
-    last_write_time_ns_ = utils::TimestampNs();
-  }
-  void ResetLastWriteLength() {
-    utils::WriteLockGuard lk(lock_);
-    last_write_length_ = 0;
-  }
-  uint64_t GetLastWriteLength() const {
-    utils::ReadLockGuard guard(lock_);
-    return last_write_length_;
-  }
+  // Serializes a metadata flush against new writes for this inode, so the set
+  // being drained cannot grow indefinitely under a sustained concurrent
+  // writer. Write operations take this mutex before updating the set.
+  using FlushGuard = std::unique_lock<bthread_mutex_t>;
+  FlushGuard AcquireFlushGuard() { return FlushGuard(write_flush_mutex_); }
 
-  uint64_t GetLastWriteTimeNs() const {
-    utils::ReadLockGuard guard(lock_);
-    return last_write_time_ns_;
-  }
-  uint64_t GetLastComitedLength() const {
-    utils::ReadLockGuard guard(lock_);
-    return last_commited_length_;
-  }
-  void ResetLastComitedLength() {
-    utils::WriteLockGuard guard(lock_);
-    last_commited_length_ = 0;
-  }
+  uint64_t GetLastWriteSliceLength() const;
+  void SetLastWriteLength(uint64_t offset, uint64_t size);
+
+  // flush checkpoint (ADR-0003): file length at open, advanced on each
+  // successful data+length flush; rollback target on data-flush failure.
+  // InitFlushCheckpoint only takes effect once per ChunkSet lifetime so a
+  // later open (e.g. a reader) cannot move the writer's rollback target.
+  void InitFlushCheckpoint(uint64_t length);
+  void SetFlushCheckpoint(uint64_t length);
+  uint64_t GetFlushCheckpoint() const;
+
+  uint64_t GetLastWriteLength() const;
+  uint64_t GetLastWriteTimeNs() const;
 
   // chunk operations
   void Append(uint32_t index, const std::vector<Slice>& slices);
+  void Put(const ChunkEntry& chunk, const char* reason);
   void Put(const std::vector<ChunkEntry>& chunks, const char* reason);
 
-  // Mark every cached chunk not-completed so the next ReadSlice re-fetches
-  // fresh slices from the MDS. Used after operations that change committed
-  // slice lists out-of-band (truncate-down / fallocate hole/zero), where the
-  // cached commited_slices_ would otherwise keep serving the pre-op data.
   void InvalidateReadCache();
 
-  size_t GetChunkSize() const {
-    utils::ReadLockGuard guard(lock_);
-    return chunk_map_.size();
-  }
+  size_t GetChunkSize() const;
 
-  bool Exist(uint32_t index) {
-    utils::ReadLockGuard guard(lock_);
-    return chunk_map_.find(index) != chunk_map_.end();
-  }
-
-  ChunkSPtr Get(uint32_t index) {
-    utils::ReadLockGuard guard(lock_);
-
-    auto it = chunk_map_.find(index);
-    return (it != chunk_map_.end()) ? it->second : nullptr;
-  }
-
+  bool Exist(uint32_t index);
+  ChunkSPtr Get(uint32_t index);
   std::vector<ChunkSPtr> GetAll();
 
   uint64_t GetVersion(uint32_t index);
@@ -359,56 +346,18 @@ class ChunkSet {
 
   bool HasStage();
   bool HasCommitting();
-
-  // task operations
-  bool HasCommitTask() {
-    utils::ReadLockGuard guard(lock_);
-    return !commit_task_map_.empty();
-  }
+  bool HasCommitTask();
 
   uint32_t TryCommitSlice(bool is_force);
 
-  void FinishCommitTask(uint64_t task_id,
-                        const std::vector<ChunkEntry>& chunks);
+  Status FinishCommitTask(CommitTaskSPtr& task,
+                          const std::vector<ChunkEntry>& chunks);
   std::vector<CommitTaskSPtr> ListCommitTask();
 
-  size_t GetCommitTaskSize() const {
-    utils::ReadLockGuard guard(lock_);
-    return commit_task_map_.size();
-  }
-
+  size_t GetCommitTaskSize() const;
   bool HasUncommitedSlice();
 
-  uint64_t GetLastActiveTimeS() const;
-
-  bool IsFlushing() const {
-    utils::ReadLockGuard guard(lock_);
-    return flushing_;
-  }
-
-  bool TryFlush() {
-    utils::WriteLockGuard guard(lock_);
-
-    if (flushing_) return false;
-    if (!last_commited_length_changed_) return false;
-
-    uint64_t now_ms = utils::TimestampMs();
-    if ((last_flush_ms_ + FLAGS_vfs_meta_flush_chunk_interval_ms) > now_ms) {
-      return false;
-    }
-
-    flushing_ = true;
-    last_flush_ms_ = now_ms;
-    last_commited_length_changed_ = false;
-
-    return true;
-  }
-
-  void ResetFlush() {
-    utils::WriteLockGuard guard(lock_);
-    flushing_ = false;
-    last_flush_ms_ = utils::TimestampMs();
-  }
+  void Reset();
 
   size_t Size() const { return GetChunkSize(); }
   size_t Bytes() const;
@@ -429,13 +378,21 @@ class ChunkSet {
   const Ino ino_;
   const uint32_t chunk_size_;
 
+  mutable bthread_mutex_t write_flush_mutex_;
   mutable utils::RWLock lock_;
 
+  // truncate/setattr(length) operation epoch
+  uint64_t epoch_{0};
+
+  // record write file length by writeslice operation
+  uint64_t last_write_slice_length_{0};
+
+  // record write file length by write operation
   uint64_t last_write_length_{0};
   uint64_t last_write_time_ns_{0};
-
-  uint64_t last_commited_length_{0};
-  bool last_commited_length_changed_{false};
+  // ADR-0003 flush checkpoint, protected by lock_
+  bool flush_checkpoint_inited_{false};
+  uint64_t flush_checkpoint_length_{0};
 
   // chunk index -> chunk
   absl::flat_hash_map<uint32_t, ChunkSPtr> chunk_map_;
@@ -446,47 +403,59 @@ class ChunkSet {
   absl::flat_hash_set<uint32_t> committing_chunk_index_set_;
 
   std::atomic<uint64_t> last_commit_ms_{0};
-
-  // flush
-  bool flushing_{false};
-  uint64_t last_flush_ms_{0};
-
-  uint64_t last_active_s_{0};
 };
 
-// all file chunk cache
-class ChunkCache {
+class ReadChunkCache {
  public:
-  ChunkCache(uint32_t chunk_size) : chunk_size_(chunk_size) {}
-  ~ChunkCache() = default;
+  ReadChunkCache() = default;
+  ~ReadChunkCache() = default;
 
-  ChunkSetSPtr Get(Ino ino);
-  ChunkSetSPtr GetOrCreate(Ino ino);
-  void Delete(Ino ino);
+  void Put(Ino ino, const ChunkEntry& chunk);
+  void Delete(Ino ino, uint32_t chunk_index);
+  void DeleteByIno(Ino ino);
 
-  bool HasUncommitedSlice();
+  bool Get(Ino ino, uint32_t chunk_index, ChunkEntry& chunk);
+
+  void CleanExpired(uint64_t expire_s);
 
   size_t Size();
   size_t Bytes();
 
-  void Clear();
-
-  void CleanExpired(uint64_t expire_s);
-
   void Summary(Json::Value& value);
-  bool Dump(Json::Value& value, bool is_summary = false);
 
  private:
-  using Map = absl::flat_hash_map<Ino, ChunkSetSPtr>;
+  struct Key {
+    Ino ino{0};
+    uint32_t chunk_index{0};
+  };
 
-  const uint32_t chunk_size_;
+  struct KeyHash {
+    size_t operator()(const Key& key) const {
+      return absl::HashOf(key.ino, key.chunk_index);
+    }
+  };
 
-  constexpr static size_t kShardNum = 128;
+  struct KeyEqual {
+    bool operator()(const Key& lhs, const Key& rhs) const {
+      return lhs.ino == rhs.ino && lhs.chunk_index == rhs.chunk_index;
+    }
+  };
+
+  struct Value {
+    ChunkEntry chunk;
+    uint64_t last_fresh_s{0};
+
+    Value(const ChunkEntry& c) : chunk(c), last_fresh_s(utils::Timestamp()) {}
+  };
+
+  using Map = absl::flat_hash_map<Key, Value, KeyHash, KeyEqual>;
+
+  constexpr static size_t kShardNum = 64;
   utils::Shards<Map, kShardNum> shard_map_;
 
   // metric
-  bvar::Adder<uint64_t> total_count_{"meta_chunk_cache_total_count"};
-  bvar::Adder<uint64_t> clean_count_{"meta_chunk_cache_clean_count"};
+  bvar::Adder<uint64_t> total_count_{"meta_read_chunk_cache_total_count"};
+  bvar::Adder<uint64_t> clean_count_{"meta_read_chunk_cache_clean_count"};
 };
 
 }  // namespace meta

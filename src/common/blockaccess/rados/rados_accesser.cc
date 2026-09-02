@@ -21,7 +21,9 @@
 #include <glog/logging.h>
 #include <rados/librados.h>
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <functional>
@@ -32,6 +34,7 @@
 #include <vector>
 
 #include "common/directory.h"
+#include "common/helper.h"
 #include "common/options/blockaccess.h"
 #include "common/status.h"
 #include "utils/scoped_cleanup.h"
@@ -52,7 +55,7 @@ DEFINE_bool(rados_enable_admin_socket, true,
             "enable librados admin socket for objecter_requests/perf dump "
             "introspection; socket goes to the dingofs run dir alongside "
             "fd_comm_socket: GetDefaultDir(run)/rados.<pid>.asok "
-            "(root -> /var/dingofs/run, non-root -> $HOME/.dingofs/run)");
+            "(root -> /var/dingo/run, non-root -> $HOME/.dingo/run)");
 
 namespace {
 
@@ -70,10 +73,17 @@ void DestroyIoctx(rados_ioctx_t ioctx) {
 }
 
 void AppendPayload(rados_write_op_t op, const PutPayload& payload) {
-  uint64_t offset = 0;
-  for (const auto& segment : payload.Segments()) {
-    rados_write_op_write(op, segment.data, segment.size, offset);
-    offset += segment.size;
+  // The first segment goes as write_full: it atomically replaces the whole
+  // object, truncating any longer previous version (a plain offset-0 write
+  // neither truncates on replicated pools nor is accepted on EC pools
+  // without allow_ec_overwrites once the object exists). The remaining
+  // segments extend the object in order within the same op.
+  const auto& segments = payload.Segments();
+  rados_write_op_write_full(op, segments[0].data, segments[0].size);
+  uint64_t offset = segments[0].size;
+  for (size_t i = 1; i < segments.size(); i++) {
+    rados_write_op_write(op, segments[i].data, segments[i].size, offset);
+    offset += segments[i].size;
   }
 }
 }  // namespace
@@ -159,12 +169,12 @@ bool RadosAccesser::Init() {
   }
 
   // librados admin socket (default on): same dir as dingofs fd_comm_socket via
-  // GetDefaultDir(kSocketDir) -- root -> /var/dingofs/run, non-root ->
-  // $HOME/.dingofs/run -- so it follows whoever runs the process. Keyed by pid.
+  // GetDefaultDir(kSocketDir) -- root -> /var/dingo/run, non-root ->
+  // $HOME/.dingo/run -- so it follows whoever runs the process. Keyed by pid.
   // Non-fatal: a failure here only loses introspection, never blocks mount.
   if (FLAGS_rados_enable_admin_socket) {
     const std::string socket_dir = GetDefaultDir(kSocketDir);
-    if (!Helper::CreateDirectory(socket_dir)) {
+    if (!::dingofs::Helper::CreateDirectory(socket_dir)) {
       LOG(WARNING)
           << "Create admin socket dir failed, skip rados admin socket: "
           << socket_dir;
@@ -188,16 +198,38 @@ bool RadosAccesser::Init() {
                << ", err: " << strerror(-err);
     return false;
   }
+  auto refresh_options = OsdMapRefresher::Options{
+      .enabled = FLAGS_rados_map_refresh_enable,
+      .interval = std::chrono::seconds(
+          std::max(FLAGS_rados_map_refresh_interval_s, 10U)),
+      .jitter_pct = std::min(FLAGS_rados_map_refresh_jitter_pct, 50U),
+  };
+  map_refresher_ = std::make_unique<OsdMapRefresher>(
+      refresh_options,
+      [cluster = cluster_]() { return rados_wait_for_latest_osdmap(cluster); });
+  if (!map_refresher_->Start()) {
+    LOG(ERROR) << "Failed to start RADOS OSDMap refresher";
+    map_refresher_.reset();
+    rados_shutdown(cluster_);
+    cluster_ = nullptr;
+    return false;
+  }
 
   LOG(INFO) << "Succss init RadosAccesser cluster: " << cluster_
             << ", mon_host: " << options_.mon_host << options_.cluster_name
-            << ", user: " << options_.user_name << ", key: " << options_.key
-            << ", pool: " << options_.pool_name;
+            << ", user: " << options_.user_name
+            << ", pool: " << options_.pool_name
+            << ", map_refresh_enabled: " << FLAGS_rados_map_refresh_enable;
 
   return true;
 }
 
-bool RadosAccesser::Destroy() {
+bool RadosAccesser::Stop() {
+  if (map_refresher_ != nullptr) {
+    map_refresher_->Stop();
+    map_refresher_.reset();
+  }
+
   if (cluster_ != nullptr) {
     VLOG(1) << "Waiting all aio to finish before destroy rados cluster: "
             << cluster_;
@@ -261,6 +293,11 @@ Status RadosAccesser::Put(const std::string& key, const PutPayload& payload) {
       LOG(ERROR) << "Failed to write object, key: " << key
                  << ", length: " << payload.Size()
                  << ", err: " << strerror(-err);
+      if (err == -EOPNOTSUPP) {
+        // semantic rejection by the osd, resending the identical request can
+        // never succeed, must not be retried.
+        return Status::NotSupport(strerror(-err));
+      }
       return Status::IoError("Failed to write object");
     }
     return Status::OK();
@@ -513,9 +550,14 @@ static void AsyncPutCallback(RadosAsyncIOUnit* io_unit, int ret_code) {
       std::get<std::shared_ptr<PutObjectAsyncContext>>(io_unit->async_context);
   if (ret_code == -ENOMEM) {
     put_context->status = Status::OutOfMemory("rados put ran out of memory");
+  } else if (ret_code == -EOPNOTSUPP) {
+    // semantic rejection by the osd, resending the identical request can
+    // never succeed, must not be retried.
+    put_context->status = Status::NotSupport(strerror(-ret_code));
+  } else if (ret_code < 0) {
+    put_context->status = Status::IoError(strerror(-ret_code));
   } else {
-    put_context->status =
-        (ret_code < 0) ? Status::IoError(strerror(-ret_code)) : Status::OK();
+    put_context->status = Status::OK();
   }
   put_context->cb(put_context);
 }

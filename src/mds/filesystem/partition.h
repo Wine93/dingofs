@@ -26,6 +26,7 @@
 #include "absl/container/btree_map.h"
 #include "glog/logging.h"
 #include "json/value.h"
+#include "mds/common/inflight_controller.h"
 #include "mds/common/status.h"
 #include "mds/common/type.h"
 #include "mds/filesystem/dentry.h"
@@ -48,12 +49,14 @@ class DirShard {
       children_[dentry.Name()] = dentry;
     }
     last_active_time_s_ = utils::Timestamp();
+    last_refresh_time_s_ = utils::Timestamp();
   }
   DirShard(uint64_t id, const Range& range, uint64_t version, absl::btree_map<std::string, Dentry>&& dentries)
       : id_(id), range_{range}, version_(version) {
     // ingest dentries to map
     children_ = std::move(dentries);
     last_active_time_s_ = utils::Timestamp();
+    last_refresh_time_s_ = utils::Timestamp();
   }
 
   static DirShardSPtr New(uint64_t id, const Range& range, uint64_t version, const std::vector<Dentry>& dentries) {
@@ -86,18 +89,22 @@ class DirShard {
   // get mid key of the shard, used for split
   std::string Mid();
 
-  bool Empty() const;
-  size_t Size() const;
-  size_t Bytes() const;
-
   void UpdateLastActiveTime() { last_active_time_s_.store(utils::Timestamp(), std::memory_order_relaxed); }
   uint64_t LastActiveTimeS() { return last_active_time_s_.load(std::memory_order_relaxed); }
+
+  bool IsFresh();
+  void UpdateLastRefreshTime() { last_refresh_time_s_.store(utils::Timestamp(), std::memory_order_relaxed); }
+  uint64_t LastRefreshTimeS() { return last_refresh_time_s_.load(std::memory_order_relaxed); }
 
   uint64_t Version() const { return version_; }
 
   std::pair<DirShardSPtr, DirShardSPtr> Split(const std::string& key, uint64_t left_id, uint64_t right_id);
 
   std::string ToString() const;
+
+  bool Empty() const;
+  size_t Size() const;
+  size_t Bytes() const;
 
   void Dump(Json::Value& value) const;
 
@@ -110,6 +117,7 @@ class DirShard {
   absl::btree_map<std::string, Dentry> children_;
 
   std::atomic<uint64_t> last_active_time_s_{0};
+  std::atomic<uint64_t> last_refresh_time_s_{0};
 };
 
 class ShardPartition;
@@ -193,7 +201,8 @@ class ShardPartition {
   void DeleteShard(const std::string& start);
   void DeleteShardNoLock(const std::string& start);
 
-  Status FetchDirShard(const Range& range, DirShardSPtr& out_shard);
+  Status FetchDirShard(const Range& range, const std::string& reason, DirShardSPtr& out_shard);
+  Status DoFetchDirShard(const Range& range, const std::string& reason, DirShardSPtr& out_shard);
 
   // refresh partition with latest inode
   bool Refresh(uint64_t new_version);
@@ -225,6 +234,8 @@ class ShardPartition {
   std::atomic<uint64_t> shard_id_generator_{1};
 
   OperationProcessorSPtr operation_processor_;
+
+  InflightController<std::string, DirShardSPtr> shard_inflight_controller_;
 };
 
 class PartitionCache {

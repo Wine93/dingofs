@@ -16,23 +16,42 @@
 
 #include "client/vfs/compaction/compactor_impl.h"
 
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <list>
 
 #include "client/vfs/common/basync_util.h"
 #include "client/vfs/common/helper.h"
 #include "client/vfs/compaction/compact_utils.h"
-#include "client/vfs/data/reader/chunk_req_reader.h"
+#include "client/vfs/data/reader/chunk_read_op.h"
 #include "client/vfs/data/slice/common.h"
 #include "client/vfs/data/slice/slice_writer.h"
 #include "client/vfs/hub/vfs_hub.h"
+#include "common/block/block_utils.h"
 #include "utils/scoped_cleanup.h"
 
 namespace dingofs {
 namespace client {
 namespace vfs {
 using namespace compaction;
+
+DEFINE_uint32(vfs_compact_cleanup_batch_size, 100,
+              "maximum block keys per uncommitted compaction cleanup batch");
+
+// S3 DeleteObjects hard limit; the sync BatchDelete path has no guard of its
+// own, so clamp here (same bound as mds gc kBatchDeleteObjectSize).
+constexpr size_t kMaxCleanupBatchSize = 1000;
+
+size_t CompactionPageNeed(int32_t offset_in_chunk, int64_t len,
+                          int64_t page_size) {
+  CHECK_GT(page_size, 0);
+  CHECK_GT(len, 0);
+  return static_cast<size_t>(
+      ((offset_in_chunk % page_size) + len + page_size - 1) / page_size);
+}
 
 Status CompactorImpl::Start() {
   LOG(INFO) << "CompactorImpl started";
@@ -92,6 +111,16 @@ Status CompactorImpl::DoCompact(ContextSPtr ctx, Ino ino, int64_t chunk_index,
   int32_t offset_in_chunk =
       static_cast<int32_t>(file_range.offset % chunk_size);
 
+  // Compaction is best-effort and must never queue behind foreground writes.
+  // Reserve before allocating/filling the dense read buffer so a capacity miss
+  // does not add heap pressure or backend read work.
+  WriteMemPool* write_pool = vfs_hub_->GetWriteMemPool();
+  WritePageLease lease;
+  DINGOFS_RETURN_NOT_OK(
+      write_pool->TryAcquire(CompactionPageNeed(offset_in_chunk, file_range.len,
+                                                write_pool->GetPageSize()),
+                             &lease));
+
   ChunkReq req(ino, chunk_index, offset_in_chunk, file_range);
 
   VLOG(9) << "Start comaction for req: " << req.ToString();
@@ -102,14 +131,12 @@ Status CompactorImpl::DoCompact(ContextSPtr ctx, Ino ino, int64_t chunk_index,
     // read-reply / RDMA path, so a plain buffer is the fill target here).
     to_write.resize(static_cast<size_t>(file_range.len));
 
-    ChunkReqReader reader(vfs_hub_, req);
-
     Status s;
     BSynchronizer sync;
     ReadBufView dst{reinterpret_cast<uint8_t*>(to_write.data()), 0,
                     to_write.size()};
-    reader.ReadAsync(SpanScope::GetContext(span), slices, dst,
-                     sync.AsStatusCallBack(s));
+    StartChunkRead(SpanScope::GetContext(span), vfs_hub_, req, slices, dst,
+                   sync.AsStatusCallBack(s));
     sync.Wait();
 
     if (!s.ok()) {
@@ -123,33 +150,42 @@ Status CompactorImpl::DoCompact(ContextSPtr ctx, Ino ino, int64_t chunk_index,
   Slice compacted;
 
   {
-    auto page_size = vfs_hub_->GetWriteMemPool()->GetPageSize();
-
+    const auto page_size = write_pool->GetPageSize();
     SliceDataContext ctx(fs_info.id, ino, chunk_index, chunk_size,
                          fs_info.block_size, page_size);
 
     auto writer = std::make_shared<SliceWriter>(ctx, vfs_hub_, offset_in_chunk);
 
-    Status ret =
-        writer->Write(SpanScope::GetContext(span), to_write.data(),
-                      static_cast<int32_t>(to_write.size()), offset_in_chunk);
-    if (!ret.ok()) {
-      // Compaction is best-effort: a write failure (e.g. NoSpace when the write
-      // page pool is under back-pressure) must abort this compaction and be
-      // retried later, never crash the client. Propagate like the read/flush
-      // failures above; the caller (CompactChunkTask::Run) just logs it.
-      LOG(WARNING) << "Fail compaction because write failed: " << ret.ToString()
-                   << ", ino: " << ino << ", chunk_index: " << chunk_index;
-      return ret;
-    }
+    writer->Write(SpanScope::GetContext(span), to_write.data(),
+                  static_cast<int32_t>(to_write.size()), offset_in_chunk,
+                  &lease);
 
     Status s;
     BSynchronizer sync;
     writer->FlushAsync(sync.AsStatusCallBack(s));
     sync.Wait();
     if (!s.ok()) {
+      uint64_t slice_id = writer->SliceId();
       LOG(WARNING) << "Fail compaction because flush failed: " << s.ToString()
-                   << ", ino: " << ino << ", chunk_index: " << chunk_index;
+                   << ", ino: " << ino << ", chunk_index: " << chunk_index
+                   << ", slice_id: " << slice_id;
+      // slice_id 0 means allocation never published: no block was ever
+      // uploaded, so there is nothing to reclaim.
+      if (slice_id != 0) {
+        int32_t len = writer->Len();
+        Slice orphan{.id = slice_id,
+                     .size = len,
+                     .off = 0,
+                     .len = len,
+                     .pos = offset_in_chunk};
+        Status cleanup_status =
+            DoCleanupUncommittedSlices(SpanScope::GetContext(span), {orphan});
+        if (!cleanup_status.ok()) {
+          LOG(WARNING) << "Fail cleanup of uncommitted compaction slice "
+                       << slice_id << ": " << cleanup_status.ToString()
+                       << ", ino: " << ino << ", chunk_index: " << chunk_index;
+        }
+      }
       return s;
     }
 
@@ -161,7 +197,9 @@ Status CompactorImpl::DoCompact(ContextSPtr ctx, Ino ino, int64_t chunk_index,
   return Status::OK();
 }
 
-// TODO: delete compact object after fail
+// Read/write failures upload nothing and flush failures self-clean in
+// DoCompact; the remaining orphan case is a failed metadata commit, which the
+// caller reclaims via CleanupUncommittedSlices.
 Status CompactorImpl::Compact(ContextSPtr ctx, Ino ino, int64_t chunk_index,
                               const std::vector<Slice>& slices,
                               std::vector<Slice>& out_slices) {
@@ -187,6 +225,7 @@ Status CompactorImpl::Compact(ContextSPtr ctx, Ino ino, int64_t chunk_index,
 
   if (to_compact.empty()) {
     LOG(INFO) << "No slices to compact after skipping";
+    out_slices.clear();
     return Status::OK();
   }
 
@@ -228,9 +267,71 @@ Status CompactorImpl::ForceCompact(ContextSPtr ctx, Ino ino,
   Slice compacted;
   DINGOFS_RETURN_NOT_OK(DoCompact(SpanScope::GetContext(span), ino, chunk_index,
                                   slices, compacted));
-  out_slices.push_back(compacted);
+  std::vector<Slice> out;
+  out.push_back(compacted);
+  out_slices.swap(out);
 
   return Status::OK();
+}
+
+Status CompactorImpl::CleanupUncommittedSlices(
+    ContextSPtr ctx, const std::vector<Slice>& slices) {
+  DINGOFS_RETURN_NOT_OK(IncInflight());
+  auto cleanup = MakeScopedCleanup([&]() { DecInflight(); });
+
+  return DoCleanupUncommittedSlices(ctx, slices);
+}
+
+Status CompactorImpl::DoCleanupUncommittedSlices(
+    ContextSPtr ctx, const std::vector<Slice>& slices) {
+  auto span = vfs_hub_->GetTraceManager()->StartChildSpan(
+      "CompactorImpl::CleanupUncommittedSlices", ctx->GetTraceSpan());
+
+  uint32_t block_size = vfs_hub_->GetFsInfo().block_size;
+
+  std::list<std::string> keys;
+  for (const auto& slice : slices) {
+    if (slice.id == 0 || slice.size <= 0) continue;  // holes have no blocks
+    size_t slice_blocks = 0;
+    for (const auto& key :
+         EnumerateBlockKeys(slice.id, slice.size, block_size)) {
+      keys.push_back(key.StoreKey());
+      slice_blocks++;
+    }
+    LOG(INFO) << "Cleanup uncommitted compaction slice, slice_id: " << slice.id
+              << ", size: " << slice.size << ", block_size: " << block_size
+              << ", blocks: " << slice_blocks;
+  }
+
+  if (keys.empty()) return Status::OK();
+
+  VLOG(9) << "CompactorImpl::CleanupUncommittedSlices slices: " << slices.size()
+          << ", blocks: " << keys.size();
+
+  // Keep each cleanup request bounded: zero would stall this loop forever,
+  // and the upper cap keeps a misconfigured flag from tripping the backend
+  // request limit.
+  const size_t batch_size = std::clamp<size_t>(
+      FLAGS_vfs_compact_cleanup_batch_size, 1, kMaxCleanupBatchSize);
+
+  auto* accesser = vfs_hub_->GetBlockAccesser();
+  Status status = Status::OK();
+  while (!keys.empty()) {
+    auto it = keys.begin();
+    std::advance(it, std::min(keys.size(), batch_size));
+    std::list<std::string> batch;
+    batch.splice(batch.begin(), keys, keys.begin(), it);
+
+    Status s = accesser->BatchDelete(batch);
+    if (!s.ok()) {
+      LOG(WARNING)
+          << "CompactorImpl::CleanupUncommittedSlices batch delete failed: "
+          << s.ToString() << ", batch size: " << batch.size();
+      status = s;
+    }
+  }
+
+  return status;
 }
 
 }  // namespace vfs

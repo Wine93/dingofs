@@ -48,6 +48,7 @@ DECLARE_uint32(mds_server_id);
 DECLARE_string(mds_server_host);
 DECLARE_string(mds_server_listen_host);
 DECLARE_uint32(mds_server_port);
+DECLARE_bool(mds_use_rdma);
 
 // all mds share the same inode generator
 DECLARE_bool(mds_ino_generator_share_enable);
@@ -100,23 +101,15 @@ DECLARE_uint32(mds_filesystem_name_max_size);
 DECLARE_uint32(mds_filesystem_hash_bucket_num);
 
 // cache config
-DECLARE_uint32(mds_cache_expire_interval_s);
-
-// compaction config
-DECLARE_bool(mds_compact_chunk_enable);
-DECLARE_uint32(mds_compact_chunk_threshold_num);
-DECLARE_uint32(mds_compact_chunk_interval_ms);
+DECLARE_uint64(mds_clean_threshold_count);
+DECLARE_uint32(mds_clean_expire_s);
 
 // notify buddy config
 DECLARE_uint32(mds_notify_message_batch_size);
-DECLARE_uint32(mds_wait_message_delay_us);
-
-DECLARE_uint32(mds_inode_cache_max_count);
-DECLARE_uint32(mds_partition_cache_max_count);
+DECLARE_uint32(mds_notify_message_max_inflight_per_mds);
 
 // store operation config
 DECLARE_uint32(mds_store_operation_batch_size);
-DECLARE_uint32(mds_store_operation_merge_delay_us);
 
 DECLARE_int32(mds_storage_dingodb_replica_num);
 

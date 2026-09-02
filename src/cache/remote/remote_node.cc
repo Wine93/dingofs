@@ -31,6 +31,7 @@
 
 #include "common/options/cache.h"
 #include "common/status.h"
+#include "dingofs/infiniband.pb.h"
 
 namespace dingofs {
 namespace cache {
@@ -58,6 +59,10 @@ DEFINE_validator(cache_rpc_timeout_ms, brpc::PassValidate);
 DEFINE_uint32(cache_prefetch_rpc_timeout_ms, 3000,
               "timeout for remote cache prefetch rpcs in milliseconds");
 DEFINE_validator(cache_prefetch_rpc_timeout_ms, brpc::PassValidate);
+
+DEFINE_uint32(cache_delete_rpc_timeout_ms, 3000,
+              "timeout for remote cache delete rpcs in milliseconds");
+DEFINE_validator(cache_delete_rpc_timeout_ms, brpc::PassValidate);
 
 DEFINE_uint32(cache_rpc_max_retry_times, 3,
               "maximum retry count for remote cache rpcs");
@@ -129,6 +134,8 @@ uint32_t RemoteNode::NextTimeoutMs(const std::string& method,
     timeout_ms = FLAGS_cache_rpc_timeout_ms;
   } else if (method == "Prefetch") {
     timeout_ms = FLAGS_cache_prefetch_rpc_timeout_ms;
+  } else if (method == "Delete") {
+    timeout_ms = FLAGS_cache_delete_rpc_timeout_ms;
   } else {
     CHECK(false) << "Unknown rpc method=" << method;
   }
@@ -137,7 +144,10 @@ uint32_t RemoteNode::NextTimeoutMs(const std::string& method,
   return std::min(timeout_ms, FLAGS_cache_rpc_max_timeout_ms);
 }
 
-bool RemoteNode::ShouldRetry(const std::string& method, int /*retcode*/) const {
+bool RemoteNode::ShouldRetry(const std::string& method, int retcode) const {
+  if (FLAGS_use_rdma && retcode == pb::infiniband::ErrorCode::ProtocolError) {
+    return false;
+  }
   return method == "Range";
 }
 

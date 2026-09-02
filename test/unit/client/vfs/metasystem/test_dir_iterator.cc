@@ -14,14 +14,14 @@
  * limitations under the License.
  */
 
-#include "client/vfs/metasystem/mds/dir_iterator.h"
-
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <thread>
 #include <vector>
 
+#include "client/vfs/metasystem/mds/dir_iterator.h"
 #include "client/vfs/vfs_meta.h"
 #include "common/status.h"
 #include "common/trace/context.h"
@@ -37,6 +37,7 @@ namespace vfs {
 namespace meta {
 namespace test {
 
+using dingofs::client::vfs::test::MakeFileAttr;
 using ::testing::_;
 using ::testing::DoAll;
 using ::testing::Eq;
@@ -45,7 +46,6 @@ using ::testing::InSequence;
 using ::testing::Invoke;
 using ::testing::Return;
 using ::testing::SetArgReferee;
-using dingofs::client::vfs::test::MakeFileAttr;
 
 class DirIteratorTest : public ::testing::Test {
  protected:
@@ -63,16 +63,20 @@ class DirIteratorTest : public ::testing::Test {
     ctx_ = std::make_shared<Context>("test");
   }
 
-  static DirEntry MakeDirEntry(Ino ino, const std::string& name) {
-    DirEntry entry;
+  using ReadDirEntry = MDSClient::ReadDirEntry;
+
+  static ReadDirEntry MakeDirEntry(Ino ino, const std::string& name) {
+    ReadDirEntry entry;
     entry.ino = ino;
     entry.name = name;
-    entry.attr = MakeFileAttr(ino);
+    entry.attr_entry.set_ino(ino);
+    entry.attr_entry.set_type(pb::mds::FileType::FILE);
     return entry;
   }
 
-  static std::vector<DirEntry> MakeEntries(size_t count, uint64_t start_ino) {
-    std::vector<DirEntry> entries;
+  static std::vector<ReadDirEntry> MakeEntries(size_t count,
+                                                uint64_t start_ino) {
+    std::vector<ReadDirEntry> entries;
     entries.reserve(count);
     for (size_t i = 0; i < count; ++i) {
       entries.push_back(
@@ -86,16 +90,18 @@ class DirIteratorTest : public ::testing::Test {
   std::unique_ptr<TraceManager> trace_manager_;
   std::unique_ptr<MockMDSClient> mds_client_;
   MockMDSClient* mock_mds_client_{nullptr};
+  InodeCacheUPtr inode_cache_{InodeCache::New(1)};
   ContextSPtr ctx_;
 };
 
 // --- 1. Empty directory returns NoData ---
 TEST_F(DirIteratorTest, GetValue_EmptyDir_ReturnsNoData) {
   EXPECT_CALL(*mock_mds_client_, ReadDir(_, Eq(1), Eq(100), _, _, _, _))
-      .WillOnce(DoAll(SetArgReferee<6>(std::vector<DirEntry>{}),
-                      Return(Status::OK())));
+      .WillOnce(
+          DoAll(SetArgReferee<6>(std::vector<ReadDirEntry>{}),
+                Return(Status::OK())));
 
-  auto dir_iter = DirIterator::New(*mds_client_, 1, 100);
+  auto dir_iter = DirIterator::New(*mds_client_, *inode_cache_, 1, 100);
   DirEntry entry;
   Status s = dir_iter->GetValue(ctx_, 0, true, entry);
   EXPECT_FALSE(s.ok());
@@ -109,13 +115,13 @@ TEST_F(DirIteratorTest, GetValue_SingleBatch_SequentialRead) {
   EXPECT_CALL(*mock_mds_client_, ReadDir(_, Eq(1), Eq(100), "", _, _, _))
       .WillOnce(DoAll(SetArgReferee<6>(entries), Return(Status::OK())));
 
-  auto dir_iter = DirIterator::New(*mds_client_, 1, 100);
+  auto dir_iter = DirIterator::New(*mds_client_, *inode_cache_, 1, 100);
 
   for (size_t i = 0; i < entries.size(); ++i) {
     DirEntry entry;
     Status s = dir_iter->GetValue(ctx_, i, true, entry);
     EXPECT_TRUE(s.ok());
-    EXPECT_EQ(entry.ino, entries[i].ino);
+    EXPECT_EQ(entry.ino, entries[i].attr_entry.ino());
     EXPECT_EQ(entry.name, entries[i].name);
   }
 }
@@ -132,13 +138,13 @@ TEST_F(DirIteratorTest, GetValue_MultiBatch_TriggersMultipleFetches) {
               ReadDir(_, Eq(1), Eq(100), first_batch.back().name, _, true, _))
       .WillOnce(DoAll(SetArgReferee<6>(second_batch), Return(Status::OK())));
 
-  auto dir_iter = DirIterator::New(*mds_client_, 1, 100);
+  auto dir_iter = DirIterator::New(*mds_client_, *inode_cache_, 1, 100);
 
   // Read first element of second batch to trigger second fetch.
   DirEntry entry;
   Status s = dir_iter->GetValue(ctx_, batch_size, true, entry);
   EXPECT_TRUE(s.ok());
-  EXPECT_EQ(entry.ino, second_batch[0].ino);
+  EXPECT_EQ(entry.ino, second_batch[0].attr_entry.ino());
 }
 
 // --- 4. with_attr flag is passed correctly ---
@@ -148,7 +154,7 @@ TEST_F(DirIteratorTest, GetValue_WithAttrFlag_PassedToReadDir) {
   EXPECT_CALL(*mock_mds_client_, ReadDir(_, _, _, _, _, true, _))
       .WillOnce(DoAll(SetArgReferee<6>(entries), Return(Status::OK())));
 
-  auto dir_iter = DirIterator::New(*mds_client_, 1, 100);
+  auto dir_iter = DirIterator::New(*mds_client_, *inode_cache_, 1, 100);
   DirEntry entry;
   Status s = dir_iter->GetValue(ctx_, 0, true, entry);
   EXPECT_TRUE(s.ok());
@@ -160,9 +166,9 @@ TEST_F(DirIteratorTest, GetValue_BackwardSeek_UsesMemoAndRefetches) {
   auto prev_batch_size = FLAGS_vfs_meta_read_dir_batch_size;
   FLAGS_vfs_meta_read_dir_batch_size = 4;
 
-  auto first_batch = MakeEntries(4, 1);   // full batch (triggers next fetch)
-  auto second_batch = MakeEntries(1, 5);  // advances offset_ to 4
-  auto refetch_batch = MakeEntries(2, 1); // backward seek from memo position 0
+  auto first_batch = MakeEntries(4, 1);    // full batch (triggers next fetch)
+  auto second_batch = MakeEntries(1, 5);   // advances offset_ to 4
+  auto refetch_batch = MakeEntries(2, 1);  // backward seek from memo position 0
 
   {
     InSequence seq;
@@ -177,21 +183,21 @@ TEST_F(DirIteratorTest, GetValue_BackwardSeek_UsesMemoAndRefetches) {
         .WillOnce(DoAll(SetArgReferee<6>(refetch_batch), Return(Status::OK())));
   }
 
-  auto dir_iter = DirIterator::New(*mds_client_, 1, 100);
+  auto dir_iter = DirIterator::New(*mds_client_, *inode_cache_, 1, 100);
 
   // Read offset 3 to populate first batch in cache (offset_ stays at 0).
   DirEntry entry;
   ASSERT_TRUE(dir_iter->GetValue(ctx_, 3, true, entry).ok());
-  EXPECT_EQ(entry.ino, first_batch[3].ino);
+  EXPECT_EQ(entry.ino, first_batch[3].attr_entry.ino());
 
   // Read offset 4 to trigger a second fetch, advancing offset_ to 4.
   ASSERT_TRUE(dir_iter->GetValue(ctx_, 4, true, entry).ok());
-  EXPECT_EQ(entry.ino, second_batch[0].ino);
+  EXPECT_EQ(entry.ino, second_batch[0].attr_entry.ino());
 
   // Seek backward to offset 1 — triggers SeekBackward which uses memo.
   Status s = dir_iter->GetValue(ctx_, 1, true, entry);
   EXPECT_TRUE(s.ok());
-  EXPECT_EQ(entry.ino, refetch_batch[1].ino);
+  EXPECT_EQ(entry.ino, refetch_batch[1].attr_entry.ino());
 
   FLAGS_vfs_meta_read_dir_batch_size = prev_batch_size;
 }
@@ -201,11 +207,25 @@ TEST_F(DirIteratorTest, GetValue_FetchError_Propagated) {
   EXPECT_CALL(*mock_mds_client_, ReadDir)
       .WillOnce(Return(Status::Internal("mock error")));
 
-  auto dir_iter = DirIterator::New(*mds_client_, 1, 100);
+  auto dir_iter = DirIterator::New(*mds_client_, *inode_cache_, 1, 100);
   DirEntry entry;
   Status s = dir_iter->GetValue(ctx_, 0, true, entry);
   EXPECT_FALSE(s.ok());
   EXPECT_TRUE(s.IsInternal());
+}
+
+TEST_F(DirIteratorTest, GetValue_FetchError_CanRetry) {
+  auto entries = MakeEntries(1, 10);
+
+  EXPECT_CALL(*mock_mds_client_, ReadDir)
+      .WillOnce(Return(Status::Internal("mock error")))
+      .WillOnce(DoAll(SetArgReferee<6>(entries), Return(Status::OK())));
+
+  auto dir_iter = DirIterator::New(*mds_client_, *inode_cache_, 1, 100);
+  DirEntry entry;
+  EXPECT_TRUE(dir_iter->GetValue(ctx_, 0, true, entry).IsInternal());
+  ASSERT_TRUE(dir_iter->GetValue(ctx_, 0, true, entry).ok());
+  EXPECT_EQ(entry.ino, 10u);
 }
 
 // --- 7. Reading past end of directory returns NoData ---
@@ -217,7 +237,7 @@ TEST_F(DirIteratorTest, GetValue_PastEnd_ReturnsNoData) {
   EXPECT_CALL(*mock_mds_client_, ReadDir)
       .WillOnce(DoAll(SetArgReferee<6>(entries), Return(Status::OK())));
 
-  auto dir_iter = DirIterator::New(*mds_client_, 1, 100);
+  auto dir_iter = DirIterator::New(*mds_client_, *inode_cache_, 1, 100);
 
   DirEntry entry;
   ASSERT_TRUE(dir_iter->GetValue(ctx_, 0, true, entry).ok());
@@ -235,7 +255,7 @@ TEST_F(DirIteratorTest, Size_ReturnsCachedEntryCount) {
   EXPECT_CALL(*mock_mds_client_, ReadDir)
       .WillOnce(DoAll(SetArgReferee<6>(entries), Return(Status::OK())));
 
-  auto dir_iter = DirIterator::New(*mds_client_, 1, 100);
+  auto dir_iter = DirIterator::New(*mds_client_, *inode_cache_, 1, 100);
   EXPECT_EQ(dir_iter->Size(), 0u);
 
   DirEntry entry;
@@ -250,7 +270,7 @@ TEST_F(DirIteratorTest, Bytes_ReturnsEstimatedMemoryUsage) {
   EXPECT_CALL(*mock_mds_client_, ReadDir)
       .WillOnce(DoAll(SetArgReferee<6>(entries), Return(Status::OK())));
 
-  auto dir_iter = DirIterator::New(*mds_client_, 1, 100);
+  auto dir_iter = DirIterator::New(*mds_client_, *inode_cache_, 1, 100);
   DirEntry entry;
   ASSERT_TRUE(dir_iter->GetValue(ctx_, 0, true, entry).ok());
 
@@ -265,14 +285,14 @@ TEST_F(DirIteratorTest, DumpAndLoad_RoundTrip) {
   EXPECT_CALL(*mock_mds_client_, ReadDir)
       .WillOnce(DoAll(SetArgReferee<6>(entries), Return(Status::OK())));
 
-  auto dir_iter = DirIterator::New(*mds_client_, 1, 100);
+  auto dir_iter = DirIterator::New(*mds_client_, *inode_cache_, 1, 100);
   DirEntry entry;
   ASSERT_TRUE(dir_iter->GetValue(ctx_, 0, true, entry).ok());
 
   Json::Value dumped;
   ASSERT_TRUE(dir_iter->Dump(dumped));
 
-  auto loaded = DirIterator::New(*mds_client_, 1, 100);
+  auto loaded = DirIterator::New(*mds_client_, *inode_cache_, 1, 100);
   ASSERT_TRUE(loaded->Load(dumped));
 
   EXPECT_EQ(loaded->INo(), dir_iter->INo());
@@ -282,7 +302,7 @@ TEST_F(DirIteratorTest, DumpAndLoad_RoundTrip) {
 
 // --- 11. Remember tracks requested offsets ---
 TEST_F(DirIteratorTest, Remember_TracksOffsets) {
-  auto dir_iter = DirIterator::New(*mds_client_, 1, 100);
+  auto dir_iter = DirIterator::New(*mds_client_, *inode_cache_, 1, 100);
   dir_iter->Remember(7);
   dir_iter->Remember(3);
 
@@ -291,9 +311,165 @@ TEST_F(DirIteratorTest, Remember_TracksOffsets) {
   dir_iter.reset();
 }
 
+// --- DeleteEntry drops un-emitted stale names, keeps emitted ones ---
+TEST_F(DirIteratorTest, DeleteEntry_OnlyAffectsUnEmittedEntries) {
+  auto entries = MakeEntries(3, 10);  // file0, file1, file2
+
+  EXPECT_CALL(*mock_mds_client_, ReadDir(_, Eq(1), Eq(100), "", _, _, _))
+      .WillOnce(DoAll(SetArgReferee<6>(entries), Return(Status::OK())));
+
+  auto dir_iter = DirIterator::New(*mds_client_, *inode_cache_, 1, 100);
+
+  DirEntry entry;
+  ASSERT_TRUE(dir_iter->GetValue(ctx_, 0, true, entry).ok());
+  EXPECT_EQ(entry.name, "file0");
+  dir_iter->MarkEmitted(1);
+
+  // already handed to the kernel, can't be revoked
+  dir_iter->DeleteEntry("file0");
+  // not emitted yet, must disappear
+  dir_iter->DeleteEntry("file1");
+
+  ASSERT_EQ(dir_iter->Size(), 2u);
+  ASSERT_TRUE(dir_iter->GetValue(ctx_, 1, true, entry).ok());
+  EXPECT_EQ(entry.name, "file2");
+}
+
+TEST_F(DirIteratorTest, DeleteEntry_DropsReadButUnemittedEntry) {
+  auto entries = MakeEntries(2, 10);
+
+  EXPECT_CALL(*mock_mds_client_, ReadDir(_, Eq(1), Eq(100), "", _, _, _))
+      .WillOnce(DoAll(SetArgReferee<6>(entries), Return(Status::OK())));
+
+  auto dir_iter = DirIterator::New(*mds_client_, *inode_cache_, 1, 100);
+
+  DirEntry entry;
+  ASSERT_TRUE(dir_iter->GetValue(ctx_, 0, true, entry).ok());
+  dir_iter->DeleteEntry("file0");
+
+  ASSERT_TRUE(dir_iter->GetValue(ctx_, 0, true, entry).ok());
+  EXPECT_EQ(entry.name, "file1");
+}
+
+TEST_F(DirIteratorTest, DeleteEntry_FullBatchStillFetchesNextBatch) {
+  auto prev_batch_size = FLAGS_vfs_meta_read_dir_batch_size;
+  FLAGS_vfs_meta_read_dir_batch_size = 2;
+
+  auto first_batch = MakeEntries(2, 10);
+  std::vector<ReadDirEntry> second_batch = {MakeDirEntry(12, "file2")};
+
+  EXPECT_CALL(*mock_mds_client_, ReadDir(_, Eq(1), Eq(100), "", 2, _, _))
+      .WillOnce(DoAll(SetArgReferee<6>(first_batch), Return(Status::OK())));
+  EXPECT_CALL(*mock_mds_client_,
+              ReadDir(_, Eq(1), Eq(100), "file1", 2, _, _))
+      .WillOnce(DoAll(SetArgReferee<6>(second_batch), Return(Status::OK())));
+
+  auto dir_iter = DirIterator::New(*mds_client_, *inode_cache_, 1, 100);
+
+  DirEntry entry;
+  ASSERT_TRUE(dir_iter->GetValue(ctx_, 0, true, entry).ok());
+  dir_iter->DeleteEntry("file1");
+
+  ASSERT_TRUE(dir_iter->GetValue(ctx_, 1, true, entry).ok());
+  EXPECT_EQ(entry.name, "file2");
+
+  FLAGS_vfs_meta_read_dir_batch_size = prev_batch_size;
+}
+
+// --- InsertEntry overwrites a stale name and keeps the snapshot sorted ---
+TEST_F(DirIteratorTest, InsertEntry_OverwritesAndKeepsOrder) {
+  std::vector<ReadDirEntry> entries = {MakeDirEntry(10, "a"),
+                                       MakeDirEntry(12, "c")};
+
+  EXPECT_CALL(*mock_mds_client_, ReadDir(_, Eq(1), Eq(100), "", _, _, _))
+      .WillOnce(DoAll(SetArgReferee<6>(entries), Return(Status::OK())));
+
+  auto dir_iter = DirIterator::New(*mds_client_, *inode_cache_, 1, 100);
+
+  DirEntry entry;
+  ASSERT_TRUE(dir_iter->GetValue(ctx_, 0, true, entry).ok());  // emits "a"
+
+  dir_iter->InsertEntry("a", 20);  // emitted, ignored
+  dir_iter->InsertEntry("b", 21);  // inserted before "c"
+  dir_iter->InsertEntry("c", 22);  // overwrites in place
+  dir_iter->InsertEntry("z", 23);  // after batch, ignored
+
+  ASSERT_EQ(dir_iter->Size(), 3u);
+  ASSERT_TRUE(dir_iter->GetValue(ctx_, 1, true, entry).ok());
+  EXPECT_EQ(entry.name, "b");
+  EXPECT_EQ(entry.ino, 21u);
+  ASSERT_TRUE(dir_iter->GetValue(ctx_, 2, true, entry).ok());
+  EXPECT_EQ(entry.name, "c");
+  EXPECT_EQ(entry.ino, 22u);
+}
+
+TEST_F(DirIteratorTest, ConcurrentReaders_ShareCachedFetch) {
+  constexpr size_t kThreadCount = 16;
+  auto entries = MakeEntries(3, 10);
+
+  EXPECT_CALL(*mock_mds_client_, ReadDir(_, Eq(1), Eq(100), "", _, _, _))
+      .Times(1)
+      .WillOnce(DoAll(SetArgReferee<6>(entries), Return(Status::OK())));
+
+  auto dir_iter = DirIterator::New(*mds_client_, *inode_cache_, 1, 100);
+  std::vector<int> succeeded(kThreadCount);
+  std::vector<DirEntry> results(kThreadCount);
+  std::vector<std::thread> threads;
+  threads.reserve(kThreadCount);
+
+  for (size_t i = 0; i < kThreadCount; ++i) {
+    threads.emplace_back([&, i] {
+      std::lock_guard<std::mutex> lock(dir_iter->Mutex());
+      succeeded[i] =
+          dir_iter->GetValue(ctx_, i % entries.size(), true, results[i]).ok();
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  for (size_t i = 0; i < kThreadCount; ++i) {
+    ASSERT_TRUE(succeeded[i]);
+    EXPECT_EQ(results[i].ino, entries[i % entries.size()].ino);
+    EXPECT_EQ(results[i].name, entries[i % entries.size()].name);
+  }
+}
+
+TEST_F(DirIteratorTest, ConcurrentMutations_PreserveSortedSnapshot) {
+  std::vector<ReadDirEntry> entries = {
+      MakeDirEntry(1, "a"), MakeDirEntry(3, "c"), MakeDirEntry(5, "e"),
+      MakeDirEntry(7, "g"), MakeDirEntry(9, "z")};
+
+  EXPECT_CALL(*mock_mds_client_, ReadDir(_, Eq(1), Eq(100), "", _, _, _))
+      .WillOnce(DoAll(SetArgReferee<6>(entries), Return(Status::OK())));
+
+  auto dir_iter = DirIterator::New(*mds_client_, *inode_cache_, 1, 100);
+  DirEntry entry;
+  ASSERT_TRUE(dir_iter->GetValue(ctx_, 0, true, entry).ok());
+
+  std::vector<std::thread> threads;
+  threads.emplace_back([&] { dir_iter->DeleteEntry("c"); });
+  threads.emplace_back([&] { dir_iter->DeleteEntry("g"); });
+  threads.emplace_back([&] { dir_iter->InsertEntry("b", 2); });
+  threads.emplace_back([&] { dir_iter->InsertEntry("d", 4); });
+  threads.emplace_back([&] { dir_iter->InsertEntry("f", 6); });
+  threads.emplace_back([&] { dir_iter->InsertEntry("h", 8); });
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  const std::vector<std::string> expected_names = {"a", "b", "d", "e",
+                                                   "f", "h", "z"};
+  ASSERT_EQ(dir_iter->Size(), expected_names.size());
+  for (size_t i = 0; i < expected_names.size(); ++i) {
+    ASSERT_TRUE(dir_iter->GetValue(ctx_, i, true, entry).ok());
+    EXPECT_EQ(entry.name, expected_names[i]);
+  }
+}
+
 // --- 12. LastFetchTimeNs is set after construction ---
 TEST_F(DirIteratorTest, LastFetchTimeNs_SetAfterConstruction) {
-  auto dir_iter = DirIterator::New(*mds_client_, 1, 100);
+  auto dir_iter = DirIterator::New(*mds_client_, *inode_cache_, 1, 100);
   EXPECT_GT(dir_iter->LastFetchTimeNs(), 0u);
 }
 
@@ -312,15 +488,15 @@ class DirIteratorManagerTest : public ::testing::Test {
     mds_client_ = std::move(mds_client);
   }
 
-  static DirIteratorSPtr MakeDirIterator(MDSClient& client, Ino ino,
-                                         uint64_t fh) {
-    return DirIterator::New(client, ino, fh);
+  DirIteratorSPtr MakeDirIterator(MDSClient& client, Ino ino, uint64_t fh) {
+    return DirIterator::New(client, *inode_cache_, ino, fh);
   }
 
   std::unique_ptr<mds::FsInfo> fs_info_;
   std::unique_ptr<meta::RPC> rpc_;
   std::unique_ptr<TraceManager> trace_manager_;
   std::unique_ptr<MockMDSClient> mds_client_;
+  InodeCacheUPtr inode_cache_{InodeCache::New(1)};
 };
 
 // --- 13. Put, Get, Delete lifecycle ---
@@ -356,6 +532,38 @@ TEST_F(DirIteratorManagerTest, Size_CountsAllIterators) {
                       [](const DirIteratorManager::DirIteratorSet&) {});
 
   EXPECT_EQ(manager.Size(), 2u);
+}
+
+TEST_F(DirIteratorManagerTest, ConcurrentPutGetDelete_SameDirectory) {
+  constexpr size_t kThreadCount = 16;
+  DirIteratorManager manager;
+  std::vector<std::thread> threads;
+  threads.reserve(kThreadCount);
+
+  for (size_t i = 0; i < kThreadCount; ++i) {
+    threads.emplace_back([&, i] {
+      auto iter = MakeDirIterator(*mds_client_, 1, 100 + i);
+      manager.PutWithFunc(1, 100 + i, iter,
+                          [](const DirIteratorManager::DirIteratorSet&) {});
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  ASSERT_EQ(manager.Size(), kThreadCount);
+  for (size_t i = 0; i < kThreadCount; ++i) {
+    ASSERT_NE(manager.Get(1, 100 + i), nullptr);
+  }
+
+  threads.clear();
+  for (size_t i = 0; i < kThreadCount; ++i) {
+    threads.emplace_back([&, i] { manager.Delete(1, 100 + i); });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  EXPECT_EQ(manager.Size(), 0u);
 }
 
 // --- 16. Bytes aggregates iterator memory ---
@@ -395,7 +603,7 @@ TEST_F(DirIteratorManagerTest, DumpAndLoad_RoundTrip) {
   ASSERT_TRUE(manager.Dump(dumped));
 
   DirIteratorManager loaded_manager;
-  ASSERT_TRUE(loaded_manager.Load(*mds_client_, dumped));
+  ASSERT_TRUE(loaded_manager.Load(*mds_client_, *inode_cache_, dumped));
 
   EXPECT_EQ(loaded_manager.Size(), manager.Size());
   EXPECT_EQ(loaded_manager.Get(1, 100)->INo(), 1u);

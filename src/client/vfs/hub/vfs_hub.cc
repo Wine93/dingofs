@@ -29,6 +29,8 @@
 #include "client/vfs/compaction/compactor_impl.h"
 #include "client/vfs/components/prefetch_manager.h"
 #include "client/vfs/components/warmup_manager.h"
+#include "client/vfs/data/reader/reader_registry.h"
+#include "client/vfs/data/write_pressure_controller.h"
 #include "client/vfs/data/writer_table.h"
 #include "client/vfs/metasystem/local/metasystem.h"
 #include "client/vfs/metasystem/mds/metasystem.h"
@@ -43,7 +45,6 @@
 #include "common/directory.h"
 #include "common/options/cache.h"
 #include "common/options/client.h"
-#include "common/options/common.h"
 #include "common/status.h"
 #include "common/version.h"
 #include "utils/executor/thread/executor_impl.h"
@@ -57,6 +58,7 @@ static const std::string kReadExecutorName = "vfs_read";
 static const std::string kReadCleanupExecutorName = "vfs_read_cleanup";
 static const std::string kWriteBackgroundExecutorName = "vfs_write_bg";
 static const std::string kCBExecutorName = "vfs_callback";
+static const std::string kWritePressureExecutorName = "vfs_write_pressure";
 
 static MetaSystemUPtr BuildMetaSystem(const VFSConfig& vfs_conf,
                                       const ClientId& client_id,
@@ -77,8 +79,11 @@ static MetaSystemUPtr BuildMetaSystem(const VFSConfig& vfs_conf,
   return nullptr;
 }
 
-VFSHubImpl::VFSHubImpl(const VFSConfig& vfs_conf, ClientId client_id)
-    : client_id_(client_id), vfs_conf_(vfs_conf) {}
+VFSHubImpl::VFSHubImpl(const VFSConfig& vfs_conf, ClientId client_id,
+                       TraceManager& trace_manager)
+    : trace_manager_(trace_manager),
+      client_id_(client_id),
+      vfs_conf_(vfs_conf) {}
 
 WriterTable* VFSHubImpl::GetWriterTable() {
   CHECK_NOTNULL(writer_table_);
@@ -105,6 +110,10 @@ VFSHubImpl::~VFSHubImpl() {
     handle_manager_.reset();
   }
 
+  if (write_pressure_controller_ != nullptr) {
+    write_pressure_controller_.reset();
+  }
+
   if (writer_table_ != nullptr) {
     writer_table_.reset();
   }
@@ -123,6 +132,10 @@ VFSHubImpl::~VFSHubImpl() {
 
   if (flush_executor_ != nullptr) {
     flush_executor_.reset();
+  }
+
+  if (write_pressure_executor_ != nullptr) {
+    write_pressure_executor_.reset();
   }
 
   if (warmup_manager_ != nullptr) {
@@ -145,10 +158,6 @@ VFSHubImpl::~VFSHubImpl() {
     compactor_.reset();
   }
 
-  if (trace_manager_ != nullptr) {
-    trace_manager_.reset();
-  }
-
   if (logclean_manager_ != nullptr) {
     logclean_manager_.reset();
   }
@@ -165,12 +174,12 @@ Status VFSHubImpl::Start(bool skip_mount) {
   LOG(INFO) << fmt::format("[vfs.hub] vfs hub starting, skip_mount({}).",
                            skip_mount);
 
-  // trace manager
-  trace_manager_ = std::make_unique<TraceManager>();
-  if (FLAGS_enable_trace) {
-    if (!trace_manager_->Init()) {
-      return Status::Internal("init trace manager fail");
-    }
+  const uint64_t write_buffer_total_bytes =
+      FLAGS_vfs_write_buffer_total_mb * 1024 * 1024;
+  if (write_buffer_total_bytes % FLAGS_vfs_write_buffer_page_size != 0) {
+    return Status::InvalidParam(fmt::format(
+        "write buffer total size ({}) must be a multiple of page size ({})",
+        write_buffer_total_bytes, FLAGS_vfs_write_buffer_page_size));
   }
 
   {
@@ -181,7 +190,7 @@ Status VFSHubImpl::Start(bool skip_mount) {
   // meta system
   {
     auto meta =
-        BuildMetaSystem(vfs_conf_, client_id_, *trace_manager_, *compactor_);
+        BuildMetaSystem(vfs_conf_, client_id_, trace_manager_, *compactor_);
     if (meta == nullptr) {
       return Status::Internal("build meta system fail");
     }
@@ -192,7 +201,7 @@ Status VFSHubImpl::Start(bool skip_mount) {
 
   // load fs info
   {
-    auto span = trace_manager_->StartSpan("vfs::start");
+    auto span = trace_manager_.StartSpan("vfs::start");
 
     DINGOFS_RETURN_NOT_OK(
         meta_wrapper_->GetFsInfo(SpanScope::GetContext(span), &fs_info_));
@@ -201,6 +210,27 @@ Status VFSHubImpl::Start(bool skip_mount) {
     if (fs_info_.status != FsStatus::kNormal) {
       return Status::Internal(fmt::format("fs is unavailable, status({})",
                                           FsStatus2Str(fs_info_.status)));
+    }
+
+    if (fs_info_.block_size % FLAGS_vfs_write_buffer_page_size != 0) {
+      return Status::InvalidParam(fmt::format(
+          "filesystem block size ({}) must be a multiple of write buffer "
+          "page size ({})",
+          fs_info_.block_size, FLAGS_vfs_write_buffer_page_size));
+    }
+
+    const uint64_t max_chunk_pages =
+        (static_cast<uint64_t>(fs_info_.chunk_size) +
+         FLAGS_vfs_write_buffer_page_size - 1) /
+        FLAGS_vfs_write_buffer_page_size;
+    const uint64_t write_buffer_capacity_pages =
+        write_buffer_total_bytes / FLAGS_vfs_write_buffer_page_size;
+    if (max_chunk_pages > write_buffer_capacity_pages) {
+      return Status::InvalidParam(fmt::format(
+          "filesystem chunk size ({}) requires up to {} write buffer pages, "
+          "exceeding write buffer capacity ({} pages, {} bytes)",
+          fs_info_.chunk_size, max_chunk_pages, write_buffer_capacity_pages,
+          write_buffer_total_bytes));
     }
   }
 
@@ -264,6 +294,10 @@ Status VFSHubImpl::Start(bool skip_mount) {
     DINGOFS_RETURN_NOT_OK(writer_table_->Start());
   }
 
+  // ReaderRegistry is a non-owning index. It must exist before handles can
+  // register readers and outlive HandleManager teardown.
+  reader_registry_ = std::make_unique<ReaderRegistry>();
+
   // handle manager
   {
     handle_manager_ = std::make_unique<HandleManager>(this);
@@ -281,6 +315,7 @@ Status VFSHubImpl::Start(bool skip_mount) {
     }
     CHECK(block_store_ != nullptr) << "block store is nullptr.";
     DINGOFS_RETURN_NOT_OK(block_store_->Start());
+    meta_wrapper_->SetBlockStore(block_store_.get());
   }
 
   {
@@ -324,9 +359,19 @@ Status VFSHubImpl::Start(bool skip_mount) {
     }
   }
 
+  {
+    write_pressure_executor_ =
+        std::make_unique<ExecutorImpl>(kWritePressureExecutorName, 1);
+    if (!write_pressure_executor_->Start()) {
+      return Status::Internal("write pressure executor start fail");
+    }
+  }
+
   write_buffer_manager_ = std::make_unique<WriteMemPool>(
-      FLAGS_vfs_write_buffer_total_mb * 1024 * 1024,
-      FLAGS_vfs_write_buffer_page_size);
+      write_buffer_total_bytes, FLAGS_vfs_write_buffer_page_size);
+  write_pressure_controller_ = std::make_unique<WritePressureController>(
+      writer_table_.get(), write_pressure_executor_.get());
+  write_buffer_manager_->SetPressureObserver(write_pressure_controller_.get());
 
   // read mempool (the read-path buffer accountant; replaces ReadBufferManager)
   {
@@ -431,19 +476,45 @@ Status VFSHubImpl::Stop(bool skip_unmount) {
     uid_gid_mapper_->StopWatching();
   }
 
+  // Close page admission first so blocked foreground writers wake and no new
+  // leases can enter teardown. Existing page owners may still release.
+  if (write_buffer_manager_ != nullptr) {
+    write_buffer_manager_->Close();
+    write_buffer_manager_->SetPressureObserver(nullptr);
+  }
+
   if (compactor_ != nullptr) {
     compactor_->Stop();
   }
 
-  if (handle_manager_ != nullptr) {
-    handle_manager_->Stop();
+  // Drain the event-driven flush round before HandleManager performs the final
+  // synchronous writer flush. This prevents overlapping pressure and shutdown
+  // flush ownership.
+  if (write_pressure_controller_ != nullptr) {
+    write_pressure_controller_->StopAndDrain();
+  }
+  if (write_pressure_executor_ != nullptr) {
+    write_pressure_executor_->Stop();
   }
 
-  // HandleManager::Stop releases handle-owned reader/writer resources while
-  // preserving handle identities for handover Dump. Drain residual dirty data
-  // and stop the writer table before tearing down executors/meta/block-store.
+  Status handle_stop_status;
+  if (handle_manager_ != nullptr) {
+    handle_stop_status = handle_manager_->Stop();
+  }
+
+  // A handover must never publish state after dirty data failed to flush. The
+  // old process is already quiesced at this point, so treat this as an
+  // unrecoverable handover failure rather than letting ClientSession dump
+  // state.
+  if (skip_unmount && !handle_stop_status.ok()) {
+    LOG(FATAL) << fmt::format("Handover writer flush failed: {}",
+                              handle_stop_status.ToString());
+  }
+
+  // HandleManager::Stop has already flushed all writers before releasing its
+  // detached resources. Stop new writer acquires before tearing down
+  // executors/meta/block-store.
   if (writer_table_ != nullptr) {
-    (void)writer_table_->FlushAll();
     writer_table_->Stop();
   }
 
@@ -465,16 +536,23 @@ Status VFSHubImpl::Stop(bool skip_unmount) {
   }
 
   if (warmup_manager_ != nullptr) {
-    // Detach from meta system before stopping so any in-flight Open hook
-    // observes nullptr instead of a half-stopped manager.
+    // ClientSession has already rejected new public operations and drained all
+    // existing operations before VFSHub::Stop, so no Open trigger can race
+    // with this detach.
     if (meta_wrapper_ != nullptr) {
       meta_wrapper_->SetWarmupManager(nullptr);
     }
-    warmup_manager_->Stop();
+    CHECK(warmup_manager_->Stop().ok());
   }
 
   if (prefetch_manager_ != nullptr) {
     prefetch_manager_->Stop();
+  }
+
+  // Drain MetaSystem tasks before shutting down BlockStore. Unlink cleanup
+  // tasks run on the metadata executor and submit asynchronous cache deletes.
+  if (meta_wrapper_ != nullptr) {
+    meta_wrapper_->Stop(skip_unmount);
   }
 
   // Block cache read/prefetch completions run in cache-owned bthreads and may
@@ -485,7 +563,7 @@ Status VFSHubImpl::Stop(bool skip_unmount) {
   }
 
   // BlockStore::Shutdown has invoked every accepted upload callback. Drain
-  // CBExecutor while MetaSystem is still available to completion callbacks.
+  // CBExecutor while the callback executor is still alive.
   if (cb_executor_ != nullptr) {
     cb_executor_->Stop();
   }
@@ -495,18 +573,6 @@ Status VFSHubImpl::Stop(bool skip_unmount) {
   // read bthread, otherwise a straggler completion submits to a dead executor.
   if (read_cleanup_executor_ != nullptr) {
     read_cleanup_executor_->Stop();
-  }
-
-  // meta_wrapper_ can stop after block_store_: the metasystem flushes to MDS
-  // via RPC and never pushes data through block_store_, and its only background
-  // producer (write_background_executor_'s slice_id pre-allocation) was already
-  // drained above. Block-store completions are drained by CBExecutor above.
-  if (meta_wrapper_ != nullptr) {
-    meta_wrapper_->Stop(skip_unmount);
-  }
-
-  if (trace_manager_ != nullptr) {
-    if (FLAGS_enable_trace) trace_manager_->Stop();
   }
 
   if (logclean_manager_ != nullptr) {
@@ -523,7 +589,7 @@ Status VFSHubImpl::Stop(bool skip_unmount) {
   // Stop() would CHECK-fail (SIGABRT) such a late caller mid-teardown.
   started_.store(false, std::memory_order_relaxed);
 
-  return Status::OK();
+  return handle_stop_status;
 }
 
 }  // namespace vfs

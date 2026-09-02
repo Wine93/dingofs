@@ -14,9 +14,12 @@
 
 #include "client/vfs/metasystem/mds/file_session.h"
 
+#include <fcntl.h>
+
 #include <cstdint>
 #include <string>
 
+#include "common/helper.h"
 #include "fmt/format.h"
 #include "glog/logging.h"
 #include "json/value.h"
@@ -80,6 +83,47 @@ uint32_t FileSession::DeleteSession(uint64_t fh) {
   session_id_map_.erase(it);
 
   return DecRef();
+}
+
+bool FileSession::HasWriter() {
+  utils::ReadLockGuard lk(lock_);
+
+  for (const auto& [_, session_info] : session_id_map_) {
+    if ((session_info.flags & O_ACCMODE) != O_RDONLY) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool FileSession::HasMultipleWriters() {
+  utils::ReadLockGuard lk(lock_);
+
+  uint32_t writer_count = 0;
+  for (const auto& [_, session_info] : session_id_map_) {
+    if ((session_info.flags & O_ACCMODE) != O_RDONLY) {
+      if (++writer_count > 1) return true;
+    }
+  }
+
+  return false;
+}
+
+void FileSession::InvalidateReadCache(bool just_readonly) {
+  utils::WriteLockGuard lk(lock_);
+
+  if (just_readonly && !IsAllReadOnly()) return;
+
+  chunk_set_->InvalidateReadCache();
+}
+
+bool FileSession::IsAllReadOnly() {
+  for (const auto& [_, session_info] : session_id_map_) {
+    if ((session_info.flags & O_ACCMODE) != O_RDONLY) return false;
+  }
+
+  return true;
 }
 
 size_t FileSession::Size() {
@@ -209,10 +253,7 @@ void FileSessionMap::Delete(Ino ino, uint64_t fh) {
         if (it != map.end()) {
           auto& file_session = it->second;
           ref_count = file_session->DeleteSession(fh);
-          if (ref_count == 0) {
-            file_session->GetChunkSet()->ResetLastWriteLength();
-            map.erase(it);
-          }
+          if (ref_count == 0) map.erase(it);
         }
       },
       ino);
@@ -281,6 +322,20 @@ FileSessionMap::GetNeedKeepAliveSession() {
   });
 
   return file_session_id_map;
+}
+
+bool FileSessionMap::HasSession(Ino ino) {
+  CHECK(ino != 0) << "ino is zero.";
+
+  bool has_session = false;
+  shard_map_.withRLock(
+      [this, ino, &has_session](Map& map) {
+        auto it = map.find(ino);
+        if (it != map.end()) has_session = true;
+      },
+      ino);
+
+  return has_session;
 }
 
 size_t FileSessionMap::Size() {

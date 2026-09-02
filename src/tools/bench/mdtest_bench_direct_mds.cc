@@ -111,6 +111,8 @@ DEFINE_string(bench_mode, "unique",
               "Concurrency mode: unique (per-thread subtree) | "
               "shared (global tree, shared task queue)");
 
+DEFINE_int32(bench_dir_threads, 1, "Number of create dir worker threads");
+
 DEFINE_bool(bench_cleanup, false, "Remove bench tree after completion");
 DEFINE_bool(bench_force, true,
             "Remove residual tree from a previous run before starting");
@@ -276,12 +278,14 @@ class MdsDirectClient {
     uint64_t off = 0;
     for (;;) {
       ContextSPtr ctx = NewCtx();
-      std::vector<DirEntry> entries;
+      std::vector<MDSClient::ReadDirEntry> entries;
       Status s = mds_client_->ReadDir(ctx, ino, fh, last_name, kBatch,
                                       with_attr, entries);
       if (!s.ok()) return s;
       for (const auto& entry : entries) {
-        if (!handler(entry, off++)) return Status::OK();
+        DirEntry dir_entry{entry.ino, entry.name,
+                           Helper::ToAttr(entry.attr_entry)};
+        if (!handler(dir_entry, off++)) return Status::OK();
       }
       if (entries.size() < kBatch) break;
       last_name = entries.back().name;
@@ -551,16 +555,21 @@ class ProgressTracker {
 
  private:
   void Run() {
-    auto start = std::chrono::steady_clock::now();
+    auto last = std::chrono::steady_clock::now();
+    uint64_t last_progress = 0;
     while (running_) {
       std::this_thread::sleep_for(std::chrono::seconds(1));
       if (!running_) break;
 
       auto now = std::chrono::steady_clock::now();
-      double elapsed = std::chrono::duration<double>(now - start).count();
+      double interval = std::chrono::duration<double>(now - last).count();
       uint64_t p = progressed_.load(std::memory_order_relaxed);
+
       double pct = 100.0 * p / total_ops_;
-      double ops_sec = SafeOpsPerSec(p, elapsed);
+      double ops_sec = SafeOpsPerSec(p - last_progress, interval);
+
+      last = now;
+      last_progress = p;
 
       std::cout << "\r  [" << phase_ << " " << num_threads_ << "T] "
                 << std::fixed << std::setprecision(1) << pct << "%  " << p
@@ -651,6 +660,8 @@ static int CreateEmptyFile(MdsDirectClient* client, Ino parent,
                            const std::string& name) {
   CHECK(parent != 0) << "Invalid parent inode 0 for " << name;
 
+  auto start_time = std::chrono::steady_clock::now();
+
   Attr attr;
   Status s = client->Create(parent, name, getuid(), getgid(), 33188,
                             O_CREAT | O_WRONLY | O_EXCL, &attr);
@@ -660,6 +671,14 @@ static int CreateEmptyFile(MdsDirectClient* client, Ino parent,
         s.ToString());
     return StatusToErrno(s);
   }
+
+  auto end_time = std::chrono::steady_clock::now();
+
+  LOG(INFO) << fmt::format(
+      "create file success, parent({}) name({}) time({} ms).", parent, name,
+      std::chrono::duration_cast<std::chrono::milliseconds>(end_time -
+                                                            start_time)
+          .count());
 
   return StatusToErrno(s);
 }
@@ -830,8 +849,18 @@ static void SharedWorker(MdsDirectClient* client, TreeSpec* spec,
     if (result->error_code == 0) {
       uint64_t count = spec->DirsAtLevel(d);
       for (;;) {
-        uint64_t idx =
-            work->dir_cursors[d].fetch_add(1, std::memory_order_relaxed);
+        uint64_t idx = 0;
+        // decrease create dir thread num
+        if (result->thread_id < FLAGS_bench_dir_threads) {
+          idx = work->dir_cursors[d].fetch_add(1, std::memory_order_relaxed);
+        } else {
+          idx = work->dir_cursors[d].load(std::memory_order_relaxed);
+          if (idx >= count) break;
+          // sleep 10ms
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          continue;
+        }
+
         if (idx >= count) break;
         std::string path = spec->DirPath(d, idx);
         Ino parent = spec->ResolveParent(client, path);
@@ -864,6 +893,10 @@ static void SharedWorker(MdsDirectClient* client, TreeSpec* spec,
   // ---- File phase ----
   pthread_barrier_wait(barrier);
   if (result->error_code == 0) {
+    LOG(INFO) << fmt::format("thread({}) starting file phase, group({}).",
+                             result->thread_id,
+                             result->thread_id % work->file_cursors.size());
+
     uint32_t group_num = result->thread_id % work->file_cursors.size();
     uint64_t total = spec->TotalFiles();
     for (;;) {
@@ -888,7 +921,12 @@ static void SharedWorker(MdsDirectClient* client, TreeSpec* spec,
       result->file_ops++;
       file_progress->Add(1);
     }
+  } else {
+    LOG(ERROR) << fmt::format(
+        "thread({}) skipped file phase due to previous error({}) path({}).",
+        result->thread_id, result->error_code, result->error_path);
   }
+
   pthread_barrier_wait(barrier);
 }
 

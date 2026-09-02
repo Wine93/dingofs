@@ -39,9 +39,10 @@ namespace vfs {
 
 class VFSImpl : public VFS {
  public:
-  VFSImpl(const VFSConfig& vfs_conf, const ClientId& client_id);
+  VFSImpl(const VFSConfig& vfs_conf, const ClientId& client_id,
+          TraceManager& trace_manager);
 
-  ~VFSImpl() override = default;
+  ~VFSImpl() override;
 
   Status Start(bool skip_mount) override;
 
@@ -50,10 +51,6 @@ class VFSImpl : public VFS {
   bool Dump(ContextSPtr ctx, Json::Value& value) override;
 
   bool Load(ContextSPtr ctx, const Json::Value& value) override;
-
-  double GetAttrTimeout(const FileType& type) override;
-
-  double GetEntryTimeout(const FileType& type) override;
 
   Status Lookup(ContextSPtr ctx, Ino parent, const std::string& name,
                 Attr* attr) override;
@@ -89,7 +86,8 @@ class VFSImpl : public VFS {
   Status Link(ContextSPtr ctx, Ino ino, Ino new_parent,
               const std::string& new_name, Attr* attr) override;
 
-  Status Open(ContextSPtr ctx, Ino ino, int flags, uint64_t* fh) override;
+  Status Open(ContextSPtr ctx, Ino ino, int flags, uint64_t* fh,
+              bool* keep_cache) override;
 
   Status Create(ContextSPtr ctx, Ino parent, const std::string& name,
                 uint32_t uid, uint32_t gid, uint32_t mode, int flags,
@@ -102,6 +100,9 @@ class VFSImpl : public VFS {
                uint64_t offset, uint64_t fh, uint64_t* out_wsize) override;
 
   Status Flush(ContextSPtr ctx, Ino ino, uint64_t fh) override;
+
+  // best-effort length rollback on data-flush failure (ADR-0003)
+  void RollbackFile(ContextSPtr ctx, Ino ino, uint64_t fh);
 
   Status Release(ContextSPtr ctx, Ino ino, uint64_t fh) override;
 
@@ -139,23 +140,17 @@ class VFSImpl : public VFS {
                unsigned flags, const void* in_buf, size_t in_bufsz,
                char* out_buf, size_t out_bufsz) override;
 
-  uint64_t GetFsId() override;
-
-  uint64_t GetMaxNameLength() override;
-
-  TraceManager* GetTraceManager() override {
-    return vfs_hub_->GetTraceManager();
-  }
-
   Status GetInfo(std::string* info) override;
 
  private:
   friend class VFSImplTest;
 
   // Test-only constructor: inject a pre-built VFSHub.
-  explicit VFSImpl(std::unique_ptr<VFSHub> hub);
+  VFSImpl(std::unique_ptr<VFSHub> hub, TraceManager& trace_manager);
 
   Status StartBrpcServer();
+
+  void StopBrpcServer();
 
   // Resolve `mount_root_path_` to a real directory inode by walking the
   // filesystem. Must be called after `vfs_hub_->Start()` so that
@@ -192,10 +187,24 @@ class VFSImpl : public VFS {
 
   bool IsSubdirMount() const { return mount_root_ino_ != kRootIno; }
 
+  // Number of synthesized entries at the head of `ino`'s readdir stream:
+  // "."/".." for every directory, plus ".stats"/".trash" for the
+  // FUSE-visible root. Synthesized entries share one cookie space with real
+  // dentries (stream position p has cookie p+1); see
+  // docs/adr/0001-readdir-synthesized-entries.md.
+  uint64_t SynthesizedDirEntryCount(Ino ino) const;
+
+  // Kernel-space ino to report for the ".." entry of directory `ino`, given
+  // its already-fetched attr. Covers the mount-root self-loop, the
+  // synthesized ".trash" dir, and the mount_root_ino_ -> kRootIno rewrite
+  // (the reverse of TranslateIno).
+  Ino ResolveDotDotIno(Ino ino, const Attr& dir_attr) const;
+
   // True when the filesystem has trash enabled (`trash_days > 0`). Pinned to
   // the mount-time fs_info; runtime `updatefs --trash_days` requires remount.
   bool IsTrashVisible() const { return vfs_hub_->GetFsInfo().trash_days > 0; }
 
+  TraceManager& trace_manager_;
   const ClientId client_id_;
 
   // Filesystem-internal path mounted as the local mountpoint root.
@@ -207,11 +216,14 @@ class VFSImpl : public VFS {
   std::unique_ptr<VFSHub> vfs_hub_;
   MetaWrapper* meta_system_{nullptr};
   HandleManager* handle_manager_{nullptr};
+  ReaderRegistry* reader_registry_{nullptr};
 
-  brpc::Server brpc_server_;
+  // Services are non-owned by brpc_server_. Declare the server last so it is
+  // destroyed first and drains callbacks before either the services or hub.
   InodeBlocksServiceImpl inode_blocks_service_;
   CompactServiceImpl compact_service_;
   ClientStatServiceImpl client_stat_service_;
+  brpc::Server brpc_server_;
 };
 
 }  // namespace vfs

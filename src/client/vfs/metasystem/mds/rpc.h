@@ -16,6 +16,7 @@
 #define DINGOFS_SRC_CLIENT_VFS_META_MDS_RPC_H_
 
 #include <atomic>
+#include "common/helper.h"
 #include <cstdint>
 #include <memory>
 #include <sstream>
@@ -61,7 +62,7 @@ inline bool IsInvalidEndpoint(const EndPoint& endpoint) {
 
 inline uint32_t CalWaitTimeUs(int retry) {
   // exponential backoff
-  return mds::Helper::GenerateRealRandomInteger(50000, 100000) * (1 << retry);
+  return ::dingofs::Helper::GenerateRealRandomInteger(50000, 100000) * (1 << retry);
 }
 
 inline bool IsRetry(int& retry, int max_retry) {
@@ -94,6 +95,7 @@ struct SendRequestOption {
 
   int64_t timeout_ms;
   int max_retry;
+  bool retry{true};
   bool timeout_retry{true};
 };
 
@@ -271,10 +273,8 @@ inline std::string DescribeOpenResponse(pb::mds::OpenResponse& response) {
 // print FlushFileRequest
 inline std::string DescribeFlushFileRequest(
     pb::mds::FlushFileRequest& request) {
-  return fmt::format(
-      "fs_id:{} ino:{} length:{} data:{} data_version:{} is_final:{}",
-      request.fs_id(), request.ino(), request.length(), request.data().size(),
-      request.data_version(), request.is_final());
+  return fmt::format("fs_id:{} ino:{} length:{}", request.fs_id(),
+                     request.ino(), request.length());
 }
 
 template <typename Request, typename Response>
@@ -311,7 +311,7 @@ Status RPC::SendRequest(const EndPoint& endpoint,
     cntl.set_log_id(butil::fast_rand());
     // InjectTraceHeader(&cntl);
     request.mutable_info()->set_timeout_ms(option.timeout_ms);
-    request.mutable_info()->set_retry_times(retry);
+    request.mutable_info()->set_retry_times(request.info().retry_times() + 1);
 
     uint64_t start_us = utils::TimestampUs();
     channel->CallMethod(method, &cntl, &request, &response, nullptr);
@@ -418,7 +418,7 @@ Status RPC::SendRequest(const EndPoint& endpoint,
       break;
     }
 
-  } while (IsRetry(retry, option.max_retry));
+  } while (option.retry && IsRetry(retry, option.max_retry));
 
   return TransformError(response.error());
 }

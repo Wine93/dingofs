@@ -25,6 +25,7 @@
 #include <variant>
 
 #include "common/blockaccess/accesser.h"
+#include "common/blockaccess/rados/osd_map_refresher.h"
 #include "common/blockaccess/rados/rados_common.h"
 
 namespace dingofs {
@@ -64,13 +65,13 @@ struct RadosAsyncIOUnit {
 
 class RadosAccesser : public Accesser {
  public:
-  RadosAccesser(const RadosOptions& options) : options_(options){};
+  RadosAccesser(const RadosOptions& options) : options_(options) {};
 
-  ~RadosAccesser() override { Destroy(); }
+  ~RadosAccesser() override { Stop(); }
 
   bool Init() override;
 
-  bool Destroy() override;
+  bool Stop() override;
 
   bool ContainerExist() override;
 
@@ -112,6 +113,7 @@ class RadosAccesser : public Accesser {
   const RadosOptions options_;
 
   rados_t cluster_{nullptr};
+  std::unique_ptr<OsdMapRefresher> map_refresher_;
 };
 
 }  // namespace blockaccess

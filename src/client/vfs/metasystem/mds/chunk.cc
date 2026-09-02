@@ -36,6 +36,9 @@ static const uint32_t kChunkCommitIntervalMs = 1000;  // milliseconds
 
 static std::atomic<uint64_t> task_id_generator{10000};
 
+DEFINE_uint32(vfs_meta_chunk_fresh_time_s, 10,
+              "chunk cache fresh time seconds");
+
 bool Chunk::Put(const ChunkEntry& chunk, const char* reason) {
   CHECK(chunk.index() == index_)
       << fmt::format("[meta.chunk.{}.{}] mismatch chunk index({}|{}).", ino_,
@@ -80,31 +83,24 @@ bool Chunk::Put(const ChunkEntry& chunk, const char* reason) {
   return true;
 }
 
-bool Chunk::Compact(uint32_t start_pos, uint64_t start_slice_id,
-                    uint32_t end_pos, uint64_t end_slice_id,
+bool Chunk::Compact(const std::vector<Slice>& old_slices,
                     const std::vector<Slice>& new_slices) {
-  CHECK(start_pos < end_pos) << "invalid compact range";
-  CHECK(start_slice_id != 0) << "start_slice_id is 0";
-  CHECK(end_slice_id != 0) << "end_slice_id is 0";
+  CHECK(!old_slices.empty()) << "old_slices is empty";
   CHECK(!new_slices.empty()) << "new_slices is empty";
 
   utils::WriteLockGuard guard(lock_);
 
-  if (end_pos >= commited_slices_.size()) {
-    return false;
-  }
-  if (start_slice_id != commited_slices_[start_pos].id) {
-    return false;
-  }
-  if (end_slice_id != commited_slices_[end_pos].id) {
-    return false;
+  if (old_slices.size() > commited_slices_.size()) return false;
+
+  for (size_t i = 0; i < old_slices.size(); ++i) {
+    if (old_slices[i].id != commited_slices_[i].id) return false;
   }
 
-  uint32_t pos = start_pos;
+  uint32_t pos = 0;
   for (const auto& new_slice : new_slices) {
     commited_slices_[pos++] = new_slice;
   }
-  for (uint32_t i = end_pos + 1; i < commited_slices_.size(); ++i) {
+  for (uint32_t i = old_slices.size(); i < commited_slices_.size(); ++i) {
     commited_slices_[pos++] = commited_slices_[i];
   }
   commited_slices_.resize(pos);
@@ -252,7 +248,6 @@ bool Chunk::Dump(Json::Value& value, bool is_summary) {
   value["is_completed"] = is_completed_;
   value["commited_version"] = commited_version_;
   value["last_compaction_time_ms"] = last_compaction_time_ms_;
-  value["last_active_s"] = last_active_s_;
 
   return true;
 }
@@ -335,7 +330,63 @@ bool CommitTask::Dump(Json::Value& value) {
   return true;
 }
 
+ChunkSet::ChunkSet(Ino ino, uint32_t chunk_size)
+    : ino_(ino), chunk_size_(chunk_size) {
+  CHECK(bthread_mutex_init(&write_flush_mutex_, nullptr) == 0)
+      << "init write_flush_mutex_ fail.";
+}
+
+ChunkSet::~ChunkSet() {
+  CHECK(bthread_mutex_destroy(&write_flush_mutex_) == 0)
+      << "destroy write_flush_mutex_ fail.";
+}
+
+uint64_t ChunkSet::Epoch() const {
+  utils::ReadLockGuard guard(lock_);
+  return epoch_;
+}
+
+uint64_t ChunkSet::GetLastWriteSliceLength() const {
+  utils::ReadLockGuard guard(lock_);
+  return last_write_slice_length_;
+}
+
+void ChunkSet::SetLastWriteLength(uint64_t offset, uint64_t size) {
+  std::lock_guard<bthread_mutex_t> flush_guard(write_flush_mutex_);
+  utils::WriteLockGuard lk(lock_);
+
+  last_write_length_ = std::max(last_write_length_, offset + size);
+  last_write_time_ns_ = utils::TimestampNs();
+}
+
+void ChunkSet::InitFlushCheckpoint(uint64_t length) {
+  utils::WriteLockGuard lk(lock_);
+  if (!flush_checkpoint_inited_) {
+    flush_checkpoint_inited_ = true;
+    flush_checkpoint_length_ = length;
+  }
+}
+void ChunkSet::SetFlushCheckpoint(uint64_t length) {
+  utils::WriteLockGuard lk(lock_);
+  flush_checkpoint_inited_ = true;
+  flush_checkpoint_length_ = length;
+}
+uint64_t ChunkSet::GetFlushCheckpoint() const {
+  utils::ReadLockGuard guard(lock_);
+  return flush_checkpoint_length_;
+}
+uint64_t ChunkSet::GetLastWriteLength() const {
+  utils::ReadLockGuard guard(lock_);
+  return last_write_length_;
+}
+
+uint64_t ChunkSet::GetLastWriteTimeNs() const {
+  utils::ReadLockGuard guard(lock_);
+  return last_write_time_ns_;
+}
+
 void ChunkSet::Append(uint32_t index, const std::vector<Slice>& slices) {
+  std::lock_guard<bthread_mutex_t> flush_guard(write_flush_mutex_);
   utils::WriteLockGuard guard(lock_);
 
   auto it = chunk_map_.find(index);
@@ -347,6 +398,25 @@ void ChunkSet::Append(uint32_t index, const std::vector<Slice>& slices) {
     auto chunk = Chunk::New(ino_, index);
     chunk->AppendSlice(slices);
     chunk_map_.emplace(index, chunk);
+  }
+
+  // calculate file length with write memo
+  uint64_t chunk_offset = index * chunk_size_;
+  for (const auto& slice : slices) {
+    last_write_slice_length_ =
+        std::max(last_write_slice_length_, chunk_offset + slice.End());
+  }
+}
+
+void ChunkSet::Put(const ChunkEntry& chunk, const char* reason) {
+  utils::WriteLockGuard guard(lock_);
+
+  auto it = chunk_map_.find(chunk.index());
+  if (it != chunk_map_.end()) {
+    it->second->Put(chunk, reason);
+
+  } else {
+    chunk_map_.emplace(chunk.index(), Chunk::New(ino_, chunk, reason));
   }
 }
 
@@ -369,6 +439,27 @@ void ChunkSet::InvalidateReadCache() {
   for (auto& [index, chunk] : chunk_map_) {
     chunk->SetNotCompleted();
   }
+
+  LOG_DEBUG << fmt::format(
+      "[meta.chunkset.{}] invalidate read cache, chunk_num({}).", ino_,
+      chunk_map_.size());
+}
+
+size_t ChunkSet::GetChunkSize() const {
+  utils::ReadLockGuard guard(lock_);
+  return chunk_map_.size();
+}
+
+bool ChunkSet::Exist(uint32_t index) {
+  utils::ReadLockGuard guard(lock_);
+  return chunk_map_.find(index) != chunk_map_.end();
+}
+
+ChunkSPtr ChunkSet::Get(uint32_t index) {
+  utils::ReadLockGuard guard(lock_);
+
+  auto it = chunk_map_.find(index);
+  return (it != chunk_map_.end()) ? it->second : nullptr;
 }
 
 uint64_t ChunkSet::GetVersion(uint32_t index) {
@@ -426,6 +517,11 @@ bool ChunkSet::HasCommitting() {
   return false;
 }
 
+bool ChunkSet::HasCommitTask() {
+  utils::ReadLockGuard guard(lock_);
+  return !commit_task_map_.empty();
+}
+
 uint32_t ChunkSet::TryCommitSlice(bool is_force) {
   uint64_t now_ms = utils::TimestampMs();
   if (!is_force && now_ms < (last_commit_ms_.load(std::memory_order_relaxed) +
@@ -472,8 +568,9 @@ uint32_t ChunkSet::TryCommitSlice(bool is_force) {
 
 CommitTaskSPtr ChunkSet::CreateCommitTaskUnlock(
     std::vector<CommitTask::DeltaSlice>&& delta_slices) {
-  auto task = std::make_shared<CommitTask>(
-      task_id_generator.fetch_add(1), std::move(delta_slices), chunk_size_);
+  auto task =
+      std::make_shared<CommitTask>(task_id_generator.fetch_add(1), epoch_,
+                                   std::move(delta_slices), chunk_size_);
 
   commit_task_map_.insert({task->TaskID(), task});
 
@@ -484,9 +581,20 @@ CommitTaskSPtr ChunkSet::CreateCommitTaskUnlock(
   return task;
 }
 
-void ChunkSet::FinishCommitTask(uint64_t task_id,
-                                const std::vector<ChunkEntry>& chunks) {
+Status ChunkSet::FinishCommitTask(CommitTaskSPtr& commit_task,
+                                  const std::vector<ChunkEntry>& chunks) {
+  const uint64_t task_id = commit_task->TaskID();
+  const uint64_t task_epoch = commit_task->Epoch();
+  CHECK(!chunks.empty()) << "chunks is empty.";
+
   utils::WriteLockGuard guard(lock_);
+
+  if (task_epoch != epoch_) {
+    LOG(WARNING) << fmt::format(
+        "[meta.chunkset.{}] discard commit task({}), epoch({}->{}).", ino_,
+        task_id, task_epoch, epoch_);
+    return Status::NotFit("epoch mismatch");
+  }
 
   auto task_it = commit_task_map_.find(task_id);
   CHECK(task_it != commit_task_map_.end()) << fmt::format(
@@ -494,10 +602,6 @@ void ChunkSet::FinishCommitTask(uint64_t task_id,
       task_id);
 
   auto& task = task_it->second;
-  if (last_commited_length_ < task->GetLength()) {
-    last_commited_length_ = task->GetLength();
-    last_commited_length_changed_ = true;
-  }
 
   // delete finished task
   for (auto& chunk_index : task->GetChunkIndexs()) {
@@ -516,6 +620,8 @@ void ChunkSet::FinishCommitTask(uint64_t task_id,
       it->second->MarkCommited(chunk.version());
     }
   }
+
+  return Status::OK();
 }
 
 std::vector<CommitTaskSPtr> ChunkSet::ListCommitTask() {
@@ -531,6 +637,11 @@ std::vector<CommitTaskSPtr> ChunkSet::ListCommitTask() {
   return tasks;
 }
 
+size_t ChunkSet::GetCommitTaskSize() const {
+  utils::ReadLockGuard guard(lock_);
+  return commit_task_map_.size();
+}
+
 bool ChunkSet::HasUncommitedSlice() {
   utils::ReadLockGuard guard(lock_);
 
@@ -543,14 +654,21 @@ bool ChunkSet::HasUncommitedSlice() {
   return false;
 }
 
-uint64_t ChunkSet::GetLastActiveTimeS() const {
-  utils::ReadLockGuard guard(lock_);
+void ChunkSet::Reset() {
+  std::lock_guard<bthread_mutex_t> flush_guard(write_flush_mutex_);
+  utils::WriteLockGuard guard(lock_);
 
-  uint64_t last_active_s = last_active_s_;
-  for (const auto& [_, chunk] : chunk_map_) {
-    last_active_s = std::max(last_active_s, chunk->GetlastActiveTime());
-  }
-  return last_active_s;
+  chunk_map_.clear();
+  commit_task_map_.clear();
+  committing_chunk_index_set_.clear();
+
+  last_write_length_ = 0;
+  last_write_time_ns_ = 0;
+  last_write_slice_length_ = 0;
+  flush_checkpoint_inited_ = false;
+  flush_checkpoint_length_ = 0;
+
+  ++epoch_;
 }
 
 size_t ChunkSet::Bytes() const {
@@ -567,6 +685,7 @@ size_t ChunkSet::Bytes() const {
 // output json format string
 bool ChunkSet::Dump(Json::Value& value, bool is_summary) {
   value["ino"] = ino_;
+  value["epoch"] = epoch_;
   value["last_write_length"] = last_write_length_;
   value["last_write_time_ns"] = last_write_time_ns_;
 
@@ -597,7 +716,6 @@ bool ChunkSet::Dump(Json::Value& value, bool is_summary) {
 
   value["id_generator"] = task_id_generator.load();
   value["last_commit_ms"] = last_commit_ms_.load();
-  value["last_active_s"] = GetLastActiveTimeS();
 
   return true;
 }
@@ -608,6 +726,8 @@ bool ChunkSet::Load(const Json::Value& value) {
     LOG(ERROR) << "[meta.chunkset] chunkset is not object.";
     return false;
   }
+
+  epoch_ = value["epoch"].isNull() ? 0 : value["epoch"].asUInt64();
 
   // load last_write_length and last_time_ns
   last_write_length_ = value["last_write_length"].asUInt64();
@@ -638,131 +758,95 @@ bool ChunkSet::Load(const Json::Value& value) {
   return true;
 }
 
-ChunkSetSPtr ChunkCache::Get(Ino ino) {
-  ChunkSetSPtr chunk_set;
+void ReadChunkCache::Put(Ino ino, const ChunkEntry& chunk) {
+  Key key{ino, chunk.index()};
+
   shard_map_.withWLock(
-      [ino, &chunk_set](Map& map) mutable {
-        auto it = map.find(ino);
-        if (it != map.end()) {
-          chunk_set = it->second;
+      [&](Map& map) {
+        auto [it, inserted] = map.try_emplace(key, Value(chunk));
+        if (!inserted) {
+          it->second.chunk = chunk;
+          it->second.last_fresh_s = utils::Timestamp();
         }
       },
       ino);
 
-  return chunk_set;
+  total_count_ << 1;
 }
 
-ChunkSetSPtr ChunkCache::GetOrCreate(Ino ino) {
-  ChunkSetSPtr chunk_set;
+void ReadChunkCache::Delete(Ino ino, uint32_t chunk_index) {
+  Key key{ino, chunk_index};
+
+  shard_map_.withWLock([&](Map& map) { map.erase(key); }, ino);
+}
+
+void ReadChunkCache::DeleteByIno(Ino ino) {
   shard_map_.withWLock(
-      [this, ino, &chunk_set](Map& map) mutable {
-        auto it = map.find(ino);
-        if (it != map.end()) {
-          chunk_set = it->second;
-        } else {
-          chunk_set = ChunkSet::New(ino, chunk_size_);
-          map.emplace(ino, chunk_set);
-          total_count_ << 1;
+      [&](Map& map) {
+        for (auto it = map.begin(); it != map.end();) {
+          if (it->first.ino == ino) {
+            map.erase(it++);
+          } else {
+            ++it;
+          }
+        }
+      },
+      ino);
+}
+
+bool ReadChunkCache::Get(Ino ino, uint32_t chunk_index, ChunkEntry& chunk) {
+  uint64_t now_s = utils::Timestamp();
+  Key key{ino, chunk_index};
+
+  bool found = false;
+  shard_map_.withRLock(
+      [&](const Map& map) {
+        auto it = map.find(key);
+        if (it != map.end() &&
+            it->second.last_fresh_s + FLAGS_vfs_meta_chunk_fresh_time_s >=
+                now_s) {
+          chunk = it->second.chunk;
+          found = true;
         }
       },
       ino);
 
-  return chunk_set;
+  return found;
 }
 
-void ChunkCache::Delete(Ino ino) {
-  shard_map_.withWLock([ino](Map& map) { map.erase(ino); }, ino);
-}
+void ReadChunkCache::CleanExpired(uint64_t expire_s) {
+  if (Size() < FLAGS_vfs_meta_clean_threshold_count) return;
 
-bool ChunkCache::HasUncommitedSlice() {
-  bool has_uncommited = false;
-  shard_map_.iterate([&has_uncommited](Map& map) {
-    for (auto& [_, chunkset] : map) {
-      if (chunkset->HasUncommitedSlice()) {
-        has_uncommited = true;
-        break;
+  shard_map_.iterateWLock([&](Map& map) {
+    for (auto it = map.begin(); it != map.end();) {
+      if (it->second.last_fresh_s < expire_s) {
+        auto temp = it++;
+        map.erase(temp);
+        clean_count_ << 1;
+
+      } else {
+        ++it;
       }
     }
   });
-
-  return has_uncommited;
 }
 
-size_t ChunkCache::Size() {
+size_t ReadChunkCache::Size() {
   size_t size = 0;
   shard_map_.iterate([&size](Map& map) { size += map.size(); });
   return size;
 }
 
-size_t ChunkCache::Bytes() {
-  size_t bytes = 0;
-  shard_map_.iterate([&bytes](Map& map) {
-    for (const auto& [_, chunkset] : map) {
-      bytes += chunkset->Bytes();
-    }
-  });
-
-  return bytes;
+size_t ReadChunkCache::Bytes() {
+  return Size() * (sizeof(Key) + sizeof(Value));
 }
 
-void ChunkCache::Clear() {
-  shard_map_.iterateWLock([](Map& map) { map.clear(); });
-}
-
-void ChunkCache::CleanExpired(uint64_t expire_s) {
-  std::vector<ChunkSetSPtr> expired_chunksets;
-  shard_map_.iterate([&](Map& map) {
-    for (auto& [ino, chunkset] : map) {
-      if (chunkset->GetLastActiveTimeS() < expire_s) {
-        expired_chunksets.push_back(chunkset);
-      }
-    }
-  });
-
-  // delete expired chunksets
-  for (const auto& chunkset : expired_chunksets) {
-    Delete(chunkset->GetIno());
-    clean_count_ << 1;
-    LOG_DEBUG << fmt::format(
-        "[meta.chunkcache] clean expired chunkset ino({}).",
-        chunkset->GetIno());
-  }
-}
-
-void ChunkCache::Summary(Json::Value& value) {
-  value["name"] = "chunkcache";
+void ReadChunkCache::Summary(Json::Value& value) {
+  value["name"] = "readchunkcache";
   value["count"] = Size();
   value["bytes"] = Bytes();
   value["total_count"] = total_count_.get_value();
   value["clean_count"] = clean_count_.get_value();
-}
-
-bool ChunkCache::Dump(Json::Value& value, bool is_summary) {
-  std::vector<ChunkSetSPtr> chunksets;
-  chunksets.reserve(Size());
-
-  shard_map_.iterate([&](Map& map) {
-    for (const auto& [key, chunkset] : map) {
-      chunksets.emplace_back(chunkset);
-    }
-  });
-
-  Json::Value items = Json::arrayValue;
-  for (auto& chunkset : chunksets) {
-    Json::Value item = Json::objectValue;
-    if (!chunkset->Dump(item, is_summary)) {
-      LOG(ERROR) << "[meta.chunkcache] dump chunkset fail.";
-      return false;
-    }
-    items.append(item);
-  }
-
-  value["chunk_cache"] = items;
-
-  LOG(INFO) << fmt::format("[meta.chunkcache] dump chunkset count({}).",
-                           chunksets.size());
-
-  return true;
 }
 
 }  // namespace meta

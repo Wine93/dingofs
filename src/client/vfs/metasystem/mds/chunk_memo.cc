@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/options/client.h"
 #include "utils/time.h"
 
 namespace dingofs {
@@ -66,7 +67,11 @@ void ChunkMemo::Forget(Ino ino, uint32_t chunk_index) {
       ino);
 }
 
-void ChunkMemo::CleanExpired(uint64_t expire_time_ns) {
+void ChunkMemo::CleanExpired(uint64_t expire_time_s) {
+  if (Size() < FLAGS_vfs_meta_clean_threshold_count) return;
+
+  uint64_t expire_time_ns = expire_time_s * 1000 * 1000 * 1000;
+
   shard_map_.iterateWLock([&](Map& map) {
     for (auto it = map.begin(); it != map.end();) {
       if (it->second.time_ns < expire_time_ns) {

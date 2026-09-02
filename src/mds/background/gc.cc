@@ -262,7 +262,7 @@ Status CleanDelFileTask::CleanDelFile(const AttrEntry& attr) {
 
   // delete inode
   class Trace trace;
-  CleanDelFileOperation operation(trace, attr.fs_id(), attr.ino(), attr.maybe_tiny_file());
+  CleanDelFileOperation operation(trace, attr.fs_id(), attr.ino());
   status = operation_processor_->RunAlone(&operation);
   if (!status.ok()) {
     return status;
@@ -358,13 +358,17 @@ bool GcProcessor::Init() {
   return worker_set_->Init();
 }
 
-void GcProcessor::Destroy() {
+void GcProcessor::Stop() {
   if (dist_lock_ != nullptr) {
-    dist_lock_->Destroy();
+    dist_lock_->Stop();
   }
 
   if (worker_set_ != nullptr) {
-    worker_set_->Destroy();
+    worker_set_->Stop();
+  }
+
+  for (auto& [fs_id, block_accesser] : block_accessers_) {
+    if (block_accesser != nullptr) block_accesser->Stop();
   }
 }
 

@@ -18,7 +18,6 @@
 #include <string>
 #include <vector>
 
-#include "common/const.h"
 #include "common/logging.h"
 #include "fmt/format.h"
 #include "glog/logging.h"
@@ -31,39 +30,41 @@ namespace quota {
 
 static const uint32_t kMaxNotFoundCount = 30;
 
-Quota::Quota(uint32_t fs_id, Ino ino, const QuotaEntry& quota) : fs_id_(fs_id), ino_(ino), quota_(quota) {
+static const uint32_t kMaxDepth = 4096;
+
+Quota::Quota(uint32_t fs_id, Ino ino, const QuotaEntry& quota) : fs_id_(fs_id), ino_(ino), quota_(ToInnerQuota(quota)) {
   last_time_ns_ = utils::TimestampNs();
 
   LOG_DEBUG << fmt::format("[quota.{}.{}] create quota, detail({}).", fs_id_, ino_, quota.ShortDebugString());
 }
 
-UsageEntry Quota::GetDeltaAccumulatedUsage(uint64_t& timepoint) {
-  if (!delta_usages_.empty()) timepoint = delta_usages_.back().time_ns();
+Quota::InnerUsage Quota::GetDeltaAccumulatedUsage(uint64_t& timepoint) {
+  if (!delta_usages_.empty()) timepoint = delta_usages_.back().time_ns;
 
-  UsageEntry usage;
-  usage.set_bytes(delta_bytes_);
-  usage.set_inodes(delta_inodes_);
+  InnerUsage usage;
+  usage.bytes = delta_bytes_;
+  usage.inodes = delta_inodes_;
 
   return usage;
 }
 
-UsageEntry Quota::GetTotalAccumulatedUsage(uint64_t& timepoint) {
+Quota::InnerUsage Quota::GetTotalAccumulatedUsage(uint64_t& timepoint) {
   auto usage = GetDeltaAccumulatedUsage(timepoint);
-  usage.set_bytes(usage.bytes() + quota_.used_bytes());
-  usage.set_inodes(usage.inodes() + quota_.used_inodes());
+  usage.bytes = usage.bytes + quota_.used_bytes;
+  usage.inodes = usage.inodes + quota_.used_inodes;
 
   return usage;
 }
 
-UsageEntry Quota::CompactDeltaUsage(uint64_t timepoint) {
-  UsageEntry usage;
+Quota::InnerUsage Quota::CompactDeltaUsage(uint64_t timepoint) {
+  InnerUsage usage;
   while (!delta_usages_.empty()) {
     const auto& delta_usage = delta_usages_.front();
-    if (delta_usage.time_ns() > timepoint) break;
-    usage.set_bytes(usage.bytes() + delta_usage.bytes());
-    usage.set_inodes(usage.inodes() + delta_usage.inodes());
-    delta_bytes_ -= delta_usage.bytes();
-    delta_inodes_ -= delta_usage.inodes();
+    if (delta_usage.time_ns > timepoint) break;
+    usage.bytes = usage.bytes + delta_usage.bytes;
+    usage.inodes = usage.inodes + delta_usage.inodes;
+    delta_bytes_ -= delta_usage.bytes;
+    delta_inodes_ -= delta_usage.inodes;
     delta_usages_.pop_front();
   }
 
@@ -81,11 +82,12 @@ void Quota::UpdateUsage(int64_t byte_delta, int64_t inode_delta, const std::stri
     uint64_t time_ns = std::max({now_ns, last_time_ns_}) + 1;
     last_time_ns_ = time_ns;
 
-    UsageEntry usage;
-    usage.set_bytes(byte_delta);
-    usage.set_inodes(inode_delta);
-    usage.set_time_ns(time_ns);
-    delta_usages_.push_back(std::move(usage));
+    InnerUsage usage;
+    usage.bytes = byte_delta;
+    usage.inodes = inode_delta;
+    usage.time_ns = time_ns;
+
+    delta_usages_.push_back(usage);
     delta_bytes_ += byte_delta;
     delta_inodes_ += inode_delta;
   }
@@ -97,13 +99,13 @@ bool Quota::Check(int64_t byte_delta, int64_t inode_delta) {
   uint64_t timepoint;
   auto usage = GetTotalAccumulatedUsage(timepoint);
 
-  int64_t used_bytes = usage.bytes() + byte_delta;
-  int64_t used_inodes = usage.inodes() + inode_delta;
+  int64_t used_bytes = usage.bytes + byte_delta;
+  int64_t used_inodes = usage.inodes + inode_delta;
 
-  if ((quota_.max_bytes() > 0 && used_bytes > quota_.max_bytes()) ||
-      (quota_.max_inodes() > 0 && used_inodes > quota_.max_inodes())) {
+  if ((quota_.max_bytes > 0 && used_bytes > quota_.max_bytes) ||
+      (quota_.max_inodes > 0 && used_inodes > quota_.max_inodes)) {
     LOG_DEBUG << fmt::format("[quota.{}.{}] check fail, bytes({}/{}/{}), inodes({}/{}/{}).", fs_id_, ino_, byte_delta,
-                             usage.bytes(), quota_.max_bytes(), inode_delta, usage.inodes(), quota_.max_inodes());
+                             usage.bytes, quota_.max_bytes.load(), inode_delta, usage.inodes, quota_.max_inodes.load());
     return false;
   }
 
@@ -116,16 +118,10 @@ std::vector<UsageEntry> Quota::GetUsage() {
   std::vector<UsageEntry> usages;
   usages.reserve(delta_usages_.size());
   for (auto& usage : delta_usages_) {
-    usages.push_back(usage);
+    usages.push_back(Quota::ToUsageEntry(usage));
   }
 
   return usages;
-}
-
-QuotaEntry Quota::GetQuota() {
-  utils::ReadLockGuard lk(rwlock_);
-
-  return quota_;
 }
 
 QuotaEntry Quota::GetAccumulatedQuota() {
@@ -134,34 +130,34 @@ QuotaEntry Quota::GetAccumulatedQuota() {
   uint64_t timepoint;
   auto usage = GetDeltaAccumulatedUsage(timepoint);
 
-  QuotaEntry quota = quota_;
-  quota.set_used_bytes(quota.used_bytes() + usage.bytes());
-  quota.set_used_inodes(quota.used_inodes() + usage.inodes());
+  QuotaEntry quota = ToQuotaEntry(quota_);
+  quota.set_used_bytes(quota.used_bytes() + usage.bytes);
+  quota.set_used_inodes(quota.used_inodes() + usage.inodes);
 
   return quota;
 }
 
 void Quota::Refresh(const QuotaEntry& quota, uint64_t timepoint, const std::string& reason) {
   bool is_change = false, is_change_uuid = false;
-  QuotaEntry old_quota;
-  UsageEntry compact_usage;
+  InnerQuota old_quota;
+  InnerUsage compact_usage;
   {
     utils::WriteLockGuard lk(rwlock_);
 
     old_quota = quota_;
     compact_usage = CompactDeltaUsage(timepoint);
-    if (compact_usage.bytes() != 0 || compact_usage.inodes() != 0) is_change = true;
+    if (compact_usage.bytes != 0 || compact_usage.inodes != 0) is_change = true;
 
-    if (quota_.uuid() == quota.uuid()) {
-      if (quota_.version() < quota.version()) {
-        quota_ = quota;
+    if (quota_.uuid == quota.uuid()) {
+      if (quota_.version < quota.version()) {
+        quota_ = ToInnerQuota(quota);
         is_change = true;
       }
 
     } else {
       is_change_uuid = true;
-      if (quota_.create_time_ns() < quota.create_time_ns()) {
-        quota_ = quota;
+      if (quota_.create_time_ns < quota.create_time_ns()) {
+        quota_ = ToInnerQuota(quota);
         is_change = true;
       }
     }
@@ -171,9 +167,51 @@ void Quota::Refresh(const QuotaEntry& quota, uint64_t timepoint, const std::stri
     LOG(INFO) << fmt::format(
         "[quota.{}.{}] refresh quota({}->{}), timepoint({}) change_uuid({}) bytes({}/{}/{}) inodes({}/{}/{}) "
         "reason({}).",
-        fs_id_, ino_, old_quota.version(), quota.version(), timepoint, is_change_uuid, compact_usage.bytes(),
-        quota.used_bytes(), quota.max_bytes(), compact_usage.inodes(), quota.used_inodes(), quota.max_inodes(), reason);
+        fs_id_, ino_, old_quota.version, quota.version(), timepoint, is_change_uuid, compact_usage.bytes,
+        quota.used_bytes(), quota.max_bytes(), compact_usage.inodes, quota.used_inodes(), quota.max_inodes(), reason);
   }
+}
+
+Quota::InnerQuota Quota::ToInnerQuota(const QuotaEntry& quota) {
+  return InnerQuota{
+      .max_bytes = quota.max_bytes(),
+      .max_inodes = quota.max_inodes(),
+      .used_bytes = quota.used_bytes(),
+      .used_inodes = quota.used_inodes(),
+      .uuid = quota.uuid(),
+      .version = quota.version(),
+      .create_time_ns = quota.create_time_ns(),
+  };
+}
+
+QuotaEntry Quota::ToQuotaEntry(const InnerQuota& inner_quota) {
+  QuotaEntry quota;
+  quota.set_max_bytes(inner_quota.max_bytes);
+  quota.set_max_inodes(inner_quota.max_inodes);
+  quota.set_used_bytes(inner_quota.used_bytes);
+  quota.set_used_inodes(inner_quota.used_inodes);
+  quota.set_uuid(inner_quota.uuid);
+  quota.set_version(inner_quota.version);
+  quota.set_create_time_ns(inner_quota.create_time_ns);
+
+  return quota;
+}
+
+Quota::InnerUsage Quota::ToInnerUsage(const UsageEntry& usage) {
+  return InnerUsage{
+      .bytes = usage.bytes(),
+      .inodes = usage.inodes(),
+      .time_ns = usage.time_ns(),
+  };
+}
+
+UsageEntry Quota::ToUsageEntry(const InnerUsage& inner_usage) {
+  UsageEntry usage;
+  usage.set_bytes(inner_usage.bytes);
+  usage.set_inodes(inner_usage.inodes);
+  usage.set_time_ns(inner_usage.time_ns);
+
+  return usage;
 }
 
 void DirQuotaMap::UpsertQuota(Ino ino, const QuotaEntry& quota, const std::string& reason) {
@@ -219,7 +257,8 @@ bool DirQuotaMap::CheckQuota(Ino ino, int64_t byte_delta, int64_t inode_delta) {
   if (!HasQuota()) return true;
 
   Ino curr_ino = ino;
-  while (true) {
+  uint32_t depth = 0;
+  do {
     auto quota = GetQuota(curr_ino);
     if (quota != nullptr) {
       if (!quota->Check(byte_delta, inode_delta)) return false;
@@ -231,14 +270,17 @@ bool DirQuotaMap::CheckQuota(Ino ino, int64_t byte_delta, int64_t inode_delta) {
     if (!GetParent(curr_ino, parent)) break;
 
     curr_ino = parent;
-  }
+  } while (++depth <= kMaxDepth);
+
+  LOG(WARNING) << fmt::format("[quota.{}.{}] beyond max depth({}).", fs_id_, ino, depth);
 
   return true;
 }
 
 QuotaSPtr DirQuotaMap::GetNearestQuota(Ino ino) {
   Ino curr_ino = ino;
-  while (true) {
+  uint32_t depth = 0;
+  do {
     auto quota = GetQuota(curr_ino);
     if (quota != nullptr) return quota;
 
@@ -248,7 +290,9 @@ QuotaSPtr DirQuotaMap::GetNearestQuota(Ino ino) {
     if (!GetParent(curr_ino, parent)) break;
 
     curr_ino = parent;
-  }
+  } while (++depth <= kMaxDepth);
+
+  LOG(WARNING) << fmt::format("[quota.{}.{}] beyond max depth({}).", fs_id_, ino, depth);
 
   return nullptr;
 }
@@ -390,7 +434,7 @@ bool QuotaManager::Init() {
   return true;
 }
 
-void QuotaManager::Destroy() {
+void QuotaManager::Stop() {
   const uint32_t fs_id = fs_info_->GetFsId();
   auto status = FlushUsage();
   if (!status.ok()) {

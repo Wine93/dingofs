@@ -17,8 +17,11 @@
 #ifndef DINGOFS_SRC_CLIENT_VFS_COMPONENT_CONTEXT_H_
 #define DINGOFS_SRC_CLIENT_VFS_COMPONENT_CONTEXT_H_
 
+#include <vector>
+
 #include "client/vfs/vfs_meta.h"
 #include "common/block/block_key.h"
+#include "common/helper.h"
 #include "fmt/format.h"
 
 namespace dingofs {
@@ -61,24 +64,29 @@ struct ChunkContext {
 struct WarmupTaskContext {
   WarmupTaskContext(const WarmupTaskContext& task) = default;
   WarmupTaskContext(Ino ino) : task_key(ino), type(WarmupType::kWarmupIntime) {}
-  WarmupTaskContext(Ino ino, const std::string& xattr)
-      : task_key(ino), type(WarmupType::kWarmupManual), task_inodes(xattr) {}
+  WarmupTaskContext(const std::vector<Ino>& inos)
+      : task_keys(inos), type(WarmupType::kWarmupManual) {
+    task_key = inos.empty() ? 0 : inos.front();
+  }
+  WarmupTaskContext(Ino ino, const std::string& ino_list_str)
+      : task_key(ino), type(WarmupType::kWarmupManual) {
+    dingofs::Helper::SplitString(ino_list_str, ',', task_keys);
+  }
 
   WarmupType type;
   Ino task_key;
-  // comma separated inodeid('1000023,10000021,...'), provide by dingo-tool
-  std::string task_inodes;
+  std::vector<Ino> task_keys;
 };
 
 struct PrefetchContext {
-  PrefetchContext(uint64_t ino, int64_t prefetch_offset, int64_t file_size,
+  PrefetchContext(Ino ino, int64_t prefetch_offset, int64_t file_size,
                   int64_t prefetch_blocks)
       : ino(ino),
         prefetch_offset(prefetch_offset),
         file_size(file_size),
         prefetch_blocks(prefetch_blocks) {}
 
-  uint64_t ino;
+  Ino ino;
   int64_t prefetch_offset;
   int64_t file_size;
   int64_t prefetch_blocks;

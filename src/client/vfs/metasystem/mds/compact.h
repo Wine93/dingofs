@@ -15,7 +15,10 @@
 #ifndef DINGOFS_SRC_CLIENT_VFS_META_MDS_COMPACT_H_
 #define DINGOFS_SRC_CLIENT_VFS_META_MDS_COMPACT_H_
 
+#include <absl/container/flat_hash_map.h>
+
 #include <atomic>
+#include <cstdint>
 #include <string>
 
 #include "client/vfs/compaction/compactor.h"
@@ -42,21 +45,18 @@ class CompactProcessor;
 class CompactChunkTask : public TaskRunnable {
  public:
   CompactChunkTask(Ino ino, InodeSPtr& inode, ChunkSPtr& chunk,
-                   MDSClient& mds_client, Compactor& compactor,
                    CompactProcessor& compact_processor)
       : ino_(ino),
         inode_(inode),
         chunk_(chunk),
-        mds_client_(mds_client),
-        compactor_(compactor),
         compact_processor_(compact_processor) {}
   ~CompactChunkTask() override = default;
 
   static CompactChunkTaskPtr New(Ino ino, InodeSPtr& inode, ChunkSPtr& chunk,
-                                 MDSClient& mds_client, Compactor& compactor,
+
                                  CompactProcessor& compact_processor) {
-    return std::make_shared<CompactChunkTask>(ino, inode, chunk, mds_client,
-                                              compactor, compact_processor);
+    return std::make_shared<CompactChunkTask>(ino, inode, chunk,
+                                              compact_processor);
   }
 
   std::string Type() override { return "COMPACT_CHUNK"; }
@@ -71,14 +71,14 @@ class CompactChunkTask : public TaskRunnable {
 
  private:
   bool IsDeleted() { return inode_ != nullptr && inode_->IsDeleted(); }
+  void TryCleanupUncommittedSlices(const std::vector<Slice>& old_slices,
+                                   const std::vector<Slice>& new_slices);
+
   Status Compact();
 
   Ino ino_;
   InodeSPtr inode_;
   ChunkSPtr chunk_;
-
-  MDSClient& mds_client_;
-  Compactor& compactor_;
 
   CompactProcessor& compact_processor_;
 
@@ -88,7 +88,9 @@ class CompactChunkTask : public TaskRunnable {
 
 class CompactProcessor {
  public:
-  CompactProcessor();
+  CompactProcessor(MDSClient& mds_client, Compactor& compactor,
+                   Executor& executor)
+      : mds_client_(mds_client), compactor_(compactor), executor_(executor) {}
   ~CompactProcessor() = default;
 
   // no copy and move
@@ -97,19 +99,37 @@ class CompactProcessor {
   CompactProcessor(CompactProcessor&&) = delete;
   CompactProcessor& operator=(CompactProcessor&&) = delete;
 
-  bool Init();
   void Stop();
 
-  Status LaunchCompact(Ino ino, InodeSPtr inode, ChunkSPtr& chunk,
-                       MDSClient& mds_client, Compactor& compactor,
-                       bool is_async = true);
+  Status Execute(Ino ino, InodeSPtr inode, ChunkSPtr& chunk,
+                 bool is_async = true);
 
   bool IsStopped() { return is_stopped_.load(); }
 
+  uint64_t GetCompactedVersion(Ino ino, uint32_t chunk_index);
+  void UpdateComapctedVersion(Ino ino, uint32_t chunk_index, uint64_t version);
+
+  void CleanExpired(uint64_t expire_time_s);
+
  private:
+  friend class CompactChunkTask;
+
+  MDSClient& GetMDSClient() { return mds_client_; }
+  Compactor& GetCompactor() { return compactor_; }
+
   std::atomic<bool> is_stopped_{false};
 
-  Executor executor_;
+  MDSClient& mds_client_;
+  Compactor& compactor_;
+  Executor& executor_;
+
+  struct Value {
+    uint64_t version;
+    uint64_t last_active_time_s;
+  };
+  utils::RWLock lock_;
+  // key: ino + chunk_index, value: compacted version
+  absl::flat_hash_map<std::string, Value> compacted_version_memo_;
 };
 
 }  // namespace meta

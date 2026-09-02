@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <string>
 
+#include "common/helper.h"
 #include "common/logging.h"
 #include "dingofs/error.pb.h"
 #include "fmt/core.h"
@@ -80,11 +81,9 @@ bool CoorDistributionLock::Init() {
   return true;
 }
 
-void CoorDistributionLock::Destroy() {
+void CoorDistributionLock::Stop() {
   bool expect = false;
-  if (!is_stop_.compare_exchange_strong(expect, true)) {
-    return;
-  }
+  if (!is_stop_.compare_exchange_strong(expect, true)) return;
 
   LOG(INFO) << fmt::format("[dlock.{}] destroy dlock.", LockKey());
 
@@ -179,7 +178,7 @@ Status CoorDistributionLock::CheckLock(std::string& watch_key, int64_t& watch_re
 
   CoordinatorClient::Range range;
   range.start = lock_prefix_;
-  range.end = Helper::PrefixNext(lock_prefix_);
+  range.end = ::dingofs::Helper::PrefixNext(lock_prefix_);
 
   std::vector<CoordinatorClient::KVWithExt> kvs;
   bool more;
@@ -202,7 +201,7 @@ Status CoorDistributionLock::CheckLock(std::string& watch_key, int64_t& watch_re
 
   // debug log
   for (auto& kv : kvs) {
-    LOG(INFO) << fmt::format("[dlock.{}] key({}) revision({}).", LockKey(), Helper::StringToHex(kv.kv.key),
+    LOG(INFO) << fmt::format("[dlock.{}] key({}) revision({}).", LockKey(), ::dingofs::Helper::StringToHex(kv.kv.key),
                              kv.mod_revision);
   }
 
@@ -225,8 +224,8 @@ Status CoorDistributionLock::CheckLock(std::string& watch_key, int64_t& watch_re
   size_t watch_index = index - 1;
   watch_key = kvs[watch_index].kv.key;
   watch_revision = kvs[watch_index].mod_revision;
-  LOG(INFO) << fmt::format("[dlock.{}] watch key({}) revision({}).", LockKey(), Helper::StringToHex(watch_key),
-                           watch_revision);
+  LOG(INFO) << fmt::format("[dlock.{}] watch key({}) revision({}).", LockKey(),
+                           ::dingofs::Helper::StringToHex(watch_key), watch_revision);
   CHECK(!watch_key.empty()) << "watch key is empty.";
 
   return Status::OK();
@@ -235,8 +234,8 @@ Status CoorDistributionLock::CheckLock(std::string& watch_key, int64_t& watch_re
 Status CoorDistributionLock::Watch(const std::string& watch_key, int64_t watch_revision) {
   CHECK(!watch_key.empty()) << "watch key is empty.";
 
-  LOG(INFO) << fmt::format("[dlock.{}] watch key({}) revision({}).", LockKey(), Helper::StringToHex(watch_key),
-                           watch_revision);
+  LOG(INFO) << fmt::format("[dlock.{}] watch key({}) revision({}).", LockKey(),
+                           ::dingofs::Helper::StringToHex(watch_key), watch_revision);
 
   CoordinatorClient::WatchOut out;
   auto status = coordinator_client_->Watch(watch_key, watch_revision, out);
@@ -249,8 +248,8 @@ Status CoorDistributionLock::Watch(const std::string& watch_key, int64_t watch_r
   LOG(INFO) << fmt::format("[dlock.{}] received watch event.", LockKey());
   for (auto& envent : out.events) {
     LOG(INFO) << fmt::format("[dlock.{}] watch event, type({}) key({}) lease({}) revision({}).", LockKey(),
-                             CoordinatorClient::EventTypeName(envent.type), Helper::StringToHex(envent.kv.kv.key),
-                             envent.kv.lease, envent.kv.mod_revision);
+                             CoordinatorClient::EventTypeName(envent.type),
+                             ::dingofs::Helper::StringToHex(envent.kv.kv.key), envent.kv.lease, envent.kv.mod_revision);
   }
 
   return Status::OK();
@@ -391,7 +390,7 @@ bool StoreDistributionLock::Init() {
   return LaunchRenewLease();
 }
 
-void StoreDistributionLock::Destroy() {
+void StoreDistributionLock::Stop() {
   // just run once
   bool expect = false;
   if (!is_stop_.compare_exchange_strong(expect, true)) {

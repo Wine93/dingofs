@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "butil/endpoint.h"
+#include "common/helper.h"
 #include "common/logging.h"
 #include "dingofs/error.pb.h"
 #include "dingofs/mds.pb.h"
@@ -59,7 +60,7 @@ static void GetOfflineMDS(const std::vector<MDSMeta>& mdses, std::vector<MDSMeta
 
 bool Monitor::Init() { return dist_lock_->Init(); }
 
-void Monitor::Destroy() { dist_lock_->Destroy(); }
+void Monitor::Stop() { dist_lock_->Stop(); }
 
 void Monitor::Run() {
   bool running = false;
@@ -144,8 +145,8 @@ Status Monitor::ProcessFaultMDS(std::vector<MDSMeta>& mdses) {
   // check mds offline again
   CheckMdsAlive(offline_mdses, online_mdses);
   LOG(INFO) << fmt::format("[monitor] online mdses({}) offline mdses({}).",
-                           Helper::VectorToString(MdsHelper::GetMdsIds(online_mdses)),
-                           Helper::VectorToString(MdsHelper::GetMdsIds(offline_mdses)));
+                           ::dingofs::Helper::VectorToString(MdsHelper::GetMdsIds(online_mdses)),
+                           ::dingofs::Helper::VectorToString(MdsHelper::GetMdsIds(offline_mdses)));
 
   if (offline_mdses.empty()) {
     return Status(pb::error::EINTERNAL, "not has offline mds");
@@ -175,7 +176,7 @@ Status Monitor::ProcessFaultMDS(std::vector<MDSMeta>& mdses) {
   };
 
   auto pick_mds_func = [&online_mdses]() -> MDSMeta {
-    return online_mdses[Helper::GenerateRandomInteger(0, 1000) % online_mdses.size()];
+    return online_mdses[::dingofs::Helper::GenerateRandomInteger(0, 1000) % online_mdses.size()];
   };
 
   for (const auto& fs : fs_set) {
@@ -207,8 +208,9 @@ Status Monitor::ProcessFaultMDS(std::vector<MDSMeta>& mdses) {
         auto status = fs->UpdatePartitionPolicy(new_distributions, "fault migration by monitor");
 
         LOG(INFO) << fmt::format("[monitor] transfer fs({}) from mds({}) to mds({}) finish, status({}).", fs->FsName(),
-                                 Helper::VectorToString(mds_ids),
-                                 Helper::VectorToString(Helper::GetMdsIds(new_distributions)), status.error_str());
+                                 ::dingofs::Helper::VectorToString(mds_ids),
+                                 ::dingofs::Helper::VectorToString(Helper::GetMdsIds(new_distributions)),
+                                 status.error_str());
 
         // notify new mds to start serve partition
         auto mds_metas = MdsHelper::FilterMdsMetas(mdses, Helper::GetMdsIds(new_distributions));

@@ -15,20 +15,19 @@
 #define DINGOFS_MDS_FILESYSTEM_STORE_OPERATION_H_
 
 #include <absl/container/flat_hash_map.h>
+#include <absl/container/flat_hash_set.h>
 
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
-#include "absl/container/flat_hash_map.h"
 #include "bthread/countdown_event.h"
 #include "butil/containers/mpsc_queue.h"
 #include "dingofs/error.pb.h"
@@ -41,6 +40,7 @@
 #include "mds/filesystem/dentry.h"
 #include "mds/filesystem/inode.h"
 #include "mds/storage/storage.h"
+#include "utils/shards.h"
 
 namespace dingofs {
 namespace mds {
@@ -99,12 +99,15 @@ class Operation {
     kBatchTrashUnlink = 40,
     kCleanTrashBucket = 41,
     kRestoreFromTrash = 42,
+    kRollbackFile = 43,
 
-    kCompactChunk = 50,
-    kUpsertChunk = 51,
-    kGetChunk = 52,
-    kScanChunk = 53,
-    kCleanChunk = 54,
+    kCompactChunk = 45,
+    kUpsertChunk = 46,
+    kGetChunk = 47,
+    kBatchGetChunk = 48,
+    kBatchGetFirstChunk = 49,
+    kScanChunk = 50,
+    kCleanChunk = 51,
 
     kGetSliceRef = 55,
     kDecSliceRef = 56,
@@ -201,6 +204,8 @@ class Operation {
       case OpType::kUpsertChunk:
       case OpType::kOpenFile:
       case OpType::kFallocate:
+      case OpType::kFlushFile:
+      case OpType::kRollbackFile:
         return true;
 
       default:
@@ -223,8 +228,11 @@ class Operation {
       case OpType::kUpdateXAttr:
       case OpType::kRemoveXAttr:
       case OpType::kUpdateShardBoundaries:
+      case OpType::kUpsertChunk:
       case OpType::kOpenFile:
       case OpType::kFallocate:
+      case OpType::kFlushFile:
+      case OpType::kRollbackFile:
         return true;
 
       default:
@@ -254,7 +262,7 @@ class Operation {
 
   struct Key {
     uint32_t fs_id{0};
-    uint64_t ino{0};
+    Ino ino{0};
 
     bool operator<(const Key& other) const {
       if (fs_id != other.fs_id) {
@@ -301,6 +309,7 @@ class Operation {
   virtual InodeSPtr GetParentInode() const { return nullptr; }
 
   virtual void PrefetchKey(std::vector<std::string>& keys) {}
+  static void DeduplicatePrefetchKeys(std::vector<std::string>& keys);
 
   struct BatchSharedParam {
     AttrEntry attr;
@@ -312,7 +321,18 @@ class Operation {
     // (re)populates prefetch_kvs (including transaction retries).
     absl::flat_hash_map<std::string_view, std::string_view> prefetch_index;
 
+    // Map from chunk index to ChunkEntry for O(1) lookup. The ChunkEntry
+    // key: chunk index, value: ChunkEntry.
+    bool is_prefetched_chunk{false};
+    std::map<uint64_t, ChunkEntry> chunk_map;
+    std::set<uint64_t> changed_chunk_indexes;
+
     bool UseMutation() const { return attr.ino() == 0; }
+
+    void AddPrefetchKV(const std::string& key, const std::string& value) {
+      prefetch_kvs.push_back({KeyValue::OpType::kPut, key, value});
+      RebuildIndex();
+    }
 
     void RebuildIndex() {
       prefetch_index.clear();
@@ -321,7 +341,24 @@ class Operation {
         prefetch_index.emplace(kv.key, kv.value);
       }
     }
+
+    void Reset() {
+      attr.Clear();
+      attr_mutation.Clear();
+      prefetch_kvs.clear();
+      prefetch_index.clear();
+
+      is_prefetched_chunk = false;
+      chunk_map.clear();
+      changed_chunk_indexes.clear();
+    }
   };
+
+  // for openfile|setattr prefetch all chunks
+  virtual Status PreProcess(TxnUPtr&, BatchSharedParam&) { return Status::OK(); }
+  // for fill chunks of result
+  virtual void PostProcess(BatchSharedParam&) {}
+
   virtual Status RunInBatch(TxnUPtr&, BatchSharedParam&) { return Status(pb::error::ENOT_SUPPORT, "not support."); }
   virtual Status Run(TxnUPtr&) { return Status(pb::error::ENOT_SUPPORT, "not support."); }
 
@@ -556,7 +593,7 @@ class CreateRootOperation : public Operation {
 
 class MkDirOperation : public Operation {
  public:
-  MkDirOperation(Trace& trace, const Dentry& dentry, const AttrEntry& attr)
+  MkDirOperation(Trace& trace, const Dentry& dentry, AttrEntry& attr)
       : Operation(trace), dentry_(dentry), attr_(attr) {};
   ~MkDirOperation() override = default;
 
@@ -579,14 +616,14 @@ class MkDirOperation : public Operation {
 
  private:
   const Dentry& dentry_;
-  const AttrEntry& attr_;
+  AttrEntry& attr_;
 
   Result result_;
 };
 
 class BatchMkDirOperation : public Operation {
  public:
-  BatchMkDirOperation(Trace& trace, const std::vector<Dentry>& dentries, const std::vector<AttrEntry>& attrs)
+  BatchMkDirOperation(Trace& trace, const std::vector<Dentry>& dentries, std::vector<AttrEntry>& attrs)
       : Operation(trace), dentries_(dentries), attrs_(attrs) {};
   ~BatchMkDirOperation() override = default;
 
@@ -608,14 +645,14 @@ class BatchMkDirOperation : public Operation {
 
  private:
   const std::vector<Dentry>& dentries_;
-  const std::vector<AttrEntry>& attrs_;
+  std::vector<AttrEntry>& attrs_;
 
   Result result_;
 };
 
 class MkNodOperation : public Operation {
  public:
-  MkNodOperation(Trace& trace, InodeSPtr parent_inode, const Dentry& dentry, const AttrEntry& attr)
+  MkNodOperation(Trace& trace, InodeSPtr parent_inode, const Dentry& dentry, AttrEntry& attr)
       : Operation(trace), parent_inode_(parent_inode), dentry_(dentry), attr_(attr) {};
   ~MkNodOperation() override = default;
 
@@ -643,7 +680,7 @@ class MkNodOperation : public Operation {
  private:
   InodeSPtr parent_inode_;
   const Dentry& dentry_;
-  const AttrEntry& attr_;
+  AttrEntry& attr_;
 
   Result result_;
 };
@@ -651,7 +688,7 @@ class MkNodOperation : public Operation {
 class BatchMkNodOperation : public Operation {
  public:
   BatchMkNodOperation(Trace& trace, InodeSPtr parent_inode, const std::vector<Dentry>& dentries,
-                      const std::vector<AttrEntry>& attrs)
+                      std::vector<AttrEntry>& attrs)
       : Operation(trace), parent_inode_(parent_inode), dentries_(dentries), attrs_(attrs) {};
   ~BatchMkNodOperation() override = default;
 
@@ -679,7 +716,7 @@ class BatchMkNodOperation : public Operation {
  private:
   InodeSPtr parent_inode_;
   const std::vector<Dentry>& dentries_;
-  const std::vector<AttrEntry>& attrs_;
+  std::vector<AttrEntry>& attrs_;
 
   Result result_;
 };
@@ -687,7 +724,7 @@ class BatchMkNodOperation : public Operation {
 class BatchCreateFileOperation : public Operation {
  public:
   BatchCreateFileOperation(Trace& trace, InodeSPtr parent_inode, const std::vector<Dentry>& dentries,
-                           const std::vector<AttrEntry>& attrs, const std::vector<FileSessionSPtr>& file_sessions)
+                           std::vector<AttrEntry>& attrs, const std::vector<FileSessionSPtr>& file_sessions)
       : Operation(trace),
         parent_inode_(parent_inode),
         dentries_(dentries),
@@ -719,7 +756,7 @@ class BatchCreateFileOperation : public Operation {
  private:
   InodeSPtr parent_inode_;
   const std::vector<Dentry>& dentries_;
-  const std::vector<AttrEntry>& attrs_;
+  std::vector<AttrEntry>& attrs_;
   const std::vector<FileSessionSPtr>& file_sessions_;
 
   Result result_;
@@ -803,7 +840,7 @@ class UpdateAttrOperation : public Operation {
     uint64_t block_size{0};
   };
 
-  UpdateAttrOperation(Trace& trace, uint64_t ino, uint32_t to_set, const AttrEntry& attr, ExtraParam& extra_param)
+  UpdateAttrOperation(Trace& trace, Ino ino, uint32_t to_set, const AttrEntry& attr, ExtraParam& extra_param)
       : Operation(trace), ino_(ino), to_set_(to_set), attr_(attr), extra_param_(extra_param) {};
   ~UpdateAttrOperation() override = default;
 
@@ -817,6 +854,11 @@ class UpdateAttrOperation : public Operation {
   uint32_t GetFsId() const override { return attr_.fs_id(); }
   Ino GetIno() const override { return ino_; }
 
+  // for openfile|setattr prefetch all chunks
+  Status PreProcess(TxnUPtr&, BatchSharedParam&) override;
+  // for fill chunks of result
+  void PostProcess(BatchSharedParam&) override;
+
   Status RunInBatch(TxnUPtr& txn, BatchSharedParam& shared_param) override;
 
   void SetResultAttr(BatchSharedParam& shared_param) override { result_.attr = shared_param.attr; }
@@ -824,7 +866,7 @@ class UpdateAttrOperation : public Operation {
   Result& GetResult() { return result_; }
 
  private:
-  uint64_t ino_;
+  Ino ino_;
   const uint32_t to_set_;
   const AttrEntry& attr_;
 
@@ -835,7 +877,7 @@ class UpdateAttrOperation : public Operation {
 
 class UpdateXAttrOperation : public Operation {
  public:
-  UpdateXAttrOperation(Trace& trace, uint32_t fs_id, uint64_t ino, const Inode::XAttrMap& xattrs)
+  UpdateXAttrOperation(Trace& trace, uint32_t fs_id, Ino ino, const Inode::XAttrMap& xattrs)
       : Operation(trace), fs_id_(fs_id), ino_(ino), xattrs_(xattrs) {};
   ~UpdateXAttrOperation() override = default;
 
@@ -856,7 +898,7 @@ class UpdateXAttrOperation : public Operation {
 
  private:
   uint32_t fs_id_;
-  uint64_t ino_;
+  Ino ino_;
   const Inode::XAttrMap& xattrs_;
 
   Result result_;
@@ -864,7 +906,7 @@ class UpdateXAttrOperation : public Operation {
 
 class RemoveXAttrOperation : public Operation {
  public:
-  RemoveXAttrOperation(Trace& trace, uint32_t fs_id, uint64_t ino, const std::string& name)
+  RemoveXAttrOperation(Trace& trace, uint32_t fs_id, Ino ino, const std::string& name)
       : Operation(trace), fs_id_(fs_id), ino_(ino), name_(name) {};
   ~RemoveXAttrOperation() override = default;
 
@@ -885,7 +927,7 @@ class RemoveXAttrOperation : public Operation {
 
  private:
   uint32_t fs_id_;
-  uint64_t ino_;
+  Ino ino_;
   std::string name_;
 
   Result result_;
@@ -893,7 +935,7 @@ class RemoveXAttrOperation : public Operation {
 
 class UpdateShardBoundariesOperation : public Operation {
  public:
-  UpdateShardBoundariesOperation(Trace& trace, uint32_t fs_id, uint64_t ino,
+  UpdateShardBoundariesOperation(Trace& trace, uint32_t fs_id, Ino ino,
                                  const std::vector<std::string>& shard_boundaries)
       : Operation(trace), fs_id_(fs_id), ino_(ino), shard_boundaries_(shard_boundaries) {};
   ~UpdateShardBoundariesOperation() override = default;
@@ -915,22 +957,22 @@ class UpdateShardBoundariesOperation : public Operation {
 
  private:
   uint32_t fs_id_;
-  uint64_t ino_;
+  Ino ino_;
   const std::vector<std::string>& shard_boundaries_;
   Result result_;
 };
 
 class UpsertChunkOperation : public Operation {
  public:
-  UpsertChunkOperation(Trace& trace, const FsInfoEntry fs_info, uint64_t ino,
+  UpsertChunkOperation(Trace& trace, const FsInfoEntry fs_info, Ino ino,
                        const std::vector<DeltaSliceEntry>& delta_slices)
       : Operation(trace), fs_info_(fs_info), ino_(ino), delta_slices_(delta_slices) {};
   ~UpsertChunkOperation() override = default;
 
   struct Result {
     AttrEntry attr;
-    int64_t length{0};
     std::vector<ChunkEntry> effected_chunks;
+    int64_t delta_bytes{0};
   };
 
   OpType GetOpType() const override { return OpType::kUpsertChunk; }
@@ -938,13 +980,20 @@ class UpsertChunkOperation : public Operation {
   uint32_t GetFsId() const override { return fs_info_.fs_id(); }
   Ino GetIno() const override { return ino_; }
 
-  Status Run(TxnUPtr& txn) override;
+  void PrefetchKey(std::vector<std::string>& keys) override;
+
+  Status PreProcess(TxnUPtr& txn, BatchSharedParam&) override;
+  void PostProcess(BatchSharedParam& shared_param) override;
+
+  Status RunInBatch(TxnUPtr& txn, BatchSharedParam& shared_param) override;
+
+  void SetResultAttr(BatchSharedParam& shared_param) override { result_.attr = shared_param.attr; }
 
   Result& GetResult() { return result_; }
 
  private:
   const FsInfoEntry fs_info_;
-  const uint64_t ino_;
+  const Ino ino_;
 
   const std::vector<DeltaSliceEntry> delta_slices_;
 
@@ -953,12 +1002,11 @@ class UpsertChunkOperation : public Operation {
 
 class GetChunkOperation : public Operation {
  public:
-  GetChunkOperation(Trace& trace, uint32_t fs_id, uint64_t ino, const std::vector<uint32_t>& chunk_indexes)
+  GetChunkOperation(Trace& trace, uint32_t fs_id, Ino ino, const std::vector<uint32_t>& chunk_indexes)
       : Operation(trace), fs_id_(fs_id), ino_(ino), chunk_indexes_(chunk_indexes) {};
   ~GetChunkOperation() override = default;
 
   struct Result {
-    AttrEntry attr;
     std::vector<ChunkEntry> chunks;
   };
 
@@ -973,20 +1021,80 @@ class GetChunkOperation : public Operation {
 
  private:
   uint32_t fs_id_;
-  uint64_t ino_;
+  Ino ino_;
   std::vector<uint32_t> chunk_indexes_;
+
+  Result result_;
+};
+
+class BatchGetFirstChunkOperation : public Operation {
+ public:
+  BatchGetFirstChunkOperation(Trace& trace, uint32_t fs_id, std::vector<Ino> inoes)
+      : Operation(trace), fs_id_(fs_id), inoes_(inoes) {};
+  ~BatchGetFirstChunkOperation() override = default;
+
+  struct Result {
+    std::vector<Ino> inoes;
+    std::vector<ChunkEntry> chunks;
+  };
+
+  OpType GetOpType() const override { return OpType::kBatchGetFirstChunk; }
+
+  uint32_t GetFsId() const override { return fs_id_; }
+  Ino GetIno() const override { return inoes_.front(); }
+
+  Status Run(TxnUPtr& txn) override;
+
+  Result& GetResult() { return result_; }
+
+ private:
+  uint32_t fs_id_;
+  std::vector<Ino> inoes_;
+
+  Result result_;
+};
+
+class BatchGetChunkOperation : public Operation {
+ public:
+  struct Entry {
+    Ino ino;
+    uint32_t chunk_index;
+  };
+  BatchGetChunkOperation(Trace& trace, uint32_t fs_id, const std::vector<Entry>& entries)
+      : Operation(trace), fs_id_(fs_id), entries_(entries) {};
+  ~BatchGetChunkOperation() override = default;
+
+  struct Result {
+    struct Entry {
+      Ino ino;
+      ChunkEntry chunk;
+    };
+    std::vector<Entry> entries;
+  };
+
+  OpType GetOpType() const override { return OpType::kBatchGetChunk; }
+
+  uint32_t GetFsId() const override { return fs_id_; }
+  Ino GetIno() const override { return entries_.front().ino; }
+
+  Status Run(TxnUPtr& txn) override;
+
+  Result& GetResult() { return result_; }
+
+ private:
+  uint32_t fs_id_;
+  std::vector<Entry> entries_;
 
   Result result_;
 };
 
 class ScanChunkOperation : public Operation {
  public:
-  ScanChunkOperation(Trace& trace, uint32_t fs_id, uint64_t ino, uint32_t max_slice_num = 0)
+  ScanChunkOperation(Trace& trace, uint32_t fs_id, Ino ino, uint32_t max_slice_num = 0)
       : Operation(trace), fs_id_(fs_id), ino_(ino), max_slice_num_(max_slice_num) {};
   ~ScanChunkOperation() override = default;
 
   struct Result {
-    AttrEntry attr;
     std::vector<ChunkEntry> chunks;
   };
 
@@ -1001,7 +1109,7 @@ class ScanChunkOperation : public Operation {
 
  private:
   uint32_t fs_id_;
-  uint64_t ino_;
+  Ino ino_;
   uint32_t max_slice_num_{0};
 
   Result result_;
@@ -1009,7 +1117,7 @@ class ScanChunkOperation : public Operation {
 
 class CleanChunkOperation : public Operation {
  public:
-  CleanChunkOperation(Trace& trace, uint32_t fs_id, uint64_t ino, const std::vector<uint64_t>& chunk_indexs)
+  CleanChunkOperation(Trace& trace, uint32_t fs_id, Ino ino, const std::vector<uint64_t>& chunk_indexs)
       : Operation(trace), fs_id_(fs_id), ino_(ino), chunk_indexs_(chunk_indexs) {};
   ~CleanChunkOperation() override = default;
 
@@ -1026,7 +1134,7 @@ class CleanChunkOperation : public Operation {
 
  private:
   uint32_t fs_id_;
-  uint64_t ino_;
+  Ino ino_;
   std::vector<uint64_t> chunk_indexs_{0};
 
   Result result_;
@@ -1104,13 +1212,10 @@ class FallocateOperation : public Operation {
  public:
   struct Param {
     uint32_t fs_id;
-    uint64_t ino;
+    Ino ino;
     int32_t mode;
     uint64_t offset;
     uint64_t len;
-
-    uint64_t slice_id{0};
-    uint32_t slice_num{0};
 
     uint64_t chunk_size{0};
     uint64_t block_size{0};
@@ -1134,6 +1239,9 @@ class FallocateOperation : public Operation {
   uint32_t GetFsId() const override { return param_.fs_id; }
   Ino GetIno() const override { return param_.ino; }
 
+  Status PreProcess(TxnUPtr& txn, BatchSharedParam&) override;
+  void PostProcess(BatchSharedParam&) override;
+
   Status RunInBatch(TxnUPtr& txn, BatchSharedParam& shared_param) override;
 
   void SetResultAttr(BatchSharedParam& shared_param) override { result_.attr = shared_param.attr; }
@@ -1141,8 +1249,9 @@ class FallocateOperation : public Operation {
   Result& GetResult() { return result_; }
 
  private:
-  Status PreAlloc(TxnUPtr& txn, AttrEntry& attr, uint64_t offset, uint32_t len);
-  Status SetZero(TxnUPtr& txn, AttrEntry& attr, uint64_t offset, uint64_t len, bool keep_size);
+  void PreAlloc(AttrEntry& attr, uint64_t offset, uint64_t len, bool keep_size);
+  void SetZero(BatchSharedParam& shared_param, AttrEntry& attr, uint64_t offset, uint64_t len, bool keep_size);
+  Status CollapseRange(TxnUPtr& txn, BatchSharedParam& shared_param, AttrEntry& attr);
 
   Param param_;
 
@@ -1152,21 +1261,18 @@ class FallocateOperation : public Operation {
 class OpenFileOperation : public Operation {
  public:
   OpenFileOperation(Trace& trace, uint32_t flags, const FileSessionEntry& file_session, uint64_t chunk_size,
-                    const std::vector<uint32_t>& prefetch_chunks, bool prefetch_data)
+                    const std::vector<uint32_t>& prefetch_chunks)
       : Operation(trace),
         flags_(flags),
         file_session_(file_session),
         chunk_size_(chunk_size),
-        prefetch_chunks_(prefetch_chunks),
-        prefetch_data_(prefetch_data) {};
+        prefetch_chunks_(prefetch_chunks) {};
   ~OpenFileOperation() override = default;
 
   struct Result {
     AttrEntry attr;
     int64_t delta_bytes{0};
     std::vector<ChunkEntry> chunks;
-    std::string data;
-    uint64_t data_version{0};
   };
 
   OpType GetOpType() const override { return OpType::kOpenFile; }
@@ -1175,6 +1281,9 @@ class OpenFileOperation : public Operation {
   Ino GetIno() const override { return file_session_.ino(); }
 
   void PrefetchKey(std::vector<std::string>& keys) override;
+
+  Status PreProcess(TxnUPtr& txn, BatchSharedParam&) override;
+  void PostProcess(BatchSharedParam&) override;
 
   Status RunInBatch(TxnUPtr& txn, BatchSharedParam& shared_param) override;
 
@@ -1188,7 +1297,6 @@ class OpenFileOperation : public Operation {
   uint64_t chunk_size_{0};
 
   const std::vector<uint32_t>& prefetch_chunks_;
-  bool prefetch_data_{false};
 
   Result result_;
 };
@@ -1215,12 +1323,8 @@ class CloseFileOperation : public Operation {
 class FlushFileOperation : public Operation {
  public:
   struct ExtraParam {
-    ExtraParam(const std::string& data) : data(data) {}
-    const std::string& data;
     uint64_t length;
-    uint64_t slice_id{0};
     uint64_t chunk_size{0};
-    bool is_final{false};
   };
 
   FlushFileOperation(Trace& trace, uint32_t fs_id, Ino ino, ExtraParam& param)
@@ -1237,7 +1341,52 @@ class FlushFileOperation : public Operation {
   uint32_t GetFsId() const override { return fs_id_; }
   Ino GetIno() const override { return ino_; }
 
-  Status Run(TxnUPtr& txn) override;
+  Status RunInBatch(TxnUPtr& txn, BatchSharedParam& shared_param) override;
+
+  void SetResultAttr(BatchSharedParam& shared_param) override { result_.attr = shared_param.attr; }
+
+  Result& GetResult() { return result_; }
+
+ private:
+  const uint32_t fs_id_;
+  const Ino ino_;
+  ExtraParam& param_;
+
+  Result result_;
+};
+
+// Conditional length rollback (ADR-0003): shrink to rollback_to_length iff
+// rollback_to_length < current length <= last_write_length. Otherwise it is a
+// no-op (conservative for concurrent writers) and the current inode is kept.
+class RollbackFileOperation : public Operation {
+ public:
+  struct ExtraParam {
+    uint64_t last_write_length{0};
+    uint64_t rollback_to_length{0};
+    uint64_t chunk_size{0};
+  };
+
+  RollbackFileOperation(Trace& trace, uint32_t fs_id, Ino ino, ExtraParam& param)
+      : Operation(trace), fs_id_(fs_id), ino_(ino), param_(param) {};
+  ~RollbackFileOperation() override = default;
+
+  struct Result {
+    AttrEntry attr;
+    int64_t delta_bytes{0};
+    std::vector<ChunkEntry> effected_chunks;
+  };
+
+  OpType GetOpType() const override { return OpType::kRollbackFile; }
+
+  uint32_t GetFsId() const override { return fs_id_; }
+  Ino GetIno() const override { return ino_; }
+
+  Status PreProcess(TxnUPtr& txn, BatchSharedParam&) override;
+  void PostProcess(BatchSharedParam&) override;
+
+  Status RunInBatch(TxnUPtr& txn, BatchSharedParam& shared_param) override;
+
+  void SetResultAttr(BatchSharedParam& shared_param) override { result_.attr = shared_param.attr; }
 
   Result& GetResult() { return result_; }
 
@@ -1732,7 +1881,7 @@ class DeleteFsQuotaOperation : public Operation {
 
 class SetDirQuotaOperation : public Operation {
  public:
-  SetDirQuotaOperation(Trace& trace, uint32_t fs_id, uint64_t ino, const QuotaEntry& quota)
+  SetDirQuotaOperation(Trace& trace, uint32_t fs_id, Ino ino, const QuotaEntry& quota)
       : Operation(trace), fs_id_(fs_id), ino_(ino), quota_(quota) {};
   ~SetDirQuotaOperation() override = default;
 
@@ -1751,7 +1900,7 @@ class SetDirQuotaOperation : public Operation {
 
  private:
   uint32_t fs_id_;
-  uint64_t ino_;
+  Ino ino_;
   QuotaEntry quota_;
 
   Result result_;
@@ -1759,7 +1908,7 @@ class SetDirQuotaOperation : public Operation {
 
 class GetDirQuotaOperation : public Operation {
  public:
-  GetDirQuotaOperation(Trace& trace, uint32_t fs_id, uint64_t ino) : Operation(trace), fs_id_(fs_id), ino_(ino) {};
+  GetDirQuotaOperation(Trace& trace, uint32_t fs_id, Ino ino) : Operation(trace), fs_id_(fs_id), ino_(ino) {};
   ~GetDirQuotaOperation() override = default;
 
   struct Result {
@@ -1777,14 +1926,14 @@ class GetDirQuotaOperation : public Operation {
 
  private:
   const uint32_t fs_id_;
-  const uint64_t ino_;
+  const Ino ino_;
 
   Result result_;
 };
 
 class DeleteDirQuotaOperation : public Operation {
  public:
-  DeleteDirQuotaOperation(Trace& trace, uint32_t fs_id, uint64_t ino) : Operation(trace), fs_id_(fs_id), ino_(ino) {};
+  DeleteDirQuotaOperation(Trace& trace, uint32_t fs_id, Ino ino) : Operation(trace), fs_id_(fs_id), ino_(ino) {};
   ~DeleteDirQuotaOperation() override = default;
 
   struct Result {
@@ -1802,7 +1951,7 @@ class DeleteDirQuotaOperation : public Operation {
 
  private:
   uint32_t fs_id_;
-  uint64_t ino_;
+  Ino ino_;
 
   Result result_;
 };
@@ -2231,8 +2380,7 @@ class GetDelFileOperation : public Operation {
 
 class CleanDelFileOperation : public Operation {
  public:
-  CleanDelFileOperation(Trace& trace, uint32_t fs_id, Ino ino, bool maybe_tiny_file)
-      : Operation(trace), fs_id_(fs_id), ino_(ino), maybe_tiny_file_(maybe_tiny_file) {};
+  CleanDelFileOperation(Trace& trace, uint32_t fs_id, Ino ino) : Operation(trace), fs_id_(fs_id), ino_(ino) {};
   ~CleanDelFileOperation() override = default;
 
   OpType GetOpType() const override { return OpType::kCleanDelFile; }
@@ -2245,7 +2393,6 @@ class CleanDelFileOperation : public Operation {
  private:
   const uint32_t fs_id_;
   const Ino ino_;
-  const bool maybe_tiny_file_;
 };
 
 class ScanLockOperation : public Operation {
@@ -2534,7 +2681,7 @@ class GetAndCompactFsStatsOperation : public Operation {
 
 class GetInodeAttrOperation : public Operation {
  public:
-  GetInodeAttrOperation(Trace& trace, uint32_t fs_id, uint64_t ino) : Operation(trace), fs_id_(fs_id), ino_(ino) {};
+  GetInodeAttrOperation(Trace& trace, uint32_t fs_id, Ino ino) : Operation(trace), fs_id_(fs_id), ino_(ino) {};
   ~GetInodeAttrOperation() override = default;
 
   struct Result {
@@ -2552,7 +2699,7 @@ class GetInodeAttrOperation : public Operation {
 
  private:
   const uint32_t fs_id_;
-  const uint64_t ino_;
+  const Ino ino_;
 
   Result result_;
 };
@@ -2787,7 +2934,7 @@ class OperationProcessor : public std::enable_shared_from_this<OperationProcesso
   KVStorageSPtr GetKVStorage() const { return kv_storage_; }
 
   bool Init();
-  bool Destroy();
+  bool Stop();
 
   bool RunBatched(Operation* operation);
   Status RunAlone(Operation* operation);
@@ -2797,23 +2944,43 @@ class OperationProcessor : public std::enable_shared_from_this<OperationProcesso
   Status CreateTable(const std::string& table_name, const Range& range, int64_t& table_id);
 
  private:
+  using BatchOperationMap =
+      absl::flat_hash_map<Operation::Key, BatchOperation, Operation::Key::Hash, Operation::Key::Eq>;
+
   struct Dispatcher {
     std::thread thread;
     std::mutex thread_mutex;
     std::condition_variable thread_cond;
 
     butil::MPSCQueue<Operation*> operations;
+
+    struct ParkEntry {
+      // number of in-flight transactions for this key
+      uint32_t inflight{0};
+      // parked operations for this key
+      std::vector<Operation*> operations;
+    };
+
+    // Group commit: a bounded number of in-flight transactions per grouping
+    // key. Operations arriving for a saturated key are parked and merged into
+    // the next batch, so batch size grows with load instead of degenerating
+    // to 1.
+    using Map = absl::flat_hash_map<Operation::Key, ParkEntry, Operation::Key::Hash, Operation::Key::Eq>;
+
+    constexpr static size_t kShardNum = 8;
+    utils::Shards<Map, kShardNum> parked_map_;
+
     Dispatcher() = default;
   };
 
-  using BatchOperationMap =
-      absl::flat_hash_map<Operation::Key, BatchOperation, Operation::Key::Hash, Operation::Key::Eq>;
   static void Grouping(std::vector<Operation*>& operations, BatchOperationMap& batch_operation_map);
 
   uint32_t GetDispatcherIndex(const Operation::Key& key) const { return (key.ino + key.fs_id) % dispatchers_.size(); }
 
   void ProcessOperation(Dispatcher& dispatcher);
-  void LaunchExecuteBatchOperation(BatchOperation&& batch_operation);
+  void LaunchOrParkBatchOperation(Dispatcher& dispatcher, const Operation::Key& key, BatchOperation&& batch_operation);
+  void LaunchExecuteBatchOperation(Dispatcher& dispatcher, const Operation::Key& key, BatchOperation&& batch_operation);
+  static bool TakeParkedOperations(Dispatcher& dispatcher, const Operation::Key& key, BatchOperation& batch_operation);
   void ExecuteBatchOperation(BatchOperation& batch_operation);
 
   // use unique_ptr because Dispatcher holds non-movable members (mutex/condition_variable).

@@ -15,12 +15,12 @@
 #ifndef DINGOFS_MDS_COMMON_TYPE_H_
 #define DINGOFS_MDS_COMMON_TYPE_H_
 
-#include <absl/container/inlined_vector.h>
 #include <sys/types.h>
 
 #include <cstdint>
 #include <string>
 
+#include "absl/container/inlined_vector.h"
 #include "common/const.h"
 #include "dingofs/mds.pb.h"
 #include "fmt/format.h"
@@ -34,6 +34,8 @@ using DentryEntry = pb::mds::Dentry;
 using SliceEntry = pb::mds::Slice;
 using ChunkEntry = pb::mds::Chunk;
 using ChunkDescriptor = pb::mds::ChunkDescriptor;
+using BatchReadSliceReqEntry = pb::mds::BatchReadSliceRequest::Entry;
+using BatchReadSliceResEntry = pb::mds::BatchReadSliceResponse::Entry;
 using FsInfoEntry = pb::mds::FsInfo;
 using TrashSliceEntry = pb::mds::TrashSlice;
 using TrashSliceList = pb::mds::TrashSliceList;

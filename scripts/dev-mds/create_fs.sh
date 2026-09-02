@@ -7,7 +7,7 @@ if [[ ! -d "$mydir" ]]; then mydir="$PWD"; fi
 DEFINE_string fs_name '' 'fs name'
 DEFINE_string mds_addr '' 'mds address'
 DEFINE_string parameters 'mds_deploy_parameters.local' 'deploy parameters file'
-
+DEFINE_boolean use_local_datastore false 'use local datastore'
 
 # parse the command-line
 FLAGS "$@" || exit 1
@@ -42,35 +42,62 @@ if [ ! -f "$MDS_CLIENT_BIN_PATH" ]; then
 fi
 
 
-# check fs whether exist through output contained ENOT_FOUND
-output=`$MDS_CLIENT_BIN_PATH --cmd=getfs --mds_addr=${FLAGS_mds_addr} --fs_name=${FLAGS_fs_name} 2>&1`
-is_fail=`echo $output | grep "rpc fail" | wc -l`
-if [ $is_fail -eq 1 ]; then
+# Query the filesystem using the machine-readable output. A successful
+# command means the filesystem exists. The MDS client reports a missing
+# filesystem as `NotFound` in the error message (the RPC status is normalized
+# to EINTERNAL), so do not rely on the old NOT_FOUND error name.
+if output=$("$MDS_CLIENT_BIN_PATH" \
+    --cmd=getfs \
+    --format=json \
+    --color=never \
+    --mds_addr="${FLAGS_mds_addr}" \
+    --fs_name="${FLAGS_fs_name}" 2>&1); then
+  echo "fs ${FLAGS_fs_name} already exist"
+  exit 0
+elif ! printf '%s\n' "$output" | grep -Eqi 'not[_ ]?found'; then
   echo "get fs fail, $output"
   exit 1
 fi
 
-is_exist=`echo $output | grep success | grep ${FLAGS_fs_name} |  wc -l`
-if [ $is_exist -eq 1 ]; then
-  echo "fs ${FLAGS_fs_name} already exist"
-  exit 0
-fi
-
 echo "fs ${FLAGS_fs_name} not exist, create it"
 
-
 # create fs
-output=`$MDS_CLIENT_BIN_PATH --cmd=createfs --mds_addr=${FLAGS_mds_addr} --fs_name=${FLAGS_fs_name} --fs_partition_type=parent_hash --s3_endpoint=${S3_ENDPOINT} --s3_ak=${S3_AK} --s3_sk=${S3_SK} --s3_bucketname=${S3_BUCKETNAME}`
-is_fail=`echo $output | grep "rpc fail" | wc -l`
-if [ $is_fail -eq 1 ]; then
-  echo "create fs fail, $output"
-  exit 1
-fi
+output=""
+if [ "${FLAGS_use_local_datastore}" -eq "${FLAGS_TRUE}" ]; then
+  local_storage_path="${LOCAL_DATASTORE_PATH}/${FLAGS_fs_name}"
+  if ! mkdir -p "${local_storage_path}"; then
+    echo "create local datastore fail, ${local_storage_path}"
+    exit 1
+  fi
 
-is_success=`echo $output | grep success |  wc -l`
-if [ $is_success -eq 0 ]; then
-  echo "fs ${FLAGS_fs_name} create fail"
-  exit 1
+  if ! output=$("$MDS_CLIENT_BIN_PATH" \
+      --cmd=createfs \
+      --format=json \
+      --color=never \
+      --mds_addr="${FLAGS_mds_addr}" \
+      --fs_name="${FLAGS_fs_name}" \
+      --fs_partition_type=parent_hash \
+      --storage_path="${local_storage_path}" 2>&1); then
+    echo "create fs fail, $output"
+    exit 1
+  fi
+
+else
+  if ! output=$("$MDS_CLIENT_BIN_PATH" \
+      --cmd=createfs \
+      --format=json \
+      --color=never \
+      --mds_addr="${FLAGS_mds_addr}" \
+      --fs_name="${FLAGS_fs_name}" \
+      --fs_partition_type=parent_hash \
+      --s3_endpoint="${S3_ENDPOINT}" \
+      --s3_ak="${S3_AK}" \
+      --s3_sk="${S3_SK}" \
+      --s3_bucketname="${S3_BUCKETNAME}" 2>&1); then
+    echo "create fs fail, $output"
+    exit 1
+  fi
+
 fi
 
 echo "fs ${FLAGS_fs_name} create success"

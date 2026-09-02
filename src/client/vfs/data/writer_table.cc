@@ -19,6 +19,7 @@
 #include <fmt/format.h>
 #include <glog/logging.h>
 
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -52,14 +53,16 @@ void WriterTable::Stop() {
 }
 
 Status WriterTable::FlushAll() {
-  // Snapshot live writers (transient AcquireRef on each), flush outside lock.
-  // The transient ref does NOT touch holders — it is an internal hold.
+  // Snapshot live writers and pin each entry with a transient holder. A plain
+  // FileWriter ref would prevent UAF but would still allow the last external
+  // holder to erase the entry and Close() the writer before Flush() starts.
   std::vector<FileWriter*> snap;
   {
     std::lock_guard<std::mutex> lg(mutex_);
     snap.reserve(writers_.size());
     for (auto& [ino, e] : writers_) {
       e.writer->AcquireRef();
+      ++e.holders;
       snap.push_back(e.writer);
     }
   }
@@ -72,11 +75,62 @@ Status WriterTable::FlushAll() {
       LOG(WARNING) << fmt::format("FlushAll: writer flush failed: {}",
                                   s.ToString());
     }
-    // Release the transient ref directly via FileWriter — the snap path
-    // never touched holders, so it must not call ReleaseWriter.
-    w->ReleaseRef();
+    // Drop the transient holder. If all external holders were concurrently
+    // released, this is now the last holder and performs Close after Flush.
+    ReleaseWriter(w);
   }
   return final_status;
+}
+
+void WriterTable::FlushDirtyAsync(StatusCallback cb) {
+  std::vector<FileWriter*> snap;
+  {
+    std::lock_guard<std::mutex> lg(mutex_);
+    snap.reserve(writers_.size());
+    for (auto& [ino, entry] : writers_) {
+      entry.writer->AcquireRef();
+      ++entry.holders;
+      snap.push_back(entry.writer);
+    }
+  }
+
+  if (snap.empty()) {
+    cb(Status::OK());
+    return;
+  }
+
+  struct FlushGroup {
+    std::mutex mutex;
+    size_t remaining{0};
+    Status status;
+    StatusCallback done;
+  };
+  auto group = std::make_shared<FlushGroup>();
+  group->remaining = snap.size();
+  group->done = std::move(cb);
+
+  for (FileWriter* writer : snap) {
+    writer->FlushDirtyAsync([this, writer, group](Status status) {
+      // Holder release is part of round completion: it may be the last holder
+      // and synchronously close the writer.
+      ReleaseWriter(writer);
+
+      StatusCallback done;
+      Status final_status;
+      {
+        std::lock_guard<std::mutex> lock(group->mutex);
+        if (!status.ok() && group->status.ok()) {
+          group->status = status;
+        }
+        CHECK_GT(group->remaining, 0);
+        if (--group->remaining == 0) {
+          final_status = group->status;
+          done = std::move(group->done);
+        }
+      }
+      if (done) done(std::move(final_status));
+    });
+  }
 }
 
 size_t WriterTable::Size() const {
@@ -100,7 +154,7 @@ FileWriter* WriterTable::AcquireWriter(uint64_t ino) {
 
   // First-time create.
   auto* w = new FileWriter(vfs_hub_, ino);
-  w->AcquireRef();   // ref balance for the AcquireWriter caller
+  w->AcquireRef();  // ref balance for the AcquireWriter caller
   Status s = w->Open();
   if (!s.ok()) {
     LOG(ERROR) << fmt::format("AcquireWriter Open failed, ino={}, status={}",
@@ -153,9 +207,9 @@ void WriterTable::ReleaseWriter(FileWriter* writer) {
   //   - ReleaseRef may transitively call delete-this; doing it outside
   //     also keeps the table mutex's critical section short.
   if (need_close) {
-    writer->Close();   // flips closed_ so SchedulePeriodicFlush stops arming
+    writer->Close();  // flips closed_ so SchedulePeriodicFlush stops arming
   }
-  writer->ReleaseRef();   // may delete-this once refs_ reaches 0
+  writer->ReleaseRef();  // may delete-this once refs_ reaches 0
 }
 
 }  // namespace vfs

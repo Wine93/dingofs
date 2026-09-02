@@ -91,7 +91,7 @@ class MockOperationProcessor : public OperationProcessor {
   MockOperationProcessor() : OperationProcessor(nullptr) {}
 
   bool Init() { return true; }
-  bool Destroy() { return true; }
+  bool Stop() { return true; }
 
   bool RunBatched(Operation* operation) {
     // For UpdateShardBoundariesOperation, just simulate success
@@ -444,7 +444,8 @@ TEST_F(PartitionCacheTest, PutIfAndGet) {
   auto mock_processor = std::make_shared<MockOperationProcessor>();
 
   // Create partition
-  PartitionPtr partition = ShardPartition::New(mock_processor,
+  PartitionPtr partition = ShardPartition::New(
+      mock_processor,
       GenInode(kFsId, kParentIno, pb::mds::FileType::DIRECTORY));
 
   // Put into cache
@@ -466,7 +467,8 @@ TEST_F(PartitionCacheTest, PutIfExisting) {
   auto mock_processor = std::make_shared<MockOperationProcessor>();
 
   // Create first partition
-  PartitionPtr partition1 = ShardPartition::New(mock_processor,
+  PartitionPtr partition1 = ShardPartition::New(
+      mock_processor,
       GenInode(kFsId, kParentIno, pb::mds::FileType::DIRECTORY, 1));
 
   // Put first
@@ -474,7 +476,8 @@ TEST_F(PartitionCacheTest, PutIfExisting) {
   ASSERT_EQ(result1->BaseVersion(), 1);
 
   // Create second partition with higher version
-  PartitionPtr partition2 = ShardPartition::New(mock_processor,
+  PartitionPtr partition2 = ShardPartition::New(
+      mock_processor,
       GenInode(kFsId, kParentIno, pb::mds::FileType::DIRECTORY, 2));
   // Note: PutIf will call Refresh on the existing partition when putting a
   // partition with same ino
@@ -492,7 +495,8 @@ TEST_F(PartitionCacheTest, Delete) {
   auto mock_processor = std::make_shared<MockOperationProcessor>();
 
   // Create and put partition
-  PartitionPtr partition = ShardPartition::New(mock_processor,
+  PartitionPtr partition = ShardPartition::New(
+      mock_processor,
       GenInode(kFsId, kParentIno, pb::mds::FileType::DIRECTORY));
   cache.PutIf(partition);
 
@@ -512,8 +516,8 @@ TEST_F(PartitionCacheTest, DeleteIf) {
 
   // Create multiple partitions
   for (int i = 0; i < 10; ++i) {
-    PartitionPtr partition = ShardPartition::New(mock_processor,
-        GenInode(kFsId, 100 + i, pb::mds::FileType::DIRECTORY));
+    PartitionPtr partition = ShardPartition::New(
+        mock_processor, GenInode(kFsId, 100 + i, pb::mds::FileType::DIRECTORY));
     cache.PutIf(partition);
   }
 
@@ -536,8 +540,8 @@ TEST_F(PartitionCacheTest, Clear) {
 
   // Create multiple partitions
   for (int i = 0; i < 5; ++i) {
-    PartitionPtr partition = ShardPartition::New(mock_processor,
-        GenInode(kFsId, 100 + i, pb::mds::FileType::DIRECTORY));
+    PartitionPtr partition = ShardPartition::New(
+        mock_processor, GenInode(kFsId, 100 + i, pb::mds::FileType::DIRECTORY));
     cache.PutIf(partition);
   }
 
@@ -557,8 +561,8 @@ TEST_F(PartitionCacheTest, GetAll) {
 
   // Create multiple partitions
   for (int i = 0; i < 5; ++i) {
-    PartitionPtr partition = ShardPartition::New(mock_processor,
-        GenInode(kFsId, 100 + i, pb::mds::FileType::DIRECTORY));
+    PartitionPtr partition = ShardPartition::New(
+        mock_processor, GenInode(kFsId, 100 + i, pb::mds::FileType::DIRECTORY));
     cache.PutIf(partition);
   }
 
@@ -581,7 +585,8 @@ TEST_F(PartitionCacheTest, MultiplePutIf) {
 
   // Add multiple different partitions
   for (int i = 0; i < 100; ++i) {
-    PartitionPtr partition = ShardPartition::New(mock_processor,
+    PartitionPtr partition = ShardPartition::New(
+        mock_processor,
         GenInode(kFsId, 1000 + i, pb::mds::FileType::DIRECTORY));
     cache.PutIf(partition);
   }
@@ -602,7 +607,8 @@ TEST_F(PartitionCacheTest, BytesAndShardSize) {
   auto mock_processor = std::make_shared<MockOperationProcessor>();
 
   // Create partition with some data
-  PartitionPtr partition = ShardPartition::New(mock_processor,
+  PartitionPtr partition = ShardPartition::New(
+      mock_processor,
       GenInode(kFsId, kParentIno, pb::mds::FileType::DIRECTORY));
 
   // Note: PutWithInode requires shard to exist first
@@ -618,7 +624,8 @@ class ShardPartitionBasicTest : public testing::Test {
  protected:
   void SetUp() override {
     mock_processor_ = std::make_shared<MockOperationProcessor>();
-    partition_ = ShardPartition::New(mock_processor_,
+    partition_ = ShardPartition::New(
+        mock_processor_,
         GenInode(kFsId, kParentIno, pb::mds::FileType::DIRECTORY, 1));
   }
 
@@ -716,7 +723,8 @@ TEST_F(ShardPartitionBasicTest, Refresh) {
   ASSERT_EQ(new_inode->Version(), 2);
 
   // Create new partition with higher version inode
-  auto partition2 = ShardPartition::New(mock_processor_,
+  auto partition2 = ShardPartition::New(
+      mock_processor_,
       GenInode(kFsId, kParentIno, pb::mds::FileType::DIRECTORY, 2));
 
   // PutIf should trigger refresh on existing partition (since ino already
@@ -737,7 +745,8 @@ TEST_F(ShardPartitionBasicTest, PartitionCacheIntegration) {
 
   // Create new partition with higher version - PutIf will trigger refresh on
   // existing
-  auto partition2 = ShardPartition::New(mock_processor_,
+  auto partition2 = ShardPartition::New(
+      mock_processor_,
       GenInode(kFsId, kParentIno, pb::mds::FileType::DIRECTORY, 2));
   auto result = cache.PutIf(partition2);
   ASSERT_EQ(result->INo(), kParentIno);
@@ -811,6 +820,69 @@ TEST_F(ShardPartitionWithBoundariesTest, PutMultipleShards) {
 
   // Size() counts entries in shards, not delta ops
   ASSERT_EQ(partition_->Size(), 0);
+}
+
+// --- Performance test ---
+// Run: PARTITION_PERF=1 ./test_mds --gtest_filter=ShardPartitionPerfTest.*
+// Optionally override count: PERF_PUT_COUNT=1000000
+TEST(ShardPartitionPerfTest, Put400Million) {
+  if (getenv("PARTITION_PERF") == nullptr) {
+    GTEST_SKIP() << "set PARTITION_PERF=1 to run (long running perf test)";
+  }
+
+  uint64_t total = 400000000ULL;  // 4亿
+  if (const char* s = getenv("PERF_PUT_COUNT")) total = std::stoull(s);
+
+  auto mock_processor = std::make_shared<MockOperationProcessor>();
+  PartitionCache cache(kFsId);
+  PartitionPtr partition = cache.PutIf(ShardPartition::New(
+      mock_processor,
+      GenInode(kFsId, kParentIno, pb::mds::FileType::DIRECTORY, 1)));
+
+  // 每 compact_interval 次 Put 后通过 PutIf 更高版本的 partition 触发
+  // Refresh，清空 delta_dentry_ops_（模拟线上 compact），否则 4 亿条
+  // delta op 会 OOM（每条数百字节，共 100GB+）。
+  const uint64_t compact_interval = 100000;  // 与 dentry_op_max_count 对齐
+  const uint64_t report_interval = 10000000;
+
+  auto start_us = utils::TimestampUs();
+  uint64_t last_us = start_us;
+
+  for (uint64_t i = 1; i <= total; ++i) {
+    Dentry dentry(GenDentry(kFsId, kParentIno, 1000 + i,
+                            fmt::format("file{:012d}", i),
+                            pb::mds::FileType::FILE));
+    partition->Put(dentry, i + 1);
+
+    if (i % compact_interval == 0) {
+      // 触发 Refresh 回收 delta ops
+      partition = cache.PutIf(ShardPartition::New(
+          mock_processor,
+          GenInode(kFsId, kParentIno, pb::mds::FileType::DIRECTORY, i + 1)));
+    }
+
+    if (i % report_interval == 0) {
+      auto now_us = utils::TimestampUs();
+      double interval_qps =
+          report_interval * 1e6 / static_cast<double>(now_us - last_us);
+      double avg_qps = i * 1e6 / static_cast<double>(now_us - start_us);
+      fmt::print(
+          "progress: {}/{} ({:.1f}%), interval qps: {:.0f}, avg qps: {:.0f}, "
+          "elapsed: {:.1f}s\n",
+          i, total, i * 100.0 / total, interval_qps, avg_qps,
+          (now_us - start_us) / 1e6);
+      last_us = now_us;
+    }
+  }
+
+  auto elapsed_us = utils::TimestampUs() - start_us;
+  double qps = total * 1e6 / static_cast<double>(elapsed_us);
+  fmt::print(
+      "=== ShardPartition::Put perf: total({}) elapsed({:.1f}s) qps({:.0f}) "
+      "avg latency({:.0f}ns)\n",
+      total, elapsed_us / 1e6, qps, elapsed_us * 1000.0 / total);
+
+  ASSERT_EQ(partition->DeltaVersion(), total + 1);
 }
 
 class DirShardConstructFromDentriesTest : public testing::Test {

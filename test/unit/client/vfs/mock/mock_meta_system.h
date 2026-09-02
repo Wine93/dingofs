@@ -44,7 +44,9 @@ class MockMetaSystem : public MetaSystem {
                uint32_t uid, uint32_t gid, uint32_t mode, uint64_t rdev,
                Attr* attr),
               (override));
-  MOCK_METHOD(Status, Open, (ContextSPtr ctx, Ino ino, int flags, uint64_t fh),
+  MOCK_METHOD(Status, Open,
+              (ContextSPtr ctx, Ino ino, int flags, uint64_t fh,
+               bool* keep_cache),
               (override));
   MOCK_METHOD(Status, Create,
               (ContextSPtr ctx, Ino parent, const std::string& name,
@@ -52,6 +54,8 @@ class MockMetaSystem : public MetaSystem {
                uint64_t fh),
               (override));
   MOCK_METHOD(Status, Flush, (ContextSPtr ctx, Ino ino, uint64_t fh),
+              (override));
+  MOCK_METHOD(Status, RollbackFile, (ContextSPtr ctx, Ino ino, uint64_t fh),
               (override));
   MOCK_METHOD(Status, Close, (ContextSPtr ctx, Ino ino, uint64_t fh),
               (override));
@@ -87,6 +91,10 @@ class MockMetaSystem : public MetaSystem {
   MOCK_METHOD(Status, SetAttr,
               (ContextSPtr ctx, Ino ino, int set, const Attr& in_attr,
                Attr* out_attr),
+              (override));
+  MOCK_METHOD(Status, Fallocate,
+              (ContextSPtr ctx, Ino ino, int mode, uint64_t offset,
+               uint64_t length),
               (override));
   MOCK_METHOD(Status, SetXattr,
               (ContextSPtr ctx, Ino ino, const std::string& name,

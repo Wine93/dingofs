@@ -39,8 +39,8 @@ static const std::string kSocketDir = "run";
 // Base directory for all dingofs runtime data (log/cache/meta/data/run).
 // Resolution order (highest priority first):
 //   1. $DINGOFS_BASE_DIR environment variable, if set and non-empty.
-//   2. /var/dingofs when running as root (getuid() == 0).
-//   3. $HOME/.dingofs otherwise.
+//   2. /var/dingo when running as root (getuid() == 0).
+//   3. $HOME/.dingo otherwise.
 //
 // This is a function (not a static const) so that callers invoked during
 // static initialization — e.g. DEFINE_string(cache_dir, GetDefaultDir(...))
@@ -51,8 +51,8 @@ inline std::string GetBaseDir() {
   if (env != nullptr && env[0] != '\0') {
     return env;
   }
-  return (getuid() == 0) ? "/var/dingofs"
-                         : fmt::format("{}/.dingofs", Helper::GetHomeDir());
+  return (getuid() == 0) ? "/var/dingo"
+                         : fmt::format("{}/.dingo", Helper::GetHomeDir());
 }
 
 inline std::string GetDefaultDir(const std::string& sub_dir) {

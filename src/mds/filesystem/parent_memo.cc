@@ -16,17 +16,13 @@
 
 #include <vector>
 
-#include "brpc/reloadable_flags.h"
+#include "common/options/mds.h"
 #include "utils/time.h"
 
 namespace dingofs {
 namespace mds {
 
 static const std::string kParentMemoTotalCountMetricsName = "dingofs_{}_parent_memo_{}";
-
-// 0: no limit
-DEFINE_uint32(mds_parent_memo_cache_max_count, 1 * 1024 * 1024, "parent memo cache max count");
-DEFINE_validator(mds_parent_memo_cache_max_count, brpc::PassValidate);
 
 ParentMemo::ParentMemo(uint64_t fs_id)
     : fs_id_(fs_id),
@@ -36,13 +32,13 @@ ParentMemo::ParentMemo(uint64_t fs_id)
 void ParentMemo::Remeber(Ino ino, Ino parent) {
   parent_map_.withWLock(
       [this, ino, parent](Map& map) mutable {
-        auto it = map.find(ino);
-        if (it == map.end()) {
-          map[ino] = {parent, utils::Timestamp()};
-          total_count_ << 1;
-        } else {
+        auto [it, inserted] = map.try_emplace(ino, Value{parent, utils::Timestamp()});
+        if (!inserted) {
           it->second.parent = parent;
           it->second.last_active_time_s = utils::Timestamp();
+
+        } else {
+          total_count_ << 1;
         }
       },
       ino);
@@ -68,7 +64,7 @@ bool ParentMemo::GetParent(Ino ino, Ino& parent) {
 }
 
 void ParentMemo::CleanExpired(uint64_t expire_s) {
-  if (Size() < FLAGS_mds_parent_memo_cache_max_count) return;
+  if (Size() < FLAGS_mds_clean_threshold_count) return;
 
   std::vector<Ino> delete_inos;
   parent_map_.iterate([&](const Map& map) {
@@ -79,9 +75,7 @@ void ParentMemo::CleanExpired(uint64_t expire_s) {
     }
   });
 
-  for (const auto& ino : delete_inos) {
-    Forget(ino);
-  }
+  for (const auto& ino : delete_inos) Forget(ino);
 
   clean_count_ << delete_inos.size();
 

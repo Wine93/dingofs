@@ -14,8 +14,6 @@
 
 #include "mds/filesystem/partition.h"
 
-#include <json/value.h>
-
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
@@ -23,10 +21,13 @@
 #include <string>
 #include <vector>
 
+#include "brpc/reloadable_flags.h"
+#include "common/helper.h"
 #include "common/logging.h"
+#include "common/options/mds.h"
 #include "fmt/format.h"
 #include "glog/logging.h"
-#include "mds/common/helper.h"
+#include "json/value.h"
 #include "utils/time.h"
 
 namespace dingofs {
@@ -35,10 +36,15 @@ namespace mds {
 static const std::string kPartitionMetricsPrefix = "dingofs_{}_partition_cache_{}";
 
 // 0: no limit
-DEFINE_uint32(mds_partition_cache_shard_max_count, 4 * 1024 * 1024, "partition cache shard max count");
 DEFINE_uint32(mds_partition_dentry_op_max_count, 100000, "partition dentry op max count");
 
-DEFINE_uint32(mds_partition_shard_split_threshold, 8192, "split shard when dentry count exceeds this");
+DEFINE_uint32(mds_partition_shard_split_threshold, 100000, "split shard when dentry count exceeds this");
+
+DEFINE_bool(mds_dirshard_inflight_controller_enable, true, "DirShard inflight controller enable.");
+DEFINE_validator(mds_dirshard_inflight_controller_enable, brpc::PassValidate);
+
+DEFINE_uint32(mds_dentry_fresh_time_s, 0, "dentry fresh seconds");
+DEFINE_validator(mds_dentry_fresh_time_s, brpc::PassValidate);
 
 // --- DirShard implementation ---
 
@@ -48,6 +54,7 @@ void DirShard::Put(const Dentry& dentry) {
   children_[dentry.Name()] = dentry;
 
   UpdateLastActiveTime();
+  UpdateLastRefreshTime();
 }
 
 void DirShard::Delete(const std::string& name) {
@@ -56,6 +63,7 @@ void DirShard::Delete(const std::string& name) {
   children_.erase(name);
 
   UpdateLastActiveTime();
+  UpdateLastRefreshTime();
 }
 
 bool DirShard::Get(const std::string& name, Dentry& out) {
@@ -109,22 +117,10 @@ std::string DirShard::Mid() {
   return it->first;
 }
 
-bool DirShard::Empty() const {
-  utils::ReadLockGuard lk(lock_);
+bool DirShard::IsFresh() {
+  if (FLAGS_mds_dentry_fresh_time_s == 0) return true;
 
-  return children_.empty();
-}
-
-size_t DirShard::Size() const {
-  utils::ReadLockGuard lk(lock_);
-
-  return children_.size();
-}
-
-size_t DirShard::Bytes() const {
-  utils::ReadLockGuard lk(lock_);
-
-  return children_.size() * sizeof(Dentry);
+  return (utils::Timestamp() - last_refresh_time_s_.load(std::memory_order_relaxed)) < FLAGS_mds_dentry_fresh_time_s;
 }
 
 // split shard into two by key, [start, key), [key, end)
@@ -151,16 +147,34 @@ std::pair<DirShardSPtr, DirShardSPtr> DirShard::Split(const std::string& key, ui
 }
 
 std::string DirShard::ToString() const {
-  return fmt::format("id({}) range[{},{}) version({}) size({})", id_, Helper::StringToHex(range_.start),
-                     Helper::StringToHex(range_.end), version_, Size());
+  return fmt::format("id({}) range[{},{}) version({}) size({})", id_, ::dingofs::Helper::StringToHex(range_.start),
+                     ::dingofs::Helper::StringToHex(range_.end), version_, Size());
+}
+
+bool DirShard::Empty() const {
+  utils::ReadLockGuard lk(lock_);
+
+  return children_.empty();
+}
+
+size_t DirShard::Size() const {
+  utils::ReadLockGuard lk(lock_);
+
+  return children_.size();
+}
+
+size_t DirShard::Bytes() const {
+  utils::ReadLockGuard lk(lock_);
+
+  return children_.size() * sizeof(Dentry);
 }
 
 void DirShard::Dump(Json::Value& value) const {
   utils::ReadLockGuard lk(lock_);
 
   value["id"] = id_;
-  value["start"] = Helper::StringToHex(range_.start);
-  value["end"] = Helper::StringToHex(range_.end);
+  value["start"] = ::dingofs::Helper::StringToHex(range_.start);
+  value["end"] = ::dingofs::Helper::StringToHex(range_.end);
   value["version"] = version_;
   value["size"] = Size();
 }
@@ -183,7 +197,7 @@ Status ShardPartition::Get(const std::string& name, Dentry& out) {
   do {
     Range range;
     auto shard = GetShard(name, range);
-    if (shard != nullptr) {
+    if (shard != nullptr && shard->IsFresh()) {
       if (shard->IsFull()) AsyncSplitDirShard(range);
 
       if (shard->Get(name, out)) {
@@ -194,7 +208,8 @@ Status ShardPartition::Get(const std::string& name, Dentry& out) {
     }
 
     // Shard not in cache, try to fetch
-    auto status = FetchDirShard(range, shard);
+    const std::string reason = (shard == nullptr) ? "get-miss" : "get-stale";
+    auto status = FetchDirShard(range, reason, shard);
     if (!status.ok()) return status;
 
   } while (true);
@@ -217,12 +232,13 @@ Status ShardPartition::Scan(const std::string& trace_id, const std::string& star
                             bool is_only_dir, std::vector<Dentry>& dentries) {
   limit = (limit > 0) ? limit : UINT32_MAX;
 
-  std::string next_name = Helper::PrefixNext(start_name);
+  std::string next_name = ::dingofs::Helper::PrefixNext(start_name);
   do {
     Range range;
     auto shard = GetShard(next_name, range);
-    if (shard == nullptr) {
-      auto status = FetchDirShard(range, shard);
+    if (shard == nullptr || !shard->IsFresh()) {
+      const std::string reason = (shard == nullptr) ? "scan-miss" : "scan-stale";
+      auto status = FetchDirShard(range, reason, shard);
       if (!status.ok()) return status;
       continue;
     }
@@ -342,6 +358,60 @@ size_t ShardPartition::Bytes() const {
   return bytes;
 }
 
+void ShardPartition::Dump(Json::Value& value) const {
+  utils::ReadLockGuard lk(lock_);
+
+  value["fs_id"] = fs_id_;
+  value["ino"] = ino_;
+  value["base_version"] = base_version_;
+  value["delta_version"] = delta_version_;
+  value["delta_dentry_ops_count"] = delta_dentry_ops_.size();
+
+  std::map<std::string, Json::Value> shard_map_value;
+  if (shard_boundaries_.empty()) {
+    Json::Value shard_value(Json::objectValue);
+    shard_value["start"] = "";
+    shard_value["end"] = "";
+    shard_map_value[""] = shard_value;
+
+  } else {
+    for (size_t i = 0; i <= shard_boundaries_.size(); ++i) {
+      Json::Value shard_value(Json::objectValue);
+      if (i == 0) {
+        shard_value["start"] = "";
+        shard_value["end"] = shard_boundaries_[i];
+        shard_map_value[""] = shard_value;
+      } else if (i == shard_boundaries_.size()) {
+        shard_value["start"] = shard_boundaries_[i - 1];
+        shard_value["end"] = "";
+        shard_map_value[shard_boundaries_[i - 1]] = shard_value;
+
+      } else {
+        shard_value["start"] = shard_boundaries_[i - 1];
+        shard_value["end"] = shard_boundaries_[i];
+        shard_map_value[shard_boundaries_[i - 1]] = shard_value;
+      }
+    }
+  }
+
+  for (const auto& [shard_key, shard] : shard_map_) {
+    auto it = shard_map_value.find(shard_key);
+    if (it == shard_map_value.end()) continue;
+
+    auto& shard_value = it->second;
+    shard_value["id"] = shard->ID();
+    shard_value["size"] = shard->Size();
+    shard_value["version"] = shard->Version();
+  }
+
+  Json::Value shards_value(Json::arrayValue);
+  for (auto& it : shard_map_value) {
+    shards_value.append(it.second);
+  }
+
+  value["shards"] = shards_value;
+}
+
 // --- ShardPartition private helpers ---
 
 void ShardPartition::AddDeltaOpNoLock(DentryOp&& op) {
@@ -451,7 +521,30 @@ void ShardPartition::DeleteShard(const std::string& start) {
 
 void ShardPartition::DeleteShardNoLock(const std::string& start) { shard_map_.erase(start); }
 
-Status ShardPartition::FetchDirShard(const Range& range, DirShardSPtr& out_shard) {
+Status ShardPartition::FetchDirShard(const Range& range, const std::string& reason, DirShardSPtr& out_shard) {
+  if (!FLAGS_mds_dirshard_inflight_controller_enable) {
+    return DoFetchDirShard(range, reason, out_shard);
+  }
+
+  bool is_leader = false;
+  auto inflight = shard_inflight_controller_.GetOrCreate(range.ToString(), is_leader);
+
+  if (!is_leader) {
+    inflight->done.wait();
+    out_shard = inflight->value;
+    return inflight->status;
+  }
+
+  inflight->status = DoFetchDirShard(range, reason, out_shard);
+  inflight->value = out_shard;
+  shard_inflight_controller_.Delete(range.ToString());
+
+  inflight->done.signal();
+
+  return inflight->status;
+}
+
+Status ShardPartition::DoFetchDirShard(const Range& range, const std::string& reason, DirShardSPtr& out_shard) {
   utils::Duration duration;
   absl::btree_map<std::string, Dentry> dentries;
   Trace trace;
@@ -471,8 +564,8 @@ Status ShardPartition::FetchDirShard(const Range& range, DirShardSPtr& out_shard
 
   PutShard(out_shard);
 
-  LOG(INFO) << fmt::format("[partition.{}.{}][{}us] fetch dir shard, range{} {}.", fs_id_, ino_, duration.ElapsedUs(),
-                           range.ToString(), out_shard->ToString());
+  LOG(INFO) << fmt::format("[partition.{}.{}][{}us] fetch dir shard, range{} {} reason({}).", fs_id_, ino_,
+                           duration.ElapsedUs(), range.ToString(), out_shard->ToString(), reason);
 
   return Status::OK();
 }
@@ -505,6 +598,8 @@ bool ShardPartition::Refresh(uint64_t new_version) {
 }
 
 Status ShardPartition::DoSplitDirShard(const Range& range) {
+  utils::Duration duration;
+
   auto shard = GetShard(range.start);
   if (shard == nullptr || !shard->IsFull()) return Status::OK();
 
@@ -547,9 +642,9 @@ Status ShardPartition::DoSplitDirShard(const Range& range) {
     shard_boundaries_ = std::move(shard_boundaries);
   }
 
-  LOG(INFO) << fmt::format("[partition.{}.{}] split dir shard, parent({}) left({}) right({}) shard_boundaries({}).",
-                           fs_id_, ino_, shard->ToString(), left->ToString(), right->ToString(),
-                           Helper::VectorToString(shard_boundaries_));
+  LOG(INFO) << fmt::format(
+      "[partition.{}.{}][{}us] split dir shard, parent({}) left({}) right({}) shard_boundaries({}).", fs_id_, ino_,
+      duration.ElapsedUs(), shard->ToString(), left->ToString(), right->ToString(), shard_boundaries_.size());
 
   return Status::OK();
 }
@@ -618,60 +713,6 @@ size_t ShardPartition::CleanExpired(uint64_t expire_s) {
   }
 
   return clean_count;
-}
-
-void ShardPartition::Dump(Json::Value& value) const {
-  utils::ReadLockGuard lk(lock_);
-
-  value["fs_id"] = fs_id_;
-  value["ino"] = ino_;
-  value["base_version"] = base_version_;
-  value["delta_version"] = delta_version_;
-  value["delta_dentry_ops_count"] = delta_dentry_ops_.size();
-
-  std::map<std::string, Json::Value> shard_map_value;
-  if (shard_boundaries_.empty()) {
-    Json::Value shard_value(Json::objectValue);
-    shard_value["start"] = "";
-    shard_value["end"] = "";
-    shard_map_value[""] = shard_value;
-
-  } else {
-    for (size_t i = 0; i <= shard_boundaries_.size(); ++i) {
-      Json::Value shard_value(Json::objectValue);
-      if (i == 0) {
-        shard_value["start"] = "";
-        shard_value["end"] = shard_boundaries_[i];
-        shard_map_value[""] = shard_value;
-      } else if (i == shard_boundaries_.size()) {
-        shard_value["start"] = shard_boundaries_[i - 1];
-        shard_value["end"] = "";
-        shard_map_value[shard_boundaries_[i - 1]] = shard_value;
-
-      } else {
-        shard_value["start"] = shard_boundaries_[i - 1];
-        shard_value["end"] = shard_boundaries_[i];
-        shard_map_value[shard_boundaries_[i - 1]] = shard_value;
-      }
-    }
-  }
-
-  for (const auto& [shard_key, shard] : shard_map_) {
-    auto it = shard_map_value.find(shard_key);
-    if (it == shard_map_value.end()) continue;
-
-    auto& shard_value = it->second;
-    shard_value["id"] = shard->ID();
-    shard_value["size"] = shard->Size();
-    shard_value["version"] = shard->Version();
-  }
-
-  Json::Value shards_value(Json::arrayValue);
-  for (auto& it : shard_map_value) {
-    shards_value.append(it.second);
-  }
-
-  value["shards"] = shards_value;
 }
 
 PartitionCache::PartitionCache(uint32_t fs_id)
@@ -797,7 +838,7 @@ size_t PartitionCache::Bytes() {
 
 void PartitionCache::CleanExpired(uint64_t expire_s) {
   size_t shard_size = ShardSize();
-  if (shard_size < FLAGS_mds_partition_cache_shard_max_count) return;
+  if (shard_size < FLAGS_mds_clean_threshold_count) return;
 
   size_t clean_count = 0;
   shard_map_.iterate([&](const Map& map) {

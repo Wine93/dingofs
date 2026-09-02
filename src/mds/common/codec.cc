@@ -19,12 +19,13 @@
 #include <string>
 #include <utility>
 
+#include "common/helper.h"
 #include "dingofs/mds.pb.h"
 #include "fmt/format.h"
 #include "glog/logging.h"
 #include "mds/common/helper.h"
-#include "mds/common/trash.h"
 #include "mds/common/serial_helper.h"
+#include "mds/common/trash.h"
 
 namespace dingofs {
 namespace mds {
@@ -94,9 +95,6 @@ static uint32_t kDelFileKeySize = 1 + 4 + 1 + 8;
 // fs stats format: ${prefix} kTableFsStats kMetaFsStats {fs_id} {time_ns}
 static uint32_t kFsStatsKeySize = 1 + 1 + 4 + 8;
 
-// fs tiny file data format: ${prefix} kTableFsMeta {fs_id} kMetaFsTinyFileData {ino}
-static uint32_t kTinyFileDataKeySize = 1 + 4 + 1 + 8;
-
 // fs slice ref format: ${prefix} kTableMeta kMetaFsSliceRef {slice_id}
 static uint32_t kSliceRefKeySize = 1 + 1 + 8;
 
@@ -124,7 +122,6 @@ enum TableID : unsigned char {
 //      kMetaFsDelFile: fs deleted file, used for deleted file
 //      kMetaFsOpLog: fs operation log, used for fs operation log
 //      kMetaCacheMember: cache member info, used for cache member info
-//      kMetaFsTinyFileData: fs tiny file data, used for tiny file data
 //      kMetaFsSliceRef: fs slice ref, used for slice ref count
 enum MetaType : unsigned char {
   kMetaLock = 1,
@@ -140,7 +137,6 @@ enum MetaType : unsigned char {
   kMetaFsStats = 21,
   kMetaFsOpLog = 23,
   kMetaCacheMember = 25,
-  kMetaFsTinyFileData = 27,
   kMetaFsSliceRef = 29,
   kMetaFsDirStat = 31,
 };
@@ -190,7 +186,6 @@ void MetaCodec::SetClusterID(uint32_t cluster_id) {
   kDelSliceKeySize += kPrefixSize;
   kDelFileKeySize += kPrefixSize;
   kFsStatsKeySize += kPrefixSize;
-  kTinyFileDataKeySize += kPrefixSize;
   kSliceRefKeySize += kPrefixSize;
 }
 
@@ -648,24 +643,6 @@ Range MetaCodec::GetFsStatsRange(uint32_t fs_id) {
   return range;
 }
 
-Range MetaCodec::GetTinyFileDataRange(uint32_t fs_id) {
-  Range range;
-
-  auto& start = range.start;
-  start = kPrefix;
-  start.push_back(kTableFsMeta);
-  SerialHelper::WriteInt(fs_id, start);
-  start.push_back(kMetaFsTinyFileData);
-
-  auto& end = range.end;
-  end = kPrefix;
-  end.push_back(kTableFsMeta);
-  SerialHelper::WriteInt(fs_id, end);
-  end.push_back(kMetaFsTinyFileData + 1);
-
-  return range;
-}
-
 // lock format: ${prefix} kTableMeta kMetaLock {name}
 
 bool MetaCodec::IsLockKey(const std::string& key) {
@@ -693,7 +670,7 @@ std::string MetaCodec::EncodeLockKey(const std::string& name) {
 }
 
 void MetaCodec::DecodeLockKey(const std::string& key, std::string& name) {
-  CHECK(IsLockKey(key)) << fmt::format("invalid lock key({}).", Helper::StringToHex(key));
+  CHECK(IsLockKey(key)) << fmt::format("invalid lock key({}).", ::dingofs::Helper::StringToHex(key));
 
   name = key.substr(kLockKeyHeaderSize);
 }
@@ -744,7 +721,8 @@ std::string MetaCodec::EncodeAutoIncrementIDKey(const std::string& name) {
 }
 
 void MetaCodec::DecodeAutoIncrementIDKey(const std::string& key, std::string& name) {
-  CHECK(IsAutoIncrementIDKey(key)) << fmt::format("invalid auto increment id key({}).", Helper::StringToHex(key));
+  CHECK(IsAutoIncrementIDKey(key)) << fmt::format("invalid auto increment id key({}).",
+                                                  ::dingofs::Helper::StringToHex(key));
 
   name = key.substr(kAutoIncrementIDKeyHeaderSize);
 }
@@ -758,7 +736,7 @@ std::string MetaCodec::EncodeAutoIncrementIDValue(uint64_t id) {
 }
 
 void MetaCodec::DecodeAutoIncrementIDValue(const std::string& value, uint64_t& id) {
-  CHECK(value.size() == 8) << fmt::format("value({}) length is invalid.", Helper::StringToHex(value));
+  CHECK(value.size() == 8) << fmt::format("value({}) length is invalid.", ::dingofs::Helper::StringToHex(value));
 
   id = SerialHelper::ReadULong(value);
 }
@@ -819,7 +797,8 @@ std::string MetaCodec::EncodeHeartbeatKey(int64_t mds_id) {
 }
 
 std::string MetaCodec::EncodeHeartbeatKey(const std::string& client_id) {
-  CHECK(client_id.size() == 36) << fmt::format("client_id({}) length is invalid.", Helper::StringToHex(client_id));
+  CHECK(client_id.size() == 36) << fmt::format("client_id({}) length is invalid.",
+                                               ::dingofs::Helper::StringToHex(client_id));
 
   std::string key;
   key.reserve(kHeartbeatClientKeySize);
@@ -834,7 +813,8 @@ std::string MetaCodec::EncodeHeartbeatKey(const std::string& client_id) {
 }
 
 std::string MetaCodec::EncodeHeartbeatCacheMemberKey(const std::string& member_id) {
-  CHECK(member_id.size() == 36) << fmt::format("member_id({}) length is invalid.", Helper::StringToHex(member_id));
+  CHECK(member_id.size() == 36) << fmt::format("member_id({}) length is invalid.",
+                                               ::dingofs::Helper::StringToHex(member_id));
 
   std::string key;
   key.reserve(kHeartbeatCacheMemberKeySize);
@@ -849,20 +829,21 @@ std::string MetaCodec::EncodeHeartbeatCacheMemberKey(const std::string& member_i
 }
 
 void MetaCodec::DecodeHeartbeatKey(const std::string& key, int64_t& mds_id) {
-  CHECK(IsMdsHeartbeatKey(key)) << fmt::format("invalid mds heartbeat key({}).", Helper::StringToHex(key));
+  CHECK(IsMdsHeartbeatKey(key)) << fmt::format("invalid mds heartbeat key({}).", ::dingofs::Helper::StringToHex(key));
 
   mds_id = SerialHelper::ReadLong(key.substr(kPrefixSize + 1 + 1 + 1));
 }
 
 void MetaCodec::DecodeHeartbeatKey(const std::string& key, std::string& client_id) {
-  CHECK(IsClientHeartbeatKey(key)) << fmt::format("invalid client heartbeat key({}).", Helper::StringToHex(key));
+  CHECK(IsClientHeartbeatKey(key)) << fmt::format("invalid client heartbeat key({}).",
+                                                  ::dingofs::Helper::StringToHex(key));
 
   client_id = key.substr(kPrefixSize + 1 + 1 + 1);
 }
 
 void MetaCodec::DecodeHeartbeatCacheMemberKey(const std::string& key, std::string& member_id) {
   CHECK(IsCacheMemberHeartbeatKey(key)) << fmt::format("invalid cache_member heartbeat key({}).",
-                                                       Helper::StringToHex(key));
+                                                       ::dingofs::Helper::StringToHex(key));
 
   member_id = key.substr(kPrefixSize + 1 + 1 + 1);
 }
@@ -928,7 +909,7 @@ std::string MetaCodec::EncodeFsKey(const std::string& name) {
 }
 
 void MetaCodec::DecodeFsKey(const std::string& key, std::string& name) {
-  CHECK(IsFsKey(key)) << fmt::format("invalid fs key({}).", Helper::StringToHex(key));
+  CHECK(IsFsKey(key)) << fmt::format("invalid fs key({}).", ::dingofs::Helper::StringToHex(key));
 
   name = key.substr(kFsKeyHeaderSize);
 }
@@ -969,7 +950,7 @@ std::string MetaCodec::EncodeFsQuotaKey(uint32_t fs_id) {
 }
 
 void MetaCodec::DecodeFsQuotaKey(const std::string& key, uint32_t& fs_id) {
-  CHECK(IsFsQuotaKey(key)) << fmt::format("invalid fs quota key({}).", Helper::StringToHex(key));
+  CHECK(IsFsQuotaKey(key)) << fmt::format("invalid fs quota key({}).", ::dingofs::Helper::StringToHex(key));
 
   fs_id = SerialHelper::ReadInt(key.substr(kPrefixSize + 1 + 1));
 }
@@ -1012,7 +993,7 @@ std::string MetaCodec::EncodeFsOpLogKey(uint32_t fs_id, uint64_t time_ns) {
 }
 
 void MetaCodec::DecodeFsOpLogKey(const std::string& key, uint32_t& fs_id, uint64_t& time_ns) {
-  CHECK(IsFsOpLogKey(key)) << fmt::format("invalid fs config log key({}).", Helper::StringToHex(key));
+  CHECK(IsFsOpLogKey(key)) << fmt::format("invalid fs config log key({}).", ::dingofs::Helper::StringToHex(key));
 
   fs_id = SerialHelper::ReadInt(key.substr(kPrefixSize + 1));
   time_ns = SerialHelper::ReadULong(key.substr(kPrefixSize + 1 + 1 + 4));
@@ -1054,9 +1035,9 @@ std::string MetaCodec::EncodeSliceRefKey(uint64_t slice_id) {
 }
 
 void MetaCodec::DecodeSliceRefKey(const std::string& key, uint64_t& slice_id) {
-  CHECK(IsSliceRefKey(key)) << fmt::format("invalid slice ref key({}).", Helper::StringToHex(key));
+  CHECK(IsSliceRefKey(key)) << fmt::format("invalid slice ref key({}).", ::dingofs::Helper::StringToHex(key));
 
-  slice_id = SerialHelper::ReadULong(key.substr(kPrefixSize + 1 + 4 + 1));
+  slice_id = SerialHelper::ReadULong(key.substr(kPrefixSize + 1 + 1));
 }
 
 std::string MetaCodec::EncodeSliceRefValue(const SliceRefEntry& entry) { return entry.SerializeAsString(); }
@@ -1105,7 +1086,7 @@ std::string MetaCodec::EncodeInodeKey(uint32_t fs_id, Ino ino) {
 }
 
 void MetaCodec::DecodeInodeKey(const std::string& key, uint32_t& fs_id, uint64_t& ino) {
-  CHECK(IsInodeKey(key)) << fmt::format("invalid inode key({}).", Helper::StringToHex(key));
+  CHECK(IsInodeKey(key)) << fmt::format("invalid inode key({}).", ::dingofs::Helper::StringToHex(key));
 
   fs_id = SerialHelper::ReadInt(key.substr(kPrefixSize + 1));
   ino = SerialHelper::ReadULong(key.substr(kPrefixSize + 1 + 4 + 1));
@@ -1152,7 +1133,8 @@ std::string MetaCodec::EncodeDirInodeMutationKey(uint32_t fs_id, Ino ino, uint32
 }
 
 void MetaCodec::DecodeDirInodeMutationKey(const std::string& key, uint32_t& fs_id, uint64_t& ino, uint32_t& index) {
-  CHECK(IsDirInodeMutationKey(key)) << fmt::format("invalid inode update op key({}).", Helper::StringToHex(key));
+  CHECK(IsDirInodeMutationKey(key)) << fmt::format("invalid inode update op key({}).",
+                                                   ::dingofs::Helper::StringToHex(key));
   fs_id = SerialHelper::ReadInt(key.substr(kPrefixSize + 1));
   ino = SerialHelper::ReadULong(key.substr(kPrefixSize + 1 + 4 + 1));
   index = SerialHelper::ReadInt(key.substr(kPrefixSize + 1 + 4 + 1 + 8 + 1));
@@ -1204,7 +1186,7 @@ std::string MetaCodec::EncodeDentryKey(uint32_t fs_id, Ino ino, const std::strin
 }
 
 void MetaCodec::DecodeDentryKey(const std::string& key, uint32_t& fs_id, uint64_t& ino, std::string& name) {
-  CHECK(IsDentryKey(key)) << fmt::format("invalid dentry key({}).", Helper::StringToHex(key));
+  CHECK(IsDentryKey(key)) << fmt::format("invalid dentry key({}).", ::dingofs::Helper::StringToHex(key));
 
   fs_id = SerialHelper::ReadInt(key.substr(kPrefixSize + 1));
   ino = SerialHelper::ReadULong(key.substr(kPrefixSize + 1 + 4 + 1));
@@ -1258,7 +1240,7 @@ std::string MetaCodec::EncodeChunkKey(uint32_t fs_id, Ino ino, uint64_t chunk_in
 }
 
 void MetaCodec::DecodeChunkKey(const std::string& key, uint32_t& fs_id, uint64_t& ino, uint64_t& chunk_index) {
-  CHECK(IsChunkKey(key)) << fmt::format("invalid chunk key({}).", Helper::StringToHex(key));
+  CHECK(IsChunkKey(key)) << fmt::format("invalid chunk key({}).", ::dingofs::Helper::StringToHex(key));
 
   fs_id = SerialHelper::ReadInt(key.substr(kPrefixSize + 1));
   ino = SerialHelper::ReadULong(key.substr(kPrefixSize + 1 + 4 + 1));
@@ -1305,7 +1287,7 @@ std::string MetaCodec::EncodeFileSessionKey(uint32_t fs_id, Ino ino, const std::
 }
 
 void MetaCodec::DecodeFileSessionKey(const std::string& key, uint32_t& fs_id, uint64_t& ino, std::string& session_id) {
-  CHECK(IsFileSessionKey(key)) << fmt::format("invalid file session key({}).", Helper::StringToHex(key));
+  CHECK(IsFileSessionKey(key)) << fmt::format("invalid file session key({}).", ::dingofs::Helper::StringToHex(key));
 
   fs_id = SerialHelper::ReadInt(key.substr(kPrefixSize + 1));
   ino = SerialHelper::ReadULong(key.substr(kPrefixSize + 1 + 4 + 1));
@@ -1351,7 +1333,7 @@ std::string MetaCodec::EncodeDirQuotaKey(uint32_t fs_id, Ino ino) {
 }
 
 void MetaCodec::DecodeDirQuotaKey(const std::string& key, uint32_t& fs_id, Ino& ino) {
-  CHECK(IsDirQuotaKey(key)) << fmt::format("invalid dir quota key({}).", Helper::StringToHex(key));
+  CHECK(IsDirQuotaKey(key)) << fmt::format("invalid dir quota key({}).", ::dingofs::Helper::StringToHex(key));
 
   fs_id = SerialHelper::ReadInt(key.substr(kPrefixSize + 1));
   ino = SerialHelper::ReadULong(key.substr(kPrefixSize + 1 + 4 + 1));
@@ -1393,7 +1375,7 @@ std::string MetaCodec::EncodeDirStatKey(uint32_t fs_id, Ino ino) {
 }
 
 void MetaCodec::DecodeDirStatKey(const std::string& key, uint32_t& fs_id, Ino& ino) {
-  CHECK(IsDirStatKey(key)) << fmt::format("invalid dir stat key({}).", Helper::StringToHex(key));
+  CHECK(IsDirStatKey(key)) << fmt::format("invalid dir stat key({}).", ::dingofs::Helper::StringToHex(key));
 
   fs_id = SerialHelper::ReadInt(key.substr(kPrefixSize + 1));
   ino = SerialHelper::ReadULong(key.substr(kPrefixSize + 1 + 4 + 1));
@@ -1459,7 +1441,7 @@ std::string MetaCodec::EncodeDelSliceKey(uint32_t fs_id, Ino ino, uint64_t chunk
 
 void MetaCodec::DecodeDelSliceKey(const std::string& key, uint32_t& fs_id, uint64_t& ino, uint64_t& chunk_index,
                                   uint64_t& time_ns) {
-  CHECK(IsDelSliceKey(key)) << fmt::format("invalid del slice key({}).", Helper::StringToHex(key));
+  CHECK(IsDelSliceKey(key)) << fmt::format("invalid del slice key({}).", ::dingofs::Helper::StringToHex(key));
 
   fs_id = SerialHelper::ReadInt(key.substr(kPrefixSize + 1));
   ino = SerialHelper::ReadULong(key.substr(kPrefixSize + 1 + 4 + 1));
@@ -1507,7 +1489,7 @@ std::string MetaCodec::EncodeDelFileKey(uint32_t fs_id, Ino ino) {
 }
 
 void MetaCodec::DecodeDelFileKey(const std::string& key, uint32_t& fs_id, Ino& ino) {
-  CHECK(IsDelFileKey(key)) << fmt::format("invalid del file key({}).", Helper::StringToHex(key));
+  CHECK(IsDelFileKey(key)) << fmt::format("invalid del file key({}).", ::dingofs::Helper::StringToHex(key));
 
   fs_id = SerialHelper::ReadInt(key.substr(kPrefixSize + 1));
   ino = SerialHelper::ReadULong(key.substr(kPrefixSize + 1 + 4 + 1));
@@ -1552,7 +1534,7 @@ std::string MetaCodec::EncodeFsStatsKey(uint32_t fs_id, uint64_t time_ns) {
 }
 
 void MetaCodec::DecodeFsStatsKey(const std::string& key, uint32_t& fs_id, uint64_t& time_ns) {
-  CHECK(IsFsStatsKey(key)) << fmt::format("invalid fs stats key({}).", Helper::StringToHex(key));
+  CHECK(IsFsStatsKey(key)) << fmt::format("invalid fs stats key({}).", ::dingofs::Helper::StringToHex(key));
 
   fs_id = SerialHelper::ReadInt(key.substr(kPrefixSize + 1 + 1));
   time_ns = SerialHelper::ReadULong(key.substr(kPrefixSize + 1 + 1 + 4));
@@ -1567,53 +1549,6 @@ FsStatsDataEntry MetaCodec::DecodeFsStatsValue(const std::string& value) {
   CHECK(stats.ParseFromString(value)) << "parse fs stats fail.";
 
   return stats;
-}
-
-// tiny file data format: ${prefix} kTableFsMeta {fs_id} kMetaFsTinyFileData {ino}
-bool MetaCodec::IsTinyFileDataKey(const std::string& key) {
-  if (key.size() != kTinyFileDataKeySize) {
-    return false;
-  }
-
-  // Check the prefix, table id, and meta type
-  if (key.at(kPrefixSize) != kTableFsMeta || key.at(kPrefixSize + 1 + 4) != kMetaFsTinyFileData) {
-    return false;
-  }
-
-  return true;
-}
-
-std::string MetaCodec::EncodeTinyFileDataKey(uint32_t fs_id, Ino ino) {
-  std::string key;
-  key.reserve(kTinyFileDataKeySize);
-
-  key.append(kPrefix);
-  key.push_back(kTableFsMeta);
-  SerialHelper::WriteInt(fs_id, key);
-  key.push_back(kMetaFsTinyFileData);
-  SerialHelper::WriteULong(ino, key);
-
-  return key;
-}
-
-void MetaCodec::DecodeTinyFileDataKey(const std::string& key, uint32_t& fs_id, Ino& ino) {
-  CHECK(IsTinyFileDataKey(key)) << fmt::format("invalid tiny file data key({}).", Helper::StringToHex(key));
-
-  fs_id = SerialHelper::ReadInt(key.substr(kPrefixSize + 1));
-  ino = SerialHelper::ReadULong(key.substr(kPrefixSize + 1 + 4 + 1));
-}
-
-std::string& MetaCodec::EncodeTinyFileDataValue(std::string& data, uint64_t version) {
-  SerialHelper::WriteULong(version, data);
-
-  return data;
-}
-
-void MetaCodec::DecodeTinyFileDataValue(std::string& value, uint64_t& version) {
-  CHECK(value.size() >= 8) << fmt::format("tiny file data value({}) size is invalid.", Helper::StringToHex(value));
-
-  version = SerialHelper::ReadULong(value.substr(value.size() - 8, 8));
-  value.resize(value.size() - 8);
 }
 
 bool MetaCodec::IsMetaTableKey(const std::string& key) {
@@ -1745,16 +1680,25 @@ std::pair<std::string, std::string> MetaCodec::ParseMetaTableKey(const std::stri
       value_desc = op_log.ShortDebugString();
     } break;
 
+    case kMetaFsSliceRef: {
+      uint64_t slice_id;
+      DecodeSliceRefKey(key, slice_id);
+      key_desc = fmt::format("{} kTableMeta kMetaFsSliceRef {}", kPrefix, slice_id);
+
+      auto slice_ref = DecodeSliceRefValue(value);
+      value_desc = slice_ref.ShortDebugString();
+    } break;
+
     default:
       CHECK(false) << fmt::format("invalid meta type({}) key({}).", static_cast<int>(meta_type),
-                                  Helper::StringToHex(key));
+                                  ::dingofs::Helper::StringToHex(key));
   }
 
   return std::make_pair(std::move(key_desc), std::move(value_desc));
 }
 
 std::pair<std::string, std::string> MetaCodec::ParseFsStatsTableKey(const std::string& key, const std::string& value) {
-  CHECK(IsFsStatsKey(key)) << fmt::format("invalid fs stats key({}).", Helper::StringToHex(key));
+  CHECK(IsFsStatsKey(key)) << fmt::format("invalid fs stats key({}).", ::dingofs::Helper::StringToHex(key));
 
   std::string key_desc, value_desc;
 
@@ -1770,7 +1714,7 @@ std::pair<std::string, std::string> MetaCodec::ParseFsStatsTableKey(const std::s
 }
 
 std::pair<std::string, std::string> MetaCodec::ParseFsMetaTableKey(const std::string& key, const std::string& value) {
-  CHECK(IsFsMetaTableKey(key)) << fmt::format("invalid fs meta key({}).", Helper::StringToHex(key));
+  CHECK(IsFsMetaTableKey(key)) << fmt::format("invalid fs meta key({}).", ::dingofs::Helper::StringToHex(key));
 
   std::string key_desc, value_desc;
 
@@ -1815,9 +1759,23 @@ std::pair<std::string, std::string> MetaCodec::ParseFsMetaTableKey(const std::st
           value_desc = chunk.ShortDebugString();
         } break;
 
+        case kFsDirInodeMutation: {
+          uint32_t fs_id;
+          Ino ino;
+          uint32_t index;
+          DecodeDirInodeMutationKey(key, fs_id, ino, index);
+          key_desc = fmt::format(
+              "{} kTableFsMeta {} kMetaFsInode {} "
+              "kFsDirInodeMutation {}",
+              kPrefix, fs_id, ino, index);
+
+          auto mutation = DecodeDirInodeMutationValue(value);
+          value_desc = mutation.ShortDebugString();
+        } break;
+
         default:
           CHECK(false) << fmt::format("invalid inode type({}) key({}).", static_cast<int>(inode_type),
-                                      Helper::StringToHex(key));
+                                      ::dingofs::Helper::StringToHex(key));
       }
     } break;
 
@@ -1844,6 +1802,17 @@ std::pair<std::string, std::string> MetaCodec::ParseFsMetaTableKey(const std::st
       value_desc = dir_quota.ShortDebugString();
 
     } break;
+
+    case kMetaFsDirStat: {
+      uint32_t fs_id;
+      Ino ino;
+      DecodeDirStatKey(key, fs_id, ino);
+      key_desc = fmt::format("{} kTableFsMeta {} kMetaFsDirStat {}", kPrefix, fs_id, ino);
+
+      auto dir_stat = DecodeDirStatValue(value);
+      value_desc = dir_stat.ShortDebugString();
+    } break;
+
     case kMetaFsDelSlice: {
       uint32_t fs_id;
       Ino ino;
@@ -1870,7 +1839,7 @@ std::pair<std::string, std::string> MetaCodec::ParseFsMetaTableKey(const std::st
 
     default:
       CHECK(false) << fmt::format("invalid meta type({}) key({}).", static_cast<int>(meta_type),
-                                  Helper::StringToHex(key));
+                                  ::dingofs::Helper::StringToHex(key));
   }
 
   return std::make_pair(std::move(key_desc), std::move(value_desc));
@@ -1889,7 +1858,7 @@ std::pair<std::string, std::string> MetaCodec::ParseKey(const std::string& key, 
 
     default:
       CHECK(false) << fmt::format("invalid table id({}) key({}).", static_cast<int>(table_id),
-                                  Helper::StringToHex(key));
+                                  ::dingofs::Helper::StringToHex(key));
   }
 
   return {};
@@ -1938,8 +1907,6 @@ const char* MetaTypeName(unsigned char meta_type) {
       return "kMetaFsOpLog";
     case kMetaCacheMember:
       return "kMetaCacheMember";
-    case kMetaFsTinyFileData:
-      return "kMetaFsTinyFileData";
     case kMetaFsSliceRef:
       return "kMetaFsSliceRef";
     default:
@@ -1965,7 +1932,7 @@ const char* InodeTypeName(unsigned char inode_type) {
 }  // namespace
 
 std::string MetaCodec::ParseKeyFromHex(const std::string& hex_key) {
-  const std::string key = Helper::HexToString(hex_key);
+  const std::string key = ::dingofs::Helper::HexToString(hex_key);
 
   // Auto-detect prefix (cluster id) so this works without SetClusterID().
   size_t prefix_size = 0;
@@ -2077,7 +2044,7 @@ std::string MetaCodec::ParseKeyFromHex(const std::string& hex_key) {
           if (!enough(1 + 4 + 1 + 8 + 1)) {
             return fmt::format("{} truncated (missing ino/inode type), key({})", head, hex_key);
           }
-          uint64_t ino = SerialHelper::ReadULong(key.substr(p + 1 + 4 + 1));
+          Ino ino = SerialHelper::ReadULong(key.substr(p + 1 + 4 + 1));
           const unsigned char inode_type = static_cast<unsigned char>(key.at(p + 1 + 4 + 1 + 8));
           switch (inode_type) {
             case kFsInodeAttr:
@@ -2106,22 +2073,21 @@ std::string MetaCodec::ParseKeyFromHex(const std::string& hex_key) {
 
         case kMetaFsFileSession: {
           // format: ${prefix} kTableFsMeta {fs_id} kMetaFsFileSession {ino} {session_id}
-          uint64_t ino = SerialHelper::ReadULong(key.substr(p + 1 + 4 + 1));
+          Ino ino = SerialHelper::ReadULong(key.substr(p + 1 + 4 + 1));
           std::string session_id = key.substr(p + 1 + 4 + 1 + 8);
           return fmt::format("{} ino({}) session_id({})", head, ino, session_id);
         }
 
         case kMetaFsDirQuota:
-        case kMetaFsDelFile:
-        case kMetaFsTinyFileData: {
+        case kMetaFsDelFile: {
           // format: ${prefix} kTableFsMeta {fs_id} {meta_type} {ino}
-          uint64_t ino = SerialHelper::ReadULong(key.substr(p + 1 + 4 + 1));
+          Ino ino = SerialHelper::ReadULong(key.substr(p + 1 + 4 + 1));
           return fmt::format("{} ino({})", head, ino);
         }
 
         case kMetaFsDelSlice: {
           // format: ${prefix} kTableFsMeta {fs_id} kMetaFsDelSlice {ino} {chunk_index} {time_ns}
-          uint64_t ino = SerialHelper::ReadULong(key.substr(p + 1 + 4 + 1));
+          Ino ino = SerialHelper::ReadULong(key.substr(p + 1 + 4 + 1));
           uint64_t chunk_index = SerialHelper::ReadULong(key.substr(p + 1 + 4 + 1 + 8));
           uint64_t time_ns = SerialHelper::ReadULong(key.substr(p + 1 + 4 + 1 + 8 + 8));
           return fmt::format("{} ino({}) chunk_index({}) time_ns({})", head, ino, chunk_index, time_ns);

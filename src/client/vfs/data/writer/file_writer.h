@@ -32,13 +32,12 @@ namespace client {
 namespace vfs {
 
 class VFSHub;
+class FileWriterTestPeer;
 
 class FileWriter {
  public:
   FileWriter(VFSHub* hub, uint64_t ino)
-      : vfs_hub_(hub),
-        ino_(ino),
-        uuid_(fmt::format("file_writer-{}", ino_)) {}
+      : vfs_hub_(hub), ino_(ino), uuid_(fmt::format("file_writer-{}", ino_)) {}
 
   ~FileWriter();
 
@@ -50,6 +49,10 @@ class FileWriter {
                uint64_t* out_wsize);
 
   Status Flush();
+
+  // Starts a flush only when published writes are not fully flushed. The
+  // callback is invoked exactly once, possibly inline for a clean writer.
+  void FlushDirtyAsync(StatusCallback cb);
 
   void AcquireRef();
 
@@ -64,6 +67,14 @@ class FileWriter {
   void SetStatusIfBroken(const Status& s);
 
  private:
+  friend class FileWriterTestPeer;
+  friend void intrusive_ptr_add_ref(FileWriter* writer) {
+    writer->AcquireRef();
+  }
+  friend void intrusive_ptr_release(FileWriter* writer) {
+    writer->ReleaseRef();
+  }
+
   int32_t GetChunkSize() const;
 
   void AsyncFlush(StatusCallback cb);
@@ -73,8 +84,8 @@ class FileWriter {
 
   ChunkWriter* GetOrCreateChunkWriter(int64_t chunk_index);
 
-  void FileFlushTaskDone(uint64_t file_flush_id, StatusCallback cb,
-                         Status status);
+  void FileFlushTaskDone(uint64_t file_flush_id, uint64_t target_generation,
+                         StatusCallback cb, Status status);
   VFSHub* vfs_hub_;
   const uint64_t ino_;
   const std::string uuid_;
@@ -82,12 +93,17 @@ class FileWriter {
   std::atomic<int64_t> refs_{0};
 
   mutable std::mutex status_mutex_;
-  Status file_status_;   // sticky after first error
+  Status file_status_;  // sticky after first error
 
   mutable std::mutex mutex_;
   std::condition_variable cv_;
   bool closed_{false};
   int64_t writers_count_{0};
+  // Generations are a final-close invariant, not an exact account of what an
+  // arbitrary concurrent Flush happened to include. Lifecycle owners must
+  // quiesce writes, complete one final explicit Flush, and only then Close.
+  uint64_t write_generation_{0};
+  uint64_t flushed_generation_{0};
 
   // chunk_index -> chunk
   // chunk is used by file/file_flush_task/chunk_flush_task

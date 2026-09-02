@@ -54,6 +54,13 @@ DECLARE_uint32(small_block_size_kb);
 // Maximum number of concurrent uploads for staged blocks.
 DECLARE_uint32(upload_stage_max_inflights);
 
+// Maximum tries per round for uploading one stage block to storage, a failed
+// round is re-enqueued on a slow cycle.
+DECLARE_uint32(upload_stage_max_tries);
+
+// Delay in seconds before re-enqueueing the stage block whose upload failed.
+DECLARE_uint32(upload_stage_retry_delay_s);
+
 // Local disk cache ------------------------------------------------------------
 
 // Directory list for stage and cached blocks. Use comma-separated
@@ -74,6 +81,10 @@ DECLARE_double(free_space_ratio);
 
 // Expiration time for cached blocks in seconds. Staged blocks are not expired.
 DECLARE_uint32(cache_expire_s);
+
+// Cache eviction policy: sieve | s3fifo | 2random | lru | none (restart to
+// change).
+DECLARE_string(cache_eviction);
 
 // Interval for scanning and removing expired cached blocks in milliseconds.
 DECLARE_uint32(cache_cleanup_expire_interval_ms);
@@ -156,6 +167,8 @@ DECLARE_uint32(cache_rpc_timeout_ms);
 // Timeout for remote cache prefetch RPCs, in milliseconds.
 DECLARE_uint32(cache_prefetch_rpc_timeout_ms);
 
+DECLARE_uint32(cache_delete_rpc_timeout_ms);
+
 // Timeout for pinging a remote cache node, in milliseconds.
 DECLARE_uint32(cache_ping_rpc_timeout_ms);
 
@@ -185,11 +198,30 @@ DECLARE_uint32(cache_node_state_check_duration_ms);
 
 // Storage and MDS -------------------------------------------------------------
 
-// Maximum retry window for uploading a block to storage, in seconds.
-DECLARE_int64(storage_upload_retry_timeout_s);
+// Maximum tries (including the first attempt) for uploading one block to
+// storage.
+DECLARE_uint32(storage_upload_max_tries);
 
-// Maximum retry window for downloading a block from storage, in seconds.
-DECLARE_int64(storage_download_retry_timeout_s);
+// Maximum tries (including the first attempt) for downloading one block from
+// storage.
+DECLARE_uint32(storage_download_max_tries);
+
+// Base backoff in milliseconds between upload retries, the real backoff is
+// base * tried * tried, capped at 60 seconds.
+DECLARE_uint32(storage_upload_retry_backoff_base_ms);
+
+// Base backoff in milliseconds between download retries, the real backoff is
+// base * tried, capped at 10 seconds.
+DECLARE_uint32(storage_download_retry_backoff_base_ms);
+
+// Maximum tries (including the first attempt) for downloading one block that
+// storage reports as not found; only applied by callers that opt in
+// (foreground reads racing a writeback upload). Set to 1 to disable.
+DECLARE_uint32(storage_download_notfound_max_tries);
+
+// Base backoff in milliseconds between notfound download retries, the real
+// backoff is base * tried, capped at 10 seconds.
+DECLARE_uint32(storage_download_notfound_retry_backoff_base_ms);
 
 // Number of worker threads for async storage upload tasks.
 DECLARE_uint64(storage_upload_thread_pool_size);
@@ -249,6 +281,10 @@ DECLARE_int32(rdma_rpc_timeout_ms);
 // Signal one client request SEND every N requests. 0 disables periodic
 // signaled request SENDs.
 DECLARE_uint32(rdma_client_signal_request_send_every);
+
+// Interval in seconds between server keepalives sent on every RDMA session to
+// detect vanished peers. 0 disables keepalive.
+DECLARE_uint32(rdma_server_keepalive_interval_s);
 
 }  // namespace infiniband
 

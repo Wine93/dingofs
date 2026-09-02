@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "brpc/controller.h"
+#include "common/helper.h"
 #include "common/logging.h"
 #include "common/options/common.h"
 #include "dingofs/error.pb.h"
@@ -61,12 +62,22 @@ DEFINE_uint32(mds_service_write_worker_num, 4096, "number of write workers");
 DEFINE_uint32(mds_service_write_worker_max_pending_num, 259072, "write service worker max pending num");
 DEFINE_bool(mds_service_write_worker_use_pthread, false, "write worker use pthread");
 
-#define RunInPlace(name, controller, request, response, svr_done) \
-  if (!FLAGS_mds_service_worker_enable) {                         \
-    return Do##name(controller, request, response, svr_done);     \
+#define RunInPlace(name, controller, request, response, svr_done)                                              \
+  if (!FLAGS_mds_service_worker_enable) {                                                                      \
+    if (BAIDU_UNLIKELY(IsStopped())) {                                                                         \
+      brpc::ClosureGuard done_guard(svr_done);                                                                 \
+      ServiceHelper::SetError((response)->mutable_error(), pb::error::ESERVICE_STOPPED, "service is stopped"); \
+      return;                                                                                                  \
+    }                                                                                                          \
+    return Do##name(controller, request, response, svr_done);                                                  \
   }
 
 #define RunInQueue(name, controller, request, response, svr_done, worker_set)                                    \
+  if (BAIDU_UNLIKELY(IsStopped())) {                                                                             \
+    brpc::ClosureGuard done_guard(svr_done);                                                                     \
+    ServiceHelper::SetError((response)->mutable_error(), pb::error::ESERVICE_STOPPED, "service is stopped");     \
+    return;                                                                                                      \
+  }                                                                                                              \
   auto task = std::make_shared<ServiceTask>(                                                                     \
       [this, controller, request, response, svr_done]() { Do##name(controller, request, response, svr_done); }); \
                                                                                                                  \
@@ -173,9 +184,13 @@ bool MDSServiceImpl::Init() {
   return true;
 }
 
-void MDSServiceImpl::Destroy() {
-  read_worker_set_->Destroy();
-  write_worker_set_->Destroy();
+void MDSServiceImpl::Stop() {
+  bool expected = false;
+  if (!is_stopped_.compare_exchange_strong(expected, true)) return;
+
+  read_worker_set_->Stop();
+  write_worker_set_->Stop();
+
   if (FLAGS_enable_trace) trace_manager_.Stop();
 }
 
@@ -216,7 +231,7 @@ void MDSServiceImpl::DoHeartbeat(google::protobuf::RpcController*, const pb::mds
     if (!client_info.file_sessions().empty()) {
       auto file_system = GetFileSystem(client_info.fs_id());
 
-      file_system->AsyncKeepAliveFileSession(Helper::PbRepeatedToVector(client_info.file_sessions()));
+      file_system->AsyncKeepAliveFileSession(::dingofs::Helper::PbRepeatedToVector(client_info.file_sessions()));
     }
 
     // Piggyback FsInfo.version so the client can detect runtime-mutable
@@ -273,7 +288,7 @@ void MDSServiceImpl::DoGetMDSList(google::protobuf::RpcController*, const pb::md
     return ServiceHelper::SetError(response->mutable_error(), status.error_code(), status.error_str());
   }
 
-  Helper::VectorToPbRepeated(mdses, response->mutable_mdses());
+  ::dingofs::Helper::VectorToPbRepeated(mdses, response->mutable_mdses());
 }
 
 void MDSServiceImpl::GetMDSList(google::protobuf::RpcController* controller, const pb::mds::GetMDSListRequest* request,
@@ -316,7 +331,7 @@ void MDSServiceImpl::DoCreateFs(google::protobuf::RpcController*, const pb::mds:
   param.enable_uid_gid_map = request->enable_uid_gid_map();
   param.partition_type = request->partition_type();
   param.expect_mds_num = request->expect_mds_num();
-  param.candidate_mds_ids = Helper::PbRepeatedToVector(request->candidate_mds_ids());
+  param.candidate_mds_ids = ::dingofs::Helper::PbRepeatedToVector(request->candidate_mds_ids());
 
   pb::mds::FsInfo fs_info;
   status = file_system_set_->CreateFs(param, fs_info);
@@ -601,7 +616,7 @@ void MDSServiceImpl::DoListFsInfo(google::protobuf::RpcController*, const pb::md
     return ServiceHelper::SetError(response->mutable_error(), status.error_code(), status.error_str());
   }
 
-  Helper::VectorToPbRepeated(fs_infoes, response->mutable_fs_infos());
+  ::dingofs::Helper::VectorToPbRepeated(fs_infoes, response->mutable_fs_infos());
 }
 
 void MDSServiceImpl::ListFsInfo(google::protobuf::RpcController* controller, const pb::mds::ListFsInfoRequest* request,
@@ -813,6 +828,7 @@ void MDSServiceImpl::DoGetInode(google::protobuf::RpcController*, const pb::mds:
   }
 
   response->mutable_inode()->Swap(&entry_out.attr);
+  response->mutable_inode()->clear_shard_boundaries();
 }
 
 // inode interface
@@ -844,7 +860,7 @@ void MDSServiceImpl::DoBatchGetInode(google::protobuf::RpcController*, const pb:
   Context ctx(request->context(), request->info().request_id(), __func__, CalReqType(request));
 
   std::vector<EntryOut> entries;
-  status = file_system->BatchGetInode(ctx, Helper::PbRepeatedToVector(request->inoes()), entries);
+  status = file_system->BatchGetInode(ctx, ::dingofs::Helper::PbRepeatedToVector(request->inoes()), entries);
   ServiceHelper::SetResponseInfo(ctx.GetTrace(), response->mutable_info());
   if (BAIDU_UNLIKELY(!status.ok())) {
     SpanScope::SetStatus(span, status);
@@ -885,7 +901,7 @@ void MDSServiceImpl::DoBatchGetXAttr(google::protobuf::RpcController*, const pb:
   Context ctx(request->context(), request->info().request_id(), __func__, CalReqType(request));
 
   std::vector<pb::mds::XAttr> xattrs;
-  status = file_system->BatchGetXAttr(ctx, Helper::PbRepeatedToVector(request->inoes()), xattrs);
+  status = file_system->BatchGetXAttr(ctx, ::dingofs::Helper::PbRepeatedToVector(request->inoes()), xattrs);
   ServiceHelper::SetResponseInfo(ctx.GetTrace(), response->mutable_info());
   if (BAIDU_UNLIKELY(!status.ok())) {
     SpanScope::SetStatus(span, status);
@@ -935,6 +951,7 @@ void MDSServiceImpl::DoLookup(google::protobuf::RpcController* controller, const
   }
 
   response->mutable_inode()->Swap(&entry_out.attr);
+  response->mutable_inode()->clear_shard_boundaries();
 }
 
 void MDSServiceImpl::Lookup(google::protobuf::RpcController* controller, const pb::mds::LookupRequest* request,
@@ -988,7 +1005,12 @@ void MDSServiceImpl::DoBatchCreate(google::protobuf::RpcController*, const pb::m
   }
 
   response->mutable_parent_inode()->Swap(&entry_out.parent_attr);
-  for (auto& attr : entry_out.attrs) response->add_inodes()->Swap(&attr);
+  for (auto& attr : entry_out.attrs) {
+    attr.clear_shard_boundaries();
+    response->add_inodes()->Swap(&attr);
+  }
+
+  response->mutable_parent_inode()->clear_shard_boundaries();
 }
 
 void MDSServiceImpl::BatchCreate(google::protobuf::RpcController* controller,
@@ -1067,6 +1089,9 @@ void MDSServiceImpl::DoMkNod(google::protobuf::RpcController*, const pb::mds::Mk
 
   response->mutable_parent_inode()->Swap(&entry_out.parent_attr);
   response->mutable_inode()->Swap(&entry_out.attr);
+
+  response->mutable_parent_inode()->clear_shard_boundaries();
+  response->mutable_inode()->clear_shard_boundaries();
 }
 
 void MDSServiceImpl::MkNod(google::protobuf::RpcController* controller, const pb::mds::MkNodRequest* request,
@@ -1115,7 +1140,12 @@ void MDSServiceImpl::DoBatchMkNod(google::protobuf::RpcController*, const pb::md
   }
 
   response->mutable_parent_inode()->Swap(&entry_out.parent_attr);
-  for (auto& attr : entry_out.attrs) response->add_inodes()->Swap(&attr);
+  for (auto& attr : entry_out.attrs) {
+    attr.clear_shard_boundaries();
+    response->add_inodes()->Swap(&attr);
+  }
+
+  response->mutable_parent_inode()->clear_shard_boundaries();
 }
 
 void MDSServiceImpl::BatchMkNod(google::protobuf::RpcController* controller, const pb::mds::BatchMkNodRequest* request,
@@ -1181,6 +1211,9 @@ void MDSServiceImpl::DoMkDir(google::protobuf::RpcController*, const pb::mds::Mk
 
   response->mutable_parent_inode()->Swap(&entry_out.parent_attr);
   response->mutable_inode()->Swap(&entry_out.attr);
+
+  response->mutable_parent_inode()->clear_shard_boundaries();
+  response->mutable_inode()->clear_shard_boundaries();
 }
 
 void MDSServiceImpl::MkDir(google::protobuf::RpcController* controller, const pb::mds::MkDirRequest* request,
@@ -1229,7 +1262,12 @@ void MDSServiceImpl::DoBatchMkDir(google::protobuf::RpcController*, const pb::md
   }
 
   response->mutable_parent_inode()->Swap(&entry_out.parent_attr);
-  for (auto& attr : entry_out.attrs) response->add_inodes()->Swap(&attr);
+  for (auto& attr : entry_out.attrs) {
+    attr.clear_shard_boundaries();
+    response->add_inodes()->Swap(&attr);
+  }
+
+  response->mutable_parent_inode()->clear_shard_boundaries();
 }
 
 void MDSServiceImpl::BatchMkDir(google::protobuf::RpcController* controller, const pb::mds::BatchMkDirRequest* request,
@@ -1287,6 +1325,8 @@ void MDSServiceImpl::DoRmDir(google::protobuf::RpcController*, const pb::mds::Rm
 
   response->set_ino(entry_out.attr.ino());
   response->mutable_parent_inode()->Swap(&entry_out.parent_attr);
+
+  response->mutable_parent_inode()->clear_shard_boundaries();
 }
 
 void MDSServiceImpl::RmDir(google::protobuf::RpcController* controller, const pb::mds::RmDirRequest* request,
@@ -1368,7 +1408,6 @@ void MDSServiceImpl::DoOpen(google::protobuf::RpcController*, const pb::mds::Ope
   param.session_id = request->session_id();
   param.flags = request->flags();
   param.is_prefetch_chunk = request->prefetch_chunk();
-  param.is_prefetch_data = request->prefetch_data();
   // index: version map for chunk validation
   for (const auto& cd : request->chunk_descriptors()) {
     param.chunk_version_map.emplace(cd.index(), cd.version());
@@ -1383,9 +1422,9 @@ void MDSServiceImpl::DoOpen(google::protobuf::RpcController*, const pb::mds::Ope
   }
 
   response->mutable_inode()->Swap(&entry_out.attr);
-  Helper::VectorToPbRepeated(entry_out.chunks, response->mutable_chunks());
-  response->set_data(std::move(entry_out.data_out));
-  response->set_data_version(entry_out.data_version);
+  ::dingofs::Helper::VectorToPbRepeated(entry_out.chunks, response->mutable_chunks());
+
+  response->mutable_inode()->clear_shard_boundaries();
 }
 
 void MDSServiceImpl::Open(google::protobuf::RpcController* controller, const pb::mds::OpenRequest* request,
@@ -1473,10 +1512,6 @@ void MDSServiceImpl::DoFlushFile(google::protobuf::RpcController*, const pb::mds
 
   FileSystem::FlushFileParam param{.length = request->length()};
 
-  auto* mut_request = const_cast<pb::mds::FlushFileRequest*>(request);
-  param.data.swap(*mut_request->mutable_data());  // zero copy
-  param.is_final = request->is_final();
-
   EntryWithFileChangeOut entry_out;
   status = file_system->FlushFile(ctx, request->ino(), param, entry_out);
   ServiceHelper::SetResponseInfo(ctx.GetTrace(), response->mutable_info());
@@ -1486,7 +1521,7 @@ void MDSServiceImpl::DoFlushFile(google::protobuf::RpcController*, const pb::mds
   }
 
   response->mutable_inode()->Swap(&entry_out.attr);
-  response->set_shrink_file(entry_out.shrink_file);
+  response->mutable_inode()->clear_shard_boundaries();
 }
 
 void MDSServiceImpl::FlushFile(google::protobuf::RpcController* controller, const pb::mds::FlushFileRequest* request,
@@ -1518,6 +1553,69 @@ void MDSServiceImpl::FlushFile(google::protobuf::RpcController* controller, cons
   RunInQueue(FlushFile, controller, request, response, svr_done, write_worker_set_);
 }
 
+void MDSServiceImpl::DoRollbackFile(google::protobuf::RpcController*, const pb::mds::RollbackFileRequest* request,
+                                    pb::mds::RollbackFileResponse* response, TraceClosure* done) {
+  brpc::ClosureGuard done_guard(done);
+  done->SetQueueWaitTime();
+
+  auto span = StartSpan("MDSServiceImpl::DoRollbackFile", request->info());
+
+  auto file_system = GetFileSystem(request->fs_id());
+  auto status = ValidateRequest(file_system, request, done->GetQueueWaitTimeUs());
+  if (BAIDU_UNLIKELY(!status.ok())) {
+    SpanScope::SetStatus(span, status);
+    return ServiceHelper::SetError(response->mutable_error(), status.error_code(), status.error_str());
+  }
+
+  Context ctx(request->context(), request->info().request_id(), __func__, CalReqType(request));
+
+  FileSystem::RollbackFileParam param{.last_write_length = request->last_write_length(),
+                                      .rollback_to_length = request->rollback_to_length()};
+
+  EntryWithFileChangeOut entry_out;
+  status = file_system->RollbackFile(ctx, request->ino(), param, entry_out);
+  ServiceHelper::SetResponseInfo(ctx.GetTrace(), response->mutable_info());
+  if (BAIDU_UNLIKELY(!status.ok())) {
+    SpanScope::SetStatus(span, status);
+    ServiceHelper::SetError(response->mutable_error(), status.error_code(), status.error_str());
+  }
+
+  response->mutable_inode()->Swap(&entry_out.attr);
+  response->set_shrink_file(entry_out.shrink_file);
+
+  response->mutable_inode()->clear_shard_boundaries();
+}
+
+void MDSServiceImpl::RollbackFile(google::protobuf::RpcController* controller,
+                                  const pb::mds::RollbackFileRequest* request, pb::mds::RollbackFileResponse* response,
+                                  google::protobuf::Closure* done) {
+  auto* svr_done = new ServiceClosure(__func__, done, request, response);
+
+  // validate request
+  auto validate_fn = [&]() -> Status {
+    if (request->fs_id() == 0) {
+      return Status(pb::error::EILLEGAL_PARAMTETER, "fs_id is empty");
+    }
+    if (request->ino() == 0) {
+      return Status(pb::error::EILLEGAL_PARAMTETER, "ino is empty");
+    }
+
+    return Status::OK();
+  };
+
+  auto status = validate_fn();
+  if (BAIDU_UNLIKELY(!status.ok())) {
+    brpc::ClosureGuard done_guard(svr_done);
+    return ServiceHelper::SetError(response->mutable_error(), status.error_code(), status.error_str());
+  }
+
+  // run in place.
+  RunInPlace(RollbackFile, controller, request, response, svr_done);
+
+  // run in queue.
+  RunInQueue(RollbackFile, controller, request, response, svr_done, write_worker_set_);
+}
+
 void MDSServiceImpl::DoLink(google::protobuf::RpcController*, const pb::mds::LinkRequest* request,
                             pb::mds::LinkResponse* response, TraceClosure* done) {
   brpc::ClosureGuard done_guard(done);
@@ -1544,6 +1642,9 @@ void MDSServiceImpl::DoLink(google::protobuf::RpcController*, const pb::mds::Lin
 
   response->mutable_parent_inode()->Swap(&entry_out.parent_attr);
   response->mutable_inode()->Swap(&entry_out.attr);
+
+  response->mutable_parent_inode()->clear_shard_boundaries();
+  response->mutable_inode()->clear_shard_boundaries();
 }
 
 void MDSServiceImpl::Link(google::protobuf::RpcController* controller, const pb::mds::LinkRequest* request,
@@ -1583,6 +1684,9 @@ void MDSServiceImpl::DoUnLink(google::protobuf::RpcController*, const pb::mds::U
 
   response->mutable_parent_inode()->Swap(&entry_out.parent_attr);
   response->mutable_inode()->Swap(&entry_out.attr);
+
+  response->mutable_parent_inode()->clear_shard_boundaries();
+  response->mutable_inode()->clear_shard_boundaries();
 }
 
 void MDSServiceImpl::UnLink(google::protobuf::RpcController* controller, const pb::mds::UnLinkRequest* request,
@@ -1610,14 +1714,20 @@ void MDSServiceImpl::DoBatchUnLink(google::protobuf::RpcController*, const pb::m
   Context ctx(request->context(), request->info().request_id(), __func__, CalReqType(request));
 
   EntriesWithPaOut entry_out;
-  status = file_system->BatchUnLink(ctx, request->parent(), Helper::PbRepeatedToVector(request->names()), entry_out);
+  status = file_system->BatchUnLink(ctx, request->parent(), ::dingofs::Helper::PbRepeatedToVector(request->names()),
+                                    entry_out);
   ServiceHelper::SetResponseInfo(ctx.GetTrace(), response->mutable_info());
   if (BAIDU_UNLIKELY(!status.ok())) {
     ServiceHelper::SetError(response->mutable_error(), status.error_code(), status.error_str());
   }
 
   response->mutable_parent_inode()->Swap(&entry_out.parent_attr);
-  for (auto& attr : entry_out.attrs) response->add_inodes()->Swap(&attr);
+  for (auto& attr : entry_out.attrs) {
+    attr.clear_shard_boundaries();
+    response->add_inodes()->Swap(&attr);
+  }
+
+  response->mutable_parent_inode()->clear_shard_boundaries();
 }
 
 void MDSServiceImpl::BatchUnLink(google::protobuf::RpcController* controller,
@@ -1676,6 +1786,9 @@ void MDSServiceImpl::DoSymlink(google::protobuf::RpcController*, const pb::mds::
 
   response->mutable_parent_inode()->Swap(&entry_out.parent_attr);
   response->mutable_inode()->Swap(&entry_out.attr);
+
+  response->mutable_parent_inode()->clear_shard_boundaries();
+  response->mutable_inode()->clear_shard_boundaries();
 }
 
 void MDSServiceImpl::Symlink(google::protobuf::RpcController* controller, const pb::mds::SymlinkRequest* request,
@@ -1752,6 +1865,8 @@ void MDSServiceImpl::DoGetAttr(google::protobuf::RpcController*, const pb::mds::
   }
 
   response->mutable_inode()->Swap(&entry_out.attr);
+
+  response->mutable_inode()->clear_shard_boundaries();
 }
 
 void MDSServiceImpl::GetAttr(google::protobuf::RpcController* controller, const pb::mds::GetAttrRequest* request,
@@ -1824,7 +1939,9 @@ void MDSServiceImpl::DoSetAttr(google::protobuf::RpcController*, const pb::mds::
   response->mutable_inode()->Swap(&entry_out.attr);
   response->set_shrink_file(entry_out.shrink_file);
   response->set_expand_file(entry_out.expand_file);
-  Helper::VectorToPbRepeated(entry_out.chunks, response->mutable_chunks());
+  ::dingofs::Helper::VectorToPbRepeated(entry_out.chunks, response->mutable_chunks());
+
+  response->mutable_inode()->clear_shard_boundaries();
 }
 
 void MDSServiceImpl::SetAttr(google::protobuf::RpcController* controller, const pb::mds::SetAttrRequest* request,
@@ -1940,6 +2057,8 @@ void MDSServiceImpl::DoSetXAttr(google::protobuf::RpcController*, const pb::mds:
   }
 
   response->mutable_inode()->Swap(&entry_out.attr);
+
+  response->mutable_inode()->clear_shard_boundaries();
 }
 
 void MDSServiceImpl::SetXAttr(google::protobuf::RpcController* controller, const pb::mds::SetXAttrRequest* request,
@@ -1999,6 +2118,8 @@ void MDSServiceImpl::DoRemoveXAttr(google::protobuf::RpcController*, const pb::m
   }
 
   response->mutable_inode()->Swap(&entry_out.attr);
+
+  response->mutable_inode()->clear_shard_boundaries();
 }
 
 void MDSServiceImpl::RemoveXAttr(google::protobuf::RpcController* controller,
@@ -2093,8 +2214,8 @@ void MDSServiceImpl::DoRename(google::protobuf::RpcController*, const pb::mds::R
   param.old_name = request->old_name();
   param.new_parent = request->new_parent();
   param.new_name = request->new_name();
-  param.old_ancestors = Helper::PbRepeatedToVector(request->old_ancestors());
-  param.new_ancestors = Helper::PbRepeatedToVector(request->new_ancestors());
+  param.old_ancestors = ::dingofs::Helper::PbRepeatedToVector(request->old_ancestors());
+  param.new_ancestors = ::dingofs::Helper::PbRepeatedToVector(request->new_ancestors());
 
   FileSystem::RenameResult result;
   status = file_system->CommitRename(ctx, param, result);
@@ -2104,10 +2225,15 @@ void MDSServiceImpl::DoRename(google::protobuf::RpcController*, const pb::mds::R
     return ServiceHelper::SetError(response->mutable_error(), status.error_code(), status.error_str());
   }
 
-  response->set_old_parent_version(result.old_parent_version);
-  response->set_new_parent_version(result.new_parent_version);
-  response->set_child_ino(result.child_ino);
-  response->set_deleted_ino(result.deleted_ino);
+  response->mutable_old_parent_inode()->Swap(&result.old_parent_inode);
+  response->mutable_new_parent_inode()->Swap(&result.new_parent_inode);
+  response->mutable_child_inode()->Swap(&result.child_inode);
+  if (result.deleted_inode.ino() != 0) response->mutable_deleted_inode()->Swap(&result.deleted_inode);
+
+  response->mutable_old_parent_inode()->clear_shard_boundaries();
+  response->mutable_new_parent_inode()->clear_shard_boundaries();
+  response->mutable_child_inode()->clear_shard_boundaries();
+  response->mutable_deleted_inode()->clear_shard_boundaries();
 }
 
 void MDSServiceImpl::Rename(google::protobuf::RpcController* controller, const pb::mds::RenameRequest* request,
@@ -2171,15 +2297,17 @@ void MDSServiceImpl::DoWriteSlice(google::protobuf::RpcController*, const pb::md
 
   Context ctx(request->context(), request->info().request_id(), __func__, CalReqType(request));
 
-  std::vector<ChunkEntry> chunks;
-  status = file_system->WriteSlice(ctx, request->ino(), Helper::PbRepeatedToVector(request->delta_slices()), chunks);
+  EntryWithChunkOut entry_out;
+  status = file_system->WriteSlice(ctx, request->ino(), ::dingofs::Helper::PbRepeatedToVector(request->delta_slices()),
+                                   entry_out);
   ServiceHelper::SetResponseInfo(ctx.GetTrace(), response->mutable_info());
   if (BAIDU_UNLIKELY(!status.ok())) {
     SpanScope::SetStatus(span, status);
     return ServiceHelper::SetError(response->mutable_error(), status.error_code(), status.error_str());
   }
 
-  Helper::VectorToPbRepeated(chunks, response->mutable_chunks());
+  response->mutable_inode()->Swap(&entry_out.attr);
+  ::dingofs::Helper::VectorToPbRepeated(entry_out.chunks, response->mutable_chunks());
 }
 
 void MDSServiceImpl::WriteSlice(google::protobuf::RpcController* controller, const pb::mds::WriteSliceRequest* request,
@@ -2231,15 +2359,15 @@ void MDSServiceImpl::DoReadSlice(google::protobuf::RpcController* controller, co
   Context ctx(request->context(), request->info().request_id(), __func__, CalReqType(request));
 
   std::vector<ChunkEntry> chunks;
-  status =
-      file_system->ReadSlice(ctx, request->ino(), Helper::PbRepeatedToVector(request->chunk_descriptors()), chunks);
+  status = file_system->ReadSlice(ctx, request->ino(),
+                                  ::dingofs::Helper::PbRepeatedToVector(request->chunk_descriptors()), chunks);
   ServiceHelper::SetResponseInfo(ctx.GetTrace(), response->mutable_info());
   if (BAIDU_UNLIKELY(!status.ok())) {
     SpanScope::SetStatus(span, status);
     return ServiceHelper::SetError(response->mutable_error(), status.error_code(), status.error_str());
   }
 
-  Helper::VectorToPbRepeated(chunks, response->mutable_chunks());
+  ::dingofs::Helper::VectorToPbRepeated(chunks, response->mutable_chunks());
 }
 
 void MDSServiceImpl::ReadSlice(google::protobuf::RpcController* controller, const pb::mds::ReadSliceRequest* request,
@@ -2273,6 +2401,71 @@ void MDSServiceImpl::ReadSlice(google::protobuf::RpcController* controller, cons
 
   // run in queue.
   RunInQueue(ReadSlice, controller, request, response, svr_done, read_worker_set_);
+}
+
+void MDSServiceImpl::DoBatchReadSlice(google::protobuf::RpcController*, const pb::mds::BatchReadSliceRequest* request,
+                                      pb::mds::BatchReadSliceResponse* response, TraceClosure* done) {
+  brpc::ClosureGuard done_guard(done);
+  done->SetQueueWaitTime();
+
+  auto span = StartSpan("MDSServiceImpl::DoBatchReadSlice", request->info());
+
+  auto file_system = GetFileSystem(request->fs_id());
+  auto status = ValidateRequest(file_system, request, done->GetQueueWaitTimeUs());
+  if (BAIDU_UNLIKELY(!status.ok())) {
+    SpanScope::SetStatus(span, status);
+    return ServiceHelper::SetError(response->mutable_error(), status.error_code(), status.error_str());
+  }
+
+  Context ctx(request->context(), request->info().request_id(), __func__, CalReqType(request));
+
+  std::vector<pb::mds::BatchReadSliceRequest::Entry> in_entries(request->entries().begin(), request->entries().end());
+  std::vector<pb::mds::BatchReadSliceResponse::Entry> out_entries;
+  status = file_system->BatchReadSlice(ctx, in_entries, out_entries);
+  ServiceHelper::SetResponseInfo(ctx.GetTrace(), response->mutable_info());
+  if (BAIDU_UNLIKELY(!status.ok())) {
+    SpanScope::SetStatus(span, status);
+    return ServiceHelper::SetError(response->mutable_error(), status.error_code(), status.error_str());
+  }
+
+  for (auto& entry : out_entries) {
+    response->add_entries()->Swap(&entry);
+  }
+}
+
+void MDSServiceImpl::BatchReadSlice(google::protobuf::RpcController* controller,
+                                    const pb::mds::BatchReadSliceRequest* request,
+                                    pb::mds::BatchReadSliceResponse* response, google::protobuf::Closure* done) {
+  auto* svr_done = new ServiceClosure(__func__, done, request, response);
+
+  // validate request
+  auto validate_fn = [&]() -> Status {
+    if (request->fs_id() == 0) {
+      return Status(pb::error::EILLEGAL_PARAMTETER, "fs_id is 0");
+    }
+    if (request->entries().empty()) {
+      return Status(pb::error::EILLEGAL_PARAMTETER, "entries is empty");
+    }
+    for (const auto& entry : request->entries()) {
+      if (entry.ino() == 0) {
+        return Status(pb::error::EILLEGAL_PARAMTETER, "ino is 0");
+      }
+    }
+
+    return Status::OK();
+  };
+
+  auto status = validate_fn();
+  if (BAIDU_UNLIKELY(!status.ok())) {
+    brpc::ClosureGuard done_guard(svr_done);
+    return ServiceHelper::SetError(response->mutable_error(), status.error_code(), status.error_str());
+  }
+
+  // run in place.
+  RunInPlace(BatchReadSlice, controller, request, response, svr_done);
+
+  // run in queue.
+  RunInQueue(BatchReadSlice, controller, request, response, svr_done, read_worker_set_);
 }
 
 void MDSServiceImpl::DoCopyFileRange(google::protobuf::RpcController*, const pb::mds::CopyFileRangeRequest* request,
@@ -2311,7 +2504,7 @@ void MDSServiceImpl::DoCopyFileRange(google::protobuf::RpcController*, const pb:
 
   response->set_bytes_copied(entry_out.delta_bytes);
   response->mutable_dst_inode()->Swap(&entry_out.attr);
-  Helper::VectorToPbRepeated(entry_out.chunks, response->mutable_dst_chunks());
+  ::dingofs::Helper::VectorToPbRepeated(entry_out.chunks, response->mutable_dst_chunks());
 }
 
 void MDSServiceImpl::CopyFileRange(google::protobuf::RpcController* controller,
@@ -2375,7 +2568,9 @@ void MDSServiceImpl::DoFallocate(google::protobuf::RpcController*, const pb::mds
   response->mutable_inode()->Swap(&entry_out.attr);
   response->set_shrink_file(entry_out.shrink_file);
   response->set_expand_file(entry_out.expand_file);
-  Helper::VectorToPbRepeated(entry_out.chunks, response->mutable_chunks());
+  ::dingofs::Helper::VectorToPbRepeated(entry_out.chunks, response->mutable_chunks());
+
+  response->mutable_inode()->clear_shard_boundaries();
 }
 
 void MDSServiceImpl::Fallocate(google::protobuf::RpcController* controller, const pb::mds::FallocateRequest* request,
@@ -2433,7 +2628,7 @@ void MDSServiceImpl::DoCompactChunk(google::protobuf::RpcController*, const pb::
       .start_slice_id = request->start_slice_id(),
       .end_pos = request->end_pos(),
       .end_slice_id = request->end_slice_id(),
-      .new_slices = Helper::PbRepeatedToVector(request->new_slices()),
+      .new_slices = ::dingofs::Helper::PbRepeatedToVector(request->new_slices()),
   };
   status = file_system->CompactChunk(ctx, request->ino(), request->chunk_index(), param, chunk);
   ServiceHelper::SetResponseInfo(ctx.GetTrace(), response->mutable_info());
@@ -3103,13 +3298,13 @@ void MDSServiceImpl::DoNotifyBuddy(google::protobuf::RpcController*, const pb::m
                                   message.reason());
       } break;
 
-      case pb::mds::NotifyBuddyRequest::TYPE_CLEAN_PARTITION_CACHE: {
+      case pb::mds::NotifyBuddyRequest::TYPE_REFRESH_PARTITION: {
         auto file_system = GetFileSystem(message.fs_id());
         if (file_system == nullptr) {
           return ServiceHelper::SetError(response->mutable_error(), pb::error::ENOT_FOUND, "fs not found");
         }
 
-        file_system->GetPartitionCache().Delete(message.clean_partition_cache().ino());
+        file_system->GetPartitionCache().Delete(message.refresh_partition().ino());
 
       } break;
 
@@ -3165,7 +3360,7 @@ void MDSServiceImpl::JoinFs(google::protobuf::RpcController* controller, const p
 
   Context ctx(request->context(), request->info().request_id(), __func__);
 
-  std::vector<uint64_t> mds_ids = Helper::PbRepeatedToVector(request->mds_ids());
+  std::vector<uint64_t> mds_ids = ::dingofs::Helper::PbRepeatedToVector(request->mds_ids());
 
   std::string reason = "manual join fs";
   Status status = !request->fs_name().empty() ? file_system_set_->JoinFs(ctx, request->fs_name(), mds_ids, reason)
@@ -3197,7 +3392,7 @@ void MDSServiceImpl::QuitFs(google::protobuf::RpcController* controller, const p
 
   Context ctx(request->context(), request->info().request_id(), __func__);
 
-  std::vector<uint64_t> mds_ids = Helper::PbRepeatedToVector(request->mds_ids());
+  std::vector<uint64_t> mds_ids = ::dingofs::Helper::PbRepeatedToVector(request->mds_ids());
 
   std::string reason = "manual quit fs";
   Status status = !request->fs_name().empty() ? file_system_set_->QuitFs(ctx, request->fs_name(), mds_ids, reason)
@@ -3533,9 +3728,9 @@ void MDSServiceImpl::RestoreFromTrash(google::protobuf::RpcController* controlle
 
   Context ctx(request->context(), request->info().request_id(), __func__);
 
-  auto status = file_system->RestoreFromTrash(ctx, request->trash_parent(), request->trash_name(),
-                                              request->allow_trash_parent(), request->carried_bytes(),
-                                              request->carried_inodes());
+  auto status =
+      file_system->RestoreFromTrash(ctx, request->trash_parent(), request->trash_name(), request->allow_trash_parent(),
+                                    request->carried_bytes(), request->carried_inodes());
   ServiceHelper::SetResponseInfo(ctx.GetTrace(), response->mutable_info());
   if (!status.ok()) {
     return ServiceHelper::SetError(response->mutable_error(), status.error_code(), status.error_str());

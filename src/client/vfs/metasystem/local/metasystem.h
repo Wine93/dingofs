@@ -121,7 +121,8 @@ class LocalMetaSystem : public vfs::MetaSystem {
                uint32_t uid, uint32_t gid, uint32_t mode, uint64_t rdev,
                Attr* attr) override;
 
-  Status Open(ContextSPtr ctx, Ino ino, int flags, uint64_t fh) override;
+  Status Open(ContextSPtr ctx, Ino ino, int flags, uint64_t fh,
+              bool* keep_cache) override;
 
   Status Create(ContextSPtr ctx, Ino parent, const std::string& name,
                 uint32_t uid, uint32_t gid, uint32_t mode, int flags,
@@ -235,6 +236,11 @@ class LocalMetaSystem : public vfs::MetaSystem {
   Status AppendZeroSliceToChunk(uint32_t fs_id, Ino ino, uint64_t chunk_index,
                                 uint32_t chunk_pos, uint32_t len,
                                 std::vector<KeyValue>& kvs);
+  // Append zero slices only to chunks already stored for [offset, end_offset).
+  // KV updates are queued so the caller can commit them with the inode update.
+  Status AppendZeroSlicesToExistingChunks(uint32_t fs_id, Ino ino,
+                                          uint64_t offset, uint64_t end_offset,
+                                          std::vector<KeyValue>& kvs);
 
   const std::string fs_name_;
   const std::string db_path_;

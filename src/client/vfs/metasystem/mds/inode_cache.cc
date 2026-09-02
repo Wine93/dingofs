@@ -58,7 +58,6 @@ bool Inode::PutIf(const AttrEntry& attr) {
   symlink_ = attr.symlink();
   rdev_ = attr.rdev();
   flags_ = attr.flags();
-  maybe_tiny_file_ = attr.maybe_tiny_file();
 
   parents_.clear();
   parents_.insert(parents_.end(), attr.parents().begin(), attr.parents().end());
@@ -118,7 +117,6 @@ Inode::AttrEntry Inode::ToAttrEntry() const {
   attr.set_symlink(symlink_);
   attr.set_rdev(rdev_);
   attr.set_flags(flags_);
-  attr.set_maybe_tiny_file(maybe_tiny_file_);
   for (const auto& parent : parents_) {
     attr.add_parents(parent);
   }
@@ -193,9 +191,9 @@ InodeSPtr InodeCache::Get(Ino ino) {
   return inode;
 }
 
-std::vector<InodeSPtr> InodeCache::Get(const std::vector<uint64_t>& inoes) {
+std::vector<InodeSPtr> InodeCache::Get(const std::vector<uint64_t>& inos) {
   std::vector<InodeSPtr> inodes;
-  for (const auto& ino : inoes) {
+  for (const auto& ino : inos) {
     shard_map_.withRLock(
         [ino, &inodes](Map& map) {
           auto it = map.find(ino);
@@ -212,6 +210,8 @@ std::vector<InodeSPtr> InodeCache::Get(const std::vector<uint64_t>& inoes) {
 }
 
 void InodeCache::CleanExpired(uint64_t expire_s) {
+  if (Size() < FLAGS_vfs_meta_clean_threshold_count) return;
+
   std::vector<InodeSPtr> inodes;
   shard_map_.iterate([&](const Map& map) {
     for (const auto& [_, inode] : map) {
@@ -272,7 +272,6 @@ bool InodeCache::Dump(Json::Value& value) {
     item["mtime"] = inode->Mtime();
     item["atime"] = inode->Atime();
     item["version"] = inode->Version();
-    item["maybe_tiny_file"] = inode->MaybeTinyFile();
 
     // parents
     Json::Value parent_array = Json::arrayValue;
@@ -320,7 +319,6 @@ bool InodeCache::Load(const Json::Value& value) {
     attr.set_mtime(item["mtime"].asUInt64());
     attr.set_atime(item["atime"].asUInt64());
     attr.set_version(item["version"].asUInt64());
-    attr.set_maybe_tiny_file(item["maybe_tiny_file"].asBool());
 
     // parents
     for (const auto& parent : item["parents"]) {

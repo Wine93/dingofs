@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 
+#include "common/helper.h"
 #include "mds/common/helper.h"
 #include "mds/common/synchronization.h"
 #include "tikv/lib.rs.h"
@@ -37,17 +38,10 @@ bool TikvStorage::Init(const std::string& addr) {
   LOG(INFO) << fmt::format("[storage] init tikv storage, addr({}).", addr);
 
   std::vector<std::string> addrs;
-  Helper::SplitString(addr, ',', addrs);
+  dingofs::Helper::SplitString(addr, ',', addrs);
   client_ = new tikv_client::TransactionClient(addrs);
 
   LOG(INFO) << fmt::format("[storage] init tikv storage end, addr({}).", addr);
-
-  return true;
-}
-
-bool TikvStorage::Destroy() {
-  delete client_;
-  client_ = nullptr;
 
   return true;
 }
@@ -239,8 +233,8 @@ Status TikvTxn::DoScan(const Range& range, uint32_t limit, std::vector<KeyValue>
   do {
     try {
       LOG_DEBUG << fmt::format("[storage.{}] scan range[{}, {}), start_key: {}, limit: {}", txn_id_,
-                               Helper::StringToHex(range.start), Helper::StringToHex(range.end),
-                               Helper::StringToHex(start_key), actual_limit);
+                               ::dingofs::Helper::StringToHex(range.start), ::dingofs::Helper::StringToHex(range.end),
+                               ::dingofs::Helper::StringToHex(start_key), actual_limit);
 
       auto kv_pairs = txn_.scan(start_key, Bound::Included, range.end, Bound::Excluded, actual_limit);
       for (auto& kv_pair : kv_pairs) {
@@ -252,7 +246,7 @@ Status TikvTxn::DoScan(const Range& range, uint32_t limit, std::vector<KeyValue>
 
       if (kvs.size() >= limit || kv_pairs.size() < actual_limit) return Status::OK();
 
-      if (!kvs.empty()) start_key = Helper::PrefixNext(kvs.back().key);
+      if (!kvs.empty()) start_key = ::dingofs::Helper::PrefixNext(kvs.back().key);
 
     } catch (const std::exception& e) {
       if (IsOutOfRange(e.what())) {
@@ -529,8 +523,8 @@ Status TikvTxnAsync::DoScan(const Range& range, uint32_t limit, std::vector<KeyV
     Param param(kvs);
     try {
       LOG_DEBUG << fmt::format("[storage.{}] scan range[{}, {}), start_key: {}, limit: {}", txn_id_,
-                               Helper::StringToHex(range.start), Helper::StringToHex(range.end),
-                               Helper::StringToHex(start_key), actual_limit);
+                               ::dingofs::Helper::StringToHex(range.start), ::dingofs::Helper::StringToHex(range.end),
+                               ::dingofs::Helper::StringToHex(start_key), actual_limit);
 
       txn_.scan_async(
           start_key, Bound::Included, range.end, Bound::Excluded, actual_limit,
@@ -564,7 +558,7 @@ Status TikvTxnAsync::DoScan(const Range& range, uint32_t limit, std::vector<KeyV
 
     if (param.error.empty()) {
       if (param.kvs.size() >= limit || param.count < actual_limit) return Status::OK();
-      if (!kvs.empty()) start_key = Helper::PrefixNext(kvs.back().key);
+      if (!kvs.empty()) start_key = ::dingofs::Helper::PrefixNext(kvs.back().key);
 
     } else {
       if (IsOutOfRange(param.error)) {

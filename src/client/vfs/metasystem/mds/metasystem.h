@@ -15,6 +15,8 @@
 #ifndef DINGOFS_SRC_CLIENT_VFS_META_MDS_H_
 #define DINGOFS_SRC_CLIENT_VFS_META_MDS_H_
 
+#include <sys/types.h>
+
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -24,18 +26,20 @@
 #include "client/vfs/common/client_id.h"
 #include "client/vfs/compaction/compactor.h"
 #include "client/vfs/metasystem/mds/batch_processor.h"
+#include "client/vfs/metasystem/mds/block_cache_cleanup.h"
 #include "client/vfs/metasystem/mds/chunk.h"
 #include "client/vfs/metasystem/mds/chunk_memo.h"
 #include "client/vfs/metasystem/mds/compact.h"
+#include "client/vfs/metasystem/mds/dentry_cache.h"
 #include "client/vfs/metasystem/mds/dir_iterator.h"
-#include "client/vfs/metasystem/mds/dir_profile.h"
 #include "client/vfs/metasystem/mds/executor.h"
 #include "client/vfs/metasystem/mds/file_session.h"
 #include "client/vfs/metasystem/mds/id_cache.h"
 #include "client/vfs/metasystem/mds/inode_cache.h"
 #include "client/vfs/metasystem/mds/mds_client.h"
 #include "client/vfs/metasystem/mds/modify_time_memo.h"
-#include "client/vfs/metasystem/mds/tiny_file_data.h"
+#include "client/vfs/metasystem/mds/statistics.h"
+#include "client/vfs/metasystem/mds/warmup.h"
 #include "client/vfs/metasystem/meta_system.h"
 #include "client/vfs/vfs_meta.h"
 #include "common/status.h"
@@ -45,7 +49,6 @@
 #include "json/value.h"
 #include "mds/common/crontab.h"
 #include "mds/common/type.h"
-#include "utils/concurrent/concurrent.h"
 
 namespace dingofs {
 namespace client {
@@ -91,6 +94,7 @@ class MDSMetaSystem : public vfs::MetaSystem {
 
   bool Load(ContextSPtr ctx, const Json::Value& value) override;
 
+  uint32_t GetFsId() { return fs_info_.GetFsId(); }
   mds::FsInfoEntry GetFsInfo() { return fs_info_.Get(); }
 
   Status GetFsInfo(ContextSPtr ctx, FsInfo* fs_info) override;
@@ -108,9 +112,12 @@ class MDSMetaSystem : public vfs::MetaSystem {
                uint32_t uid, uint32_t gid, uint32_t mode, uint64_t rdev,
                Attr* attr) override;
 
-  Status Open(ContextSPtr ctx, Ino ino, int flags, uint64_t fh) override;
+  Status Open(ContextSPtr ctx, Ino ino, int flags, uint64_t fh,
+              bool* keep_cache) override;
 
   Status Flush(ContextSPtr ctx, Ino ino, uint64_t fh) override;
+
+  Status RollbackFile(ContextSPtr ctx, Ino ino, uint64_t fh) override;
 
   Status Close(ContextSPtr ctx, Ino ino, uint64_t fh) override;
 
@@ -123,10 +130,6 @@ class MDSMetaSystem : public vfs::MetaSystem {
                     const std::vector<Slice>& slices) override;
   Status Write(ContextSPtr ctx, Ino ino, const char* buf, uint64_t offset,
                uint64_t size, uint64_t fh) override;
-
-  Status Read(ContextSPtr ctx, Ino ino, uint64_t fh, uint64_t offset,
-              uint64_t size, ::dingofs::client::DataBuffer& data_buffer,
-              uint64_t& out_rsize) override;
 
   Status MkDir(ContextSPtr ctx, Ino parent, const std::string& name,
                uint32_t uid, uint32_t gid, uint32_t mode, Attr* attr) override;
@@ -177,12 +180,24 @@ class MDSMetaSystem : public vfs::MetaSystem {
 
   bool GetDescription(Json::Value& value) override;
 
+  void SetBlockStore(BlockStore* block_store) override {
+    block_cache_cleaner_.SetBlockStore(block_store);
+    warmup_processor_.SetEnableBlockCache(block_store->EnableCache());
+  }
+
   void SetWarmupManager(WarmupManager* warmup_manager) override {
     warmup_manager_ = warmup_manager;
+    warmup_processor_.SetWarmupManager(warmup_manager);
   }
 
  private:
   friend class OpenTask;
+  friend class MDSMetaSystemTestPeer;
+
+  MDSClient& GetMDSClient() { return mds_client_; }
+  ChunkMemo& GetChunkMemo() { return chunk_memo_; }
+  ReadChunkCache& GetReadChunkCache() { return read_chunk_cache_; }
+  DentryCache& GetDentryCache() { return dentry_cache_; }
 
   // Convert the backend-specific mds::FsInfoEntry into the backend-agnostic
   // vfs::FsInfo consumed by upper layers (GetFsInfo).
@@ -197,48 +212,54 @@ class MDSMetaSystem : public vfs::MetaSystem {
   // Refresh the cached fs_info from MDS. Driven by the heartbeat when MDS
   // reports a newer fs version.
   void RefreshCachedFsInfo();
-  void CleanExpiredModifyTimeMemo();
-  void CleanExpiredChunkMemo();
-  void CleanExpiredInodeCache();
-  void CleanExpiredTinyFileDataCache();
-  void CleanExpiredDirProfileCache();
+  void CleanExpired();
 
   bool InitCrontab();
 
   // inode cache
-  InodeSPtr PutInodeToCache(const AttrEntry& attr_entry) {
-    return inode_cache_.Put(attr_entry.ino(), attr_entry);
-  }
+  Status FetchInode(ContextSPtr& ctx, Ino ino, InodeSPtr& inode);
+  InodeSPtr PutInodeToCache(const AttrEntry& attr_entry);
   void DeleteInodeFromCache(Ino ino) { inode_cache_.Delete(ino); }
   InodeSPtr GetInodeFromCache(Ino ino) { return inode_cache_.Get(ino); }
-  InodeSPtr GetInode(FileSessionSPtr& file_session) {
-    auto inode = file_session->GetInode();
-    if (inode != nullptr) return inode;
+  InodeSPtr GetInode(FileSessionSPtr& file_session, const std::string& reason);
+  Status GetInode(Ino ino, const std::string& reason, InodeSPtr& inode);
 
-    return inode_cache_.Get(file_session->GetIno());
+  // dentry cache
+  void PutDentryToCache(Ino parent, const std::string& name, Ino ino) {
+    dentry_cache_.Put(parent, name, ino);
+  }
+  void DeleteDentryFromCache(Ino parent, const std::string& name) {
+    dentry_cache_.Delete(parent, name);
+  }
+  Ino GetDentryFromCache(Ino parent, const std::string& name) {
+    return dentry_cache_.Get(parent, name);
   }
 
-  // chunk cache
-  Status DoFlushFile(ContextSPtr ctx, InodeSPtr inode, ChunkSetSPtr& chunk_set,
-                     bool is_final);
+  // file
+  Status DoFlushFile(ContextSPtr ctx, InodeSPtr inode, ChunkSetSPtr& chunk_set);
   void LaunchWriteSlice(ContextSPtr& ctx, ChunkSetSPtr chunk_set,
                         CommitTaskSPtr task);
   // async flush batch slices of single file
-  void AsyncFlushSlice(ContextSPtr& ctx, ChunkSetSPtr chunk_set, bool is_force,
-                       bool is_wait);
+  Status AsyncFlushSlice(ContextSPtr& ctx, ChunkSetSPtr chunk_set,
+                         bool is_force, bool is_wait);
 
   // flush slices and file
   Status FlushSliceAndFile(ContextSPtr ctx, Ino ino);
-  // async flush of single slice
-  void AsyncFlushFile(ContextSPtr ctx, Ino ino);
   // flush slices of all files (called internally by Stop)
   void FlushAllFile();
+
+  bool GetChunkFromReadCache(Ino ino, uint32_t chunk_index,
+                             std::vector<Slice>* slices, uint64_t& version);
+  void DeleteChunkFromReadCache(Ino ino);
 
   Status CorrectAttr(ContextSPtr ctx, uint64_t time_ns, Attr& attr,
                      bool& is_amend, const std::string& caller);
   bool CorrectAttrLength(Attr& attr, const std::string& caller);
 
-  bool IsPrefetchTinyFileData(Ino ino);
+  void ResetFileChunkSet(Ino ino, const std::string& reason);
+  // invalidate file session's read cache, called when mtime changed
+  void InvalidateFileSessionReadCache(Ino ino);
+
   Status DoOpen(ContextSPtr ctx, Ino ino, int flags, uint64_t fh,
                 const std::string& session_id, FileSessionSPtr file_session);
   void AsyncOpen(ContextSPtr ctx, Ino ino, int flags, uint64_t fh,
@@ -247,8 +268,13 @@ class MDSMetaSystem : public vfs::MetaSystem {
   void AsyncClose(ContextSPtr ctx, Ino ino, uint64_t fh,
                   const std::string& session_id);
 
-  DirProfileSPtr GetDirProfile(Ino ino);
-  void WarmupSmallFiles(const std::vector<Ino>& inoes);
+  // dir stats
+  DirAccessStatsSPtr GetAccessStats(Ino ino) {
+    return access_stats_map_.GetOrCreate(ino);
+  }
+  void IncLookupCount(Ino ino, Ino child_ino);
+  void IncOpenDirCount(Ino ino);
+  void IncOpenCount(Ino ino, bool is_readonly);
 
   // batch operation
   Status RunOperation(OperationSPtr operation);
@@ -263,6 +289,9 @@ class MDSMetaSystem : public vfs::MetaSystem {
   mds::FsInfo fs_info_;
 
   Executor executor_;
+  // Background executor for async tasks, such as compaction, block cache
+  // cleanup, etc.
+  Executor bg_executor_;
 
   MDSClient mds_client_;
 
@@ -276,10 +305,7 @@ class MDSMetaSystem : public vfs::MetaSystem {
 
   IdCache id_cache_;
   InodeCache inode_cache_;
-
-  TinyFileDataCache tiny_file_data_cache_;
-
-  DirProfileCacheUPtr dir_profile_cache_;
+  DentryCache dentry_cache_;
 
   WarmupManager* warmup_manager_{nullptr};
 
@@ -288,11 +314,19 @@ class MDSMetaSystem : public vfs::MetaSystem {
   // This is manage crontab, like heartbeat.
   mds::CrontabManager crontab_manager_;
 
+  Compactor& compactor_;
+
   BatchProcessor batch_processor_;
 
   CompactProcessor compact_processor_;
 
-  Compactor& compactor_;
+  BlockCacheCleaner block_cache_cleaner_;
+
+  ReadChunkCache read_chunk_cache_;
+
+  AccessStatsMap access_stats_map_;
+
+  WarmupProcessor warmup_processor_;
 
   std::atomic<bool> stopped_{false};
 };

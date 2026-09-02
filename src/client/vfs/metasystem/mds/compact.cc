@@ -14,6 +14,8 @@
 
 #include "client/vfs/metasystem/mds/compact.h"
 
+#include <absl/hash/hash.h>
+
 #include "fmt/format.h"
 #include "glog/logging.h"
 
@@ -24,10 +26,7 @@ namespace meta {
 
 const std::string kCompactWorkerSetName = "compact_worker_set";
 
-DEFINE_uint32(vfs_compact_worker_num, 8, "number of compact workers");
-DEFINE_uint32(vfs_compact_worker_max_pending_num, 8096,
-              "compact worker max pending num");
-DEFINE_bool(vfs_compact_worker_use_pthread, true, "compact worker use pthread");
+constexpr size_t kCompactedVersionMemoMaxSize = 1024 * 1024;  // 1M
 
 void CompactChunkTask::Run() {
   if (compact_processor_.IsStopped() || IsDeleted()) {
@@ -51,7 +50,46 @@ void CompactChunkTask::Run() {
   Signal();
 }
 
+void CompactChunkTask::TryCleanupUncommittedSlices(
+    const std::vector<Slice>& old_slices,
+    const std::vector<Slice>& new_slices) {
+  auto& compactor = compact_processor_.GetCompactor();
+
+  // Cleanup uncommitted slices that are not in the new_slices list
+  std::vector<Slice> pure_new_slices;
+  for (const auto& slice : new_slices) {
+    if (slice.id == 0) continue;
+
+    bool is_old_slice = false;
+    for (const auto& old_slice : old_slices) {
+      if (slice.id == old_slice.id) {
+        is_old_slice = true;
+        break;
+      }
+    }
+    if (!is_old_slice) pure_new_slices.push_back(slice);
+  }
+
+  if (pure_new_slices.empty()) return;
+
+  ContextSPtr ctx = std::make_shared<Context>("");
+  Status status = compactor.CleanupUncommittedSlices(ctx, pure_new_slices);
+  if (!status.ok()) {
+    LOG(ERROR) << fmt::format(
+        "[meta.compact.{}.{}.{}] cleanup slices fail, status({}).", ino_,
+        chunk_->GetIndex(), Id(), status.ToString());
+
+  } else {
+    LOG_DEBUG << fmt::format(
+        "[meta.compact.{}.{}.{}] cleanup slices success, slices({}).", ino_,
+        chunk_->GetIndex(), Id(), Helper::ToString(pure_new_slices));
+  }
+}
+
 Status CompactChunkTask::Compact() {
+  auto& mds_client = compact_processor_.GetMDSClient();
+  auto& compactor = compact_processor_.GetCompactor();
+
   const uint32_t chunk_index = chunk_->GetIndex();
 
   auto status = chunk_->IsNeedCompaction(false);
@@ -59,28 +97,25 @@ Status CompactChunkTask::Compact() {
 
   // do compact
   uint64_t version = 0;
-  auto old_slices = chunk_->GetCommitedSlice(version);
+  std::vector<Slice> old_slices = chunk_->GetCommitedSlice(version);
   if (old_slices.empty()) return Status::OK();
 
-  LOG(INFO) << fmt::format(
-      "[meta.compact.{}.{}.{}] do compact chunk, old_slices({}) version({}).",
-      ino_, chunk_index, Id(), old_slices.size(), version);
+  // check version
+  uint64_t compacted_version =
+      compact_processor_.GetCompactedVersion(ino_, chunk_index);
+  if (version <= compacted_version) {
+    return Status::NotFit(
+        fmt::format("stale version, {}<={}", version, compacted_version));
+  }
 
   std::vector<Slice> new_slices;
   ContextSPtr ctx = std::make_shared<Context>("");
-  status = compactor_.Compact(ctx, ino_, chunk_index, old_slices, new_slices);
+  status = compactor.Compact(ctx, ino_, chunk_index, old_slices, new_slices);
   if (!status.ok()) return status;
-  if (IsDeleted()) return Status::OK();
-  if (new_slices.empty()) {
-    // All slices were skipped, so there is no valid non-empty replacement for
-    // MDS CompactChunk (the server requires new_slices to be non-empty). Leave
-    // the chunk unchanged instead of sending an invalid request. A chunk made
-    // entirely of skippable slices (for example, repeated equivalent id=0
-    // holes) therefore remains compaction-eligible and may be reconsidered
-    // after the compaction interval. This is intentionally deferred: fixing it
-    // requires either version-scoped NotFit suppression in Chunk or an MDS
-    // metadata-only compaction that preserves sparse holes without SliceWriter.
-    return Status::NotFit("all slices skipped");
+  if (new_slices.empty()) return Status::NotFit("all slices skipped");
+  if (IsDeleted()) {
+    TryCleanupUncommittedSlices(old_slices, new_slices);
+    return Status::OK();
   }
 
   MDSClient::CompactChunkParam param;
@@ -89,63 +124,62 @@ Status CompactChunkTask::Compact() {
   param.start_slice_id = old_slices.front().id;
   param.end_pos = old_slices.size() - 1;
   param.end_slice_id = old_slices.back().id;
-
   for (auto& slice : new_slices) {
     param.new_slices.push_back(Helper::ToSlice(slice));
   }
 
   mds::ChunkEntry chunk_entry;
-  status = mds_client_.CompactChunk(ctx, ino_, chunk_->GetIndex(), param,
-                                    chunk_entry);
-  if (!status.ok() && !status.IsInvalidParam() && !status.IsTimeout()) {
-    return status;
+  status = mds_client.CompactChunk(ctx, ino_, chunk_->GetIndex(), param,
+                                   chunk_entry);
+  if (!status.ok() && !status.IsTimeout() && !status.IsNetError() &&
+      !status.IsIoError()) {
+    TryCleanupUncommittedSlices(old_slices, new_slices);
   }
 
-  if (status.IsTimeout()) chunk_->SetNotCompleted();
+  if (status.IsTimeout()) {
+    chunk_->SetNotCompleted();
 
-  bool extra_local_compact = false;
-  if (chunk_entry.version() > version && !chunk_->Put(chunk_entry, "compact")) {
-    if (status.ok()) {
-      extra_local_compact =
-          chunk_->Compact(param.start_pos, param.start_slice_id, param.end_pos,
-                          param.end_slice_id, new_slices);
+  } else if (status.ok() || status.IsInvalidParam()) {
+    bool extra_local_compact = false;
+    if (chunk_entry.version() > version &&
+        !chunk_->Put(chunk_entry, "compact")) {
+      if (status.ok()) {
+        extra_local_compact = chunk_->Compact(old_slices, new_slices);
+      }
     }
-  }
 
-  LOG(INFO) << fmt::format(
-      "[meta.compact.{}.{}.{}] do compact chunk finish, version({}->{}) "
-      "old_slice({}|{}|{}) new_slices({}) final_slices({}) extra({}) "
-      "status({}).",
-      ino_, chunk_index, Id(), version, chunk_entry.version(),
-      param.start_slice_id, param.end_slice_id, old_slices.size(),
-      Helper::ToString(new_slices), chunk_entry.slices_size(),
-      extra_local_compact, status.ToString());
+    compact_processor_.UpdateComapctedVersion(ino_, chunk_index,
+                                              chunk_entry.version());
+
+    LOG(INFO) << fmt::format(
+        "[meta.compact.{}.{}.{}] do compact chunk finish, version({}->{}) "
+        "old_slice({}|{}|{}) new_slices({}) final_slices({}) extra({}) "
+        "status({}).",
+        ino_, chunk_index, Id(), version, chunk_entry.version(),
+        param.start_slice_id, param.end_slice_id, old_slices.size(),
+        Helper::ToString(new_slices), chunk_entry.slices_size(),
+        extra_local_compact, status.ToString());
+  }
 
   return status;
 }
 
-CompactProcessor::CompactProcessor()
-    : executor_(kCompactWorkerSetName, FLAGS_vfs_compact_worker_num,
-                FLAGS_vfs_compact_worker_max_pending_num,
-                FLAGS_vfs_compact_worker_use_pthread) {}
+void CompactProcessor::Stop() { is_stopped_.store(true); }
 
-bool CompactProcessor::Init() { return executor_.Init(); }
+Status CompactProcessor::Execute(Ino ino, InodeSPtr inode, ChunkSPtr& chunk,
+                                 bool is_async) {
+  if (IsStopped()) return Status::OK();
 
-void CompactProcessor::Stop() {
-  is_stopped_.store(true);
+  auto task = CompactChunkTask::New(ino, inode, chunk, *this);
 
-  executor_.Stop();
-}
-
-Status CompactProcessor::LaunchCompact(Ino ino, InodeSPtr inode,
-                                       ChunkSPtr& chunk, MDSClient& mds_client,
-                                       Compactor& compactor, bool is_async) {
-  auto task =
-      CompactChunkTask::New(ino, inode, chunk, mds_client, compactor, *this);
-
-  int64_t hash_id = ino + chunk->GetIndex();
+  int64_t hash_id = absl::HashOf(ino, chunk->GetIndex());
   if (!executor_.ExecuteByHash(hash_id, task, false)) {
-    return Status::Internal("commit compact task fail");
+    LOG(WARNING) << fmt::format(
+        "[meta.compact.{}.{}] commit compact task fail, beyond max pending "
+        "num.",
+        ino, chunk->GetIndex());
+
+    return Status::Internal("commit compact task fail, beyond max pending num");
   }
 
   if (!is_async) {
@@ -155,6 +189,44 @@ Status CompactProcessor::LaunchCompact(Ino ino, InodeSPtr inode,
   }
 
   return Status::OK();
+}
+
+uint64_t CompactProcessor::GetCompactedVersion(Ino ino, uint32_t chunk_index) {
+  utils::ReadLockGuard guard(lock_);
+
+  const std::string key = fmt::format("{}:{}", ino, chunk_index);
+  auto it = compacted_version_memo_.find(key);
+  return (it != compacted_version_memo_.end()) ? it->second.version : 0;
+}
+
+void CompactProcessor::UpdateComapctedVersion(Ino ino, uint32_t chunk_index,
+                                              uint64_t version) {
+  utils::WriteLockGuard guard(lock_);
+
+  const std::string key = fmt::format("{}:{}", ino, chunk_index);
+  auto [it, inserted] = compacted_version_memo_.try_emplace(
+      key, Value{.version = version, .last_active_time_s = utils::Timestamp()});
+  if (!inserted && it->second.version < version) {
+    it->second.version = version;
+    it->second.last_active_time_s = utils::Timestamp();
+  }
+}
+
+void CompactProcessor::CleanExpired(uint64_t expire_time_s) {
+  utils::WriteLockGuard guard(lock_);
+
+  if (compacted_version_memo_.size() < kCompactedVersionMemoMaxSize) return;
+
+  for (auto it = compacted_version_memo_.begin();
+       it != compacted_version_memo_.end();) {
+    if (it->second.last_active_time_s < expire_time_s) {
+      auto tmp = it++;
+      compacted_version_memo_.erase(tmp);
+
+    } else {
+      ++it;
+    }
+  }
 }
 
 }  // namespace meta

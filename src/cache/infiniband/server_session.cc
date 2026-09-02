@@ -34,6 +34,7 @@
 #include <utility>
 #include <vector>
 
+#include "cache/common/slab_pool.h"
 #include "cache/infiniband/common.h"
 #include "cache/infiniband/connection.h"
 #include "cache/infiniband/controller.h"
@@ -59,8 +60,16 @@ ServerSession::ServerSession(ConnectionUPtr conn, ServiceHub* service_hub)
       request_parser_(std::make_unique<RequestParser>(service_hub)),
       body_reader_(std::make_unique<BodyReader>(conn_.get())),
       response_serializer_(std::make_unique<ResponseSerializer>()),
-      response_sender_(std::make_unique<ResponseSender>(conn_.get())),
-      joiner_(std::make_unique<iutil::BthreadJoiner>()) {}
+      response_sender_(std::make_unique<ResponseSender>(conn_.get())) {
+  keepalive_context_.on_completion = [this](const WorkCompletion&) {
+    ReleaseKeepalive();
+  };
+}
+
+ServerSession::~ServerSession() {
+  DCHECK(closed_.load(std::memory_order_relaxed))
+      << "ServerSession destroyed before Shutdown()";
+}
 
 Status ServerSession::Start() {
   bthread::ExecutionQueueOptions options;
@@ -69,23 +78,63 @@ Status ServerSession::Start() {
                                              HandleWorkCompletion, this))
       << "Fail to start ExecutionQueue for handle work completion";
 
-  joiner_->Start();
-
   return OnEstablished();
 }
 
 void ServerSession::Shutdown() {
+  if (closed_.exchange(true, std::memory_order_acq_rel)) {
+    return;
+  }
+
+  broken_.store(true, std::memory_order_relaxed);
+  auto status = conn_->GetQueuePair()->ModifyQpToError();
+  LOG_IF(WARNING, !status.ok()) << "Fail to fence " << *conn_->GetQueuePair()
+                                << ": " << status.ToString();
+
+  gate_.Close();
+
   GetGlobalEventDispatcher(conn_->GetFd()).DelEvent(conn_->GetFd());
 
   CHECK_EQ(0, bthread::execution_queue_stop(queue_id_));
   CHECK_EQ(0, bthread::execution_queue_join(queue_id_));
 
-  joiner_->Shutdown();
+  LOG(INFO) << "Shutdown server session: " << *conn_->GetQueuePair();
+}
+
+void ServerSession::SendKeepalive() {
+  if (IsBroken() ||
+      keepalive_inflight_.exchange(true, std::memory_order_acq_rel)) {
+    return;
+  }
+
+  keepalive_buffer_ = conn_->GetSendBufferPool()->Alloc();
+  if (keepalive_buffer_ == nullptr) {
+    keepalive_inflight_.store(false, std::memory_order_release);
+    return;
+  }
+
+  pb::infiniband::ResponseMeta meta;
+  auto status =
+      Protocol::SerializeResponse(0, meta, nullptr, keepalive_buffer_);
+  if (status.ok()) {
+    SendWorkRequest wr;
+    wr.opcode = OpCode::kSend;
+    wr.addr = reinterpret_cast<uint64_t>(keepalive_buffer_->data);
+    wr.length = keepalive_buffer_->length;
+    wr.lkey = keepalive_buffer_->lkey;
+    wr.signaled = true;
+    wr.ctx = &keepalive_context_;
+    status = conn_->PostSendWorkRequest(wr);
+  }
+
+  if (!status.ok()) {
+    ReleaseKeepalive();
+    MarkBroken(status);
+  }
 }
 
 void ServerSession::HandleEvent() {
   conn_->HandleCompletion([this](WorkCompletions cqes) {
-    // TODO: close graceful
     int rc = bthread::execution_queue_execute(queue_id_, cqes);
     LOG_IF(WARNING, rc != 0) << "Drop " << cqes.size()
                              << " work completions: execution queue stopped";
@@ -101,6 +150,10 @@ int ServerSession::HandleWorkCompletion(
   auto* session = static_cast<ServerSession*>(meta);
   for (; iter; iter++) {
     for (const auto& wc : *iter) {
+      if (!wc.status.ok()) {
+        session->MarkBroken(wc.status);
+      }
+
       auto* ctx = wc.ctx;
       if (ctx && ctx->on_completion) {
         ctx->on_completion(wc);
@@ -108,6 +161,20 @@ int ServerSession::HandleWorkCompletion(
     }
   }
   return 0;
+}
+
+void ServerSession::MarkBroken(const Status& status) {
+  if (broken_.exchange(true, std::memory_order_relaxed)) {
+    return;
+  }
+  LOG(WARNING) << "Server session is broken: " << *conn_->GetQueuePair()
+               << " reason=" << status.ToString();
+}
+
+void ServerSession::ReleaseKeepalive() {
+  conn_->GetSendBufferPool()->Free(keepalive_buffer_);
+  keepalive_buffer_ = nullptr;
+  keepalive_inflight_.store(false, std::memory_order_release);
 }
 
 Status ServerSession::OnEstablished() {
@@ -149,17 +216,18 @@ void ServerSession::PrepRecvWorkRequest(RDMABuffer* recv_buffer,
 
 void ServerSession::OnNewMessage(const WorkCompletion& wc,
                                  RDMABuffer* recv_buffer) {
-  if (!wc.status.ok()) {
-    LOG(ERROR) << "Fail to execute receive work request: "
-               << wc.status.ToString();
+  if (!wc.status.ok() || IsBroken() || !gate_.Enter()) {
     return;
   }
 
   recv_buffer->length = wc.byte_len;
-  auto tid = iutil::RunInBthread(
-      [this, recv_buffer]() { HandleNewMessage(recv_buffer); });
-  if (tid != 0) {
-    joiner_->BackgroundJoin(tid);
+  bool started = iutil::StartBthread([this, recv_buffer]() {
+    HandleNewMessage(recv_buffer);
+    gate_.Leave();
+  });
+  if (!started) {
+    gate_.Leave();
+    MarkBroken(Status::Internal("start request handler failed"));
   }
 }
 
@@ -179,6 +247,10 @@ void ServerSession::HandleNewMessage(RDMABuffer* buffer) {
     size_t size = request_meta.attachment_size();
     ReadAttachment(&cntl, regions, size);
     if (cntl.Failed()) {
+      LOG(ERROR) << "Fail to read request attachment: method="
+                 << request_meta.method_name()
+                 << " correlation_id=" << result.correlation_id
+                 << " error=" << cntl.ErrorText();
       SendResponse(&cntl, result.correlation_id);
       return;
     }
@@ -191,6 +263,16 @@ void ServerSession::HandleNewMessage(RDMABuffer* buffer) {
   if (!cntl.Failed()) {
     attachment.buffer = cntl.response_attachment();
     attachment.dest = request_meta.write_region();
+    auto status =
+        ResponseSender::CheckAttachment(attachment.buffer, attachment.dest);
+    if (!status.ok()) {
+      LOG(ERROR) << "Invalid response attachment: method="
+                 << request_meta.method_name()
+                 << " correlation_id=" << result.correlation_id
+                 << " status=" << status.ToString();
+      SetFailed(&cntl, ErrorCode::ProtocolError, status.ToString());
+      attachment = Attachment();
+    }
   }
   SendResponse(&cntl, result.correlation_id, result.response, attachment);
 }
@@ -215,26 +297,31 @@ void ServerSession::ParseRequest(Controller* cntl, RDMABuffer* buffer,
 void ServerSession::ReadAttachment(Controller* cntl,
                                    const std::vector<Region>& src,
                                    size_t size) {
-  auto* buffer = AllocReadBuffer(size);
-  if (buffer == nullptr) {
+  auto status = BodyReader::CheckSource(src, size);
+  if (!status.ok()) {
+    SetFailed(cntl, ErrorCode::ProtocolError, status.ToString());
+    return;
+  }
+
+  auto lease = GetGlobalSlabPool()->Acquire(size);
+  if (!lease.ok()) {
     SetFailed(cntl, ErrorCode::NoMem, "alloc request attachment buffer failed");
     return;
-  } else if (buffer->lkey == 0) {
+  } else if (lease.lkey() == 0) {
     SetFailed(cntl, ErrorCode::InternalError,
               "request attachment buffer is not registered for rdma");
     return;
   }
 
-  auto status = body_reader_->Read(buffer, src, size);
+  status = body_reader_->Read(lease.data(), lease.lkey(), src, size);
   if (!status.ok()) {
+    MarkBroken(status);
     SetFailed(cntl, ErrorCode::InternalError, status.ToString());
     return;
   }
 
   IOBuffer attachment;
-  attachment.AppendUserDataWithMeta(
-      buffer->data, size, [this, buffer](void*) { FreeReadBuffer(buffer); },
-      buffer->lkey);
+  lease.MoveInto(&attachment, size);
   cntl->request_attachment() = std::move(attachment);
 }
 
@@ -261,7 +348,9 @@ void ServerSession::SendResponse(Controller* cntl, uint64_t correlation_id,
   auto* send_buffer_pool = conn_->GetSendBufferPool();
   auto* send_buffer = send_buffer_pool->Alloc();
   if (send_buffer == nullptr) {
-    LOG(ERROR) << "Fail to send response because send buffer is exhausted";
+    LOG(ERROR) << "Fail to send response because send buffer is exhausted: "
+                  "correlation_id="
+               << correlation_id;
     return;
   }
 
@@ -275,13 +364,14 @@ void ServerSession::SendResponse(Controller* cntl, uint64_t correlation_id,
   ctx.response = response;
   auto status = response_serializer_->Serialize(ctx, send_buffer);
   if (!status.ok()) {
-    LOG(ERROR) << "Fail to send response for serialize response failed";
+    LOG(ERROR) << "Fail to serialize response: correlation_id="
+               << correlation_id << " status=" << status.ToString();
     return;
   }
 
   status = response_sender_->Send(send_buffer, attachment);
   if (!status.ok()) {
-    LOG(ERROR) << "Fail to send response: " << status.ToString();
+    MarkBroken(status);
   }
 }
 

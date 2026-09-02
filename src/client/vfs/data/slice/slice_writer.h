@@ -51,8 +51,9 @@ class SliceWriter : public std::enable_shared_from_this<SliceWriter> {
 
   ~SliceWriter() = default;
 
-  Status Write(ContextSPtr ctx, const char* buf, int32_t size,
-               int32_t chunk_offset);
+  // The lease must own every page needed by this write.
+  void Write(ContextSPtr ctx, const char* buf, int32_t size,
+             int32_t chunk_offset, WritePageLease* lease);
 
   // Should be called only once (protected by ChunkWriter).
   void FlushAsync(StatusCallback cb);
@@ -74,6 +75,10 @@ class SliceWriter : public std::enable_shared_from_this<SliceWriter> {
     std::lock_guard<std::mutex> lg(write_flush_mutex_);
     return len_;
   }
+
+  // Published slice id, or 0 if allocation has not succeeded. Uploads can
+  // only be submitted after an id is published.
+  uint64_t SliceId() const { return slice_id_state_->Get(); }
 
   bool IsFlushCompleted() const {
     return flush_completion_state_->IsCompleted();

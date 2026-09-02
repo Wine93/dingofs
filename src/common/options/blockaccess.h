@@ -26,12 +26,16 @@ namespace blockaccess {
 DECLARE_bool(block_access_logging);
 
 DECLARE_int32(rados_op_timeout);
+DECLARE_bool(rados_map_refresh_enable);
+DECLARE_uint32(rados_map_refresh_interval_s);
+DECLARE_uint32(rados_map_refresh_jitter_pct);
 
 // aws option
 DECLARE_string(s3_region);
 DECLARE_int32(s3_loglevel);
 DECLARE_bool(s3_verify_ssl);
 DECLARE_int32(s3_max_connections);
+DECLARE_int32(s3_crt_throughput_target_gbps);
 DECLARE_int32(s3_connect_timeout);
 DECLARE_int32(s3_request_timeout);
 DECLARE_bool(s3_use_crt_client);
@@ -41,6 +45,7 @@ DECLARE_int32(s3_async_thread_num);
 DECLARE_bool(s3_use_thread_pool);
 DECLARE_bool(s3_use_virtual_address);
 DECLARE_bool(s3_enable_telemetry);
+DECLARE_int32(s3_sdk_max_retries);
 
 DECLARE_bool(use_fake_block_access);
 

@@ -32,6 +32,7 @@ namespace dingofs {
 namespace client {
 namespace vfs {
 
+class BlockStore;
 class WarmupManager;
 
 struct DumpOption {
@@ -79,13 +80,24 @@ class MetaSystem {
                        uint32_t uid, uint32_t gid, uint32_t mode, uint64_t rdev,
                        Attr* attr) = 0;
 
-  virtual Status Open(ContextSPtr ctx, Ino ino, int flags, uint64_t fh) = 0;
+  virtual Status Open(ContextSPtr ctx, Ino ino, int flags, uint64_t fh,
+                      bool* keep_cache) = 0;
 
   virtual Status Create(ContextSPtr ctx, Ino parent, const std::string& name,
                         uint32_t uid, uint32_t gid, uint32_t mode, int flags,
                         Attr* attr, uint64_t fh) = 0;
 
   virtual Status Flush(ContextSPtr ctx, Ino ino, uint64_t fh) = 0;
+
+  // Called when a user-visible data flush fails (ADR-0003): conditionally
+  // roll the file length back to the flush checkpoint, abandoning this round
+  // of writes. Best-effort; backends without rollback support are a no-op.
+  virtual Status RollbackFile(ContextSPtr ctx, Ino ino, uint64_t fh) {
+    (void)ctx;
+    (void)ino;
+    (void)fh;
+    return Status::OK();
+  }
 
   virtual Status Close(ContextSPtr ctx, Ino ino, uint64_t fh) = 0;
 
@@ -231,6 +243,10 @@ class MetaSystem {
 
   virtual bool GetDescription(Json::Value& value) = 0;
   virtual bool GetSummary(Json::Value& value) = 0;
+
+  // Inject the BlockStore owned by VFSHub after both objects exist.
+  // Default is a no-op so non-MDS backends do not need to care.
+  virtual void SetBlockStore(BlockStore* /*block_store*/) {}
 
   // Inject the WarmupManager owned by VFSHub after both objects exist.
   // Default is a no-op so non-MDS backends do not need to care.

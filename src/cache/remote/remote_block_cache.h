@@ -67,6 +67,7 @@ class RemoteBlockCache final : public BlockCache {
   Status Cache(BlockHandle handle, IOBuffer block, CacheOption option) override;
   Status Prefetch(BlockHandle handle, size_t length,
                   PrefetchOption option) override;
+  Status Delete(BlockHandle handle, DeleteOption option) override;
 
   void AsyncPut(BlockHandle handle, IOBuffer block, AsyncCallback cb,
                 PutOption option) override;
@@ -77,12 +78,17 @@ class RemoteBlockCache final : public BlockCache {
                   CacheOption option) override;
   void AsyncPrefetch(BlockHandle handle, size_t length, AsyncCallback cb,
                      PrefetchOption option) override;
+  void AsyncDelete(BlockHandle handle, AsyncCallback cb,
+                   DeleteOption option) override;
 
   // We gurantee that cache node is always enable stage and cache.
   bool IsEnabled() const override { return !FLAGS_cache_group.empty(); }
   bool EnableStage() const override { return IsEnabled(); }
   bool EnableCache() const override { return IsEnabled(); }
-  bool IsCached(const BlockHandle&) const override { return IsEnabled(); }
+  // Whether a block is cached on remote nodes is unknown without an RPC;
+  // answering true here makes callers skip prefetch/warmup entirely, the
+  // cache node itself deduplicates prefetch for already-cached blocks.
+  bool IsCached(const BlockHandle&) const override { return false; }
   bool Dump(Json::Value& value) const override { return cluster_->Dump(value); }
 
  private:

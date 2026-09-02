@@ -48,6 +48,7 @@ class CacheNode {
   Status Put(BlockHandle handle, IOBuffer block);
   Status Range(BlockHandle handle, off_t offset, size_t length,
                IOBuffer* buffer, size_t block_length, bool* cache_hit);
+  Status Delete(BlockHandle handle);
 
   Status AsyncCache(BlockHandle handle, IOBuffer block);
   Status AsyncPrefetch(BlockHandle handle, size_t length);
@@ -69,7 +70,10 @@ class CacheNode {
                             IOBuffer* buffer);
   Status RunTask(StorageClient* storage_client, DownloadTaskSPtr task);
   Status WaitTask(DownloadTaskSPtr task);
-  void AllocSlabBuffer(IOBuffer* buffer, size_t length);
+  Status DownloadBlock(StorageClient* storage_client, const BlockHandle& handle,
+                       off_t offset, size_t length, IOBuffer* buffer);
+  static Status AllocOrdinaryBuffer(IOBuffer* buffer, size_t length);
+  Status AllocSlabBuffer(IOBuffer* buffer, size_t length);
 
  private:
   std::atomic<bool> running_;

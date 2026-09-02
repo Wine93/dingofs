@@ -23,6 +23,12 @@
 namespace dingofs {
 namespace client {
 
+namespace {
+
+bool ValidatePositiveUint64(const char*, uint64_t value) { return value > 0; }
+
+}  // namespace
+
 DEFINE_int32(vfs_bthread_worker_num, 0, "bthread worker num");
 
 // access log
@@ -58,30 +64,17 @@ DEFINE_validator(vfs_meta_access_logging, brpc::PassValidate);
 DEFINE_int64(vfs_meta_access_log_threshold_us, 0, "access log threshold");
 DEFINE_validator(vfs_meta_access_log_threshold_us, brpc::PassValidate);
 
-DEFINE_uint64(vfs_meta_memo_expired_s, 3600, "modify time memo expired time");
-DEFINE_validator(vfs_meta_memo_expired_s, brpc::PassValidate);
+DEFINE_uint32(vfs_meta_clean_threshold_count, 100000,
+              "clean cache threshold count");
+DEFINE_validator(vfs_meta_clean_threshold_count, brpc::PassValidate);
+DEFINE_uint64(vfs_meta_clean_expired_s, 3600, "clean expired cache time");
+DEFINE_validator(vfs_meta_clean_expired_s, brpc::PassValidate);
 
-DEFINE_uint64(vfs_meta_chunk_cache_expired_s, 3600, "chunk cache expired time");
-DEFINE_validator(vfs_meta_chunk_cache_expired_s, brpc::PassValidate);
-
-DEFINE_uint64(vfs_meta_inode_cache_expired_s, 3600, "inode cache expired time");
-DEFINE_validator(vfs_meta_inode_cache_expired_s, brpc::PassValidate);
-
-DEFINE_uint32(vfs_meta_inode_attr_ttl_s, 5,
-              "inode attr freshness ttl, refetch from mds after expired, "
-              "0 means always refetch");
+DEFINE_uint32(vfs_meta_inode_attr_ttl_s, 10, "inode cache ttl seconds");
 DEFINE_validator(vfs_meta_inode_attr_ttl_s, brpc::PassValidate);
 
-DEFINE_uint64(vfs_meta_tiny_file_data_cache_expired_s, 3600,
-              "tiny file data cache expired time");
-DEFINE_validator(vfs_meta_tiny_file_data_cache_expired_s, brpc::PassValidate);
-
-DEFINE_bool(vfs_tiny_file_data_enable, false, "enable vfs meta prefetch data");
-DEFINE_validator(vfs_tiny_file_data_enable, brpc::PassValidate);
-
-DEFINE_uint64(vfs_tiny_file_max_size, 1024 * 1024 * 32,
-              "max size of tiny file");
-DEFINE_validator(vfs_tiny_file_max_size, brpc::PassValidate);
+DEFINE_uint32(vfs_meta_dentry_cache_ttl_s, 10, "dentry cache ttl seconds");
+DEFINE_validator(vfs_meta_dentry_cache_ttl_s, brpc::PassValidate);
 
 DEFINE_int32(vfs_flush_thread, 4, "number of background flush threads");
 DEFINE_validator(vfs_flush_thread, brpc::PassValidate);
@@ -119,6 +112,9 @@ DEFINE_uint32(vfs_prefetch_threads, 8, "number of prefetch threads");
 
 // warmup
 DEFINE_int32(vfs_warmup_threads, 4, "number of warmup threads");
+DEFINE_uint64(vfs_warmup_max_inflight_blocks, 512,
+              "maximum warmup prefetch blocks awaiting callbacks");
+DEFINE_validator(vfs_warmup_max_inflight_blocks, ValidatePositiveUint64);
 
 // vfs handle
 // read_cleanup runs only low-frequency reader-side housekeeping (async
@@ -152,32 +148,20 @@ DEFINE_int64(vfs_warmup_trigger_restart_interval_secs, 1800,
              "passive warmup restart interval");
 DEFINE_validator(vfs_warmup_trigger_restart_interval_secs, brpc::PassValidate);
 
-// dir-warmup: drive bulk intime prefetch from per-directory profile built
-// during ReadDir. Triggered on Open against the parent directory profile.
-DEFINE_bool(vfs_meta_warmup_small_file_enable, false,
+// vfs warmup small file(data/inode/dentry)
+DEFINE_bool(vfs_meta_warmup_small_file_enable, true,
             "enable directory-profile driven warmup on open");
 DEFINE_validator(vfs_meta_warmup_small_file_enable, brpc::PassValidate);
-
-DEFINE_uint32(vfs_meta_warmup_small_file_batch_size, 256,
-              "batch size of inos to warm up per trigger");
-DEFINE_validator(vfs_meta_warmup_small_file_batch_size, brpc::PassValidate);
-
-DEFINE_uint32(vfs_meta_warmup_small_file_ttl_s, 600,
-              "DirProfile TTL in seconds (Tprofile)");
-DEFINE_validator(vfs_meta_warmup_small_file_ttl_s, brpc::PassValidate);
 
 // vfs meta
 
 DEFINE_uint32(vfs_meta_read_dir_batch_size, 1024, "read dir batch size.");
+DEFINE_bool(vfs_meta_use_rdma, false, "use RDMA for MDS RPC");
 DEFINE_uint32(vfs_meta_rpc_timeout_ms, 10000, "rpc timeout ms");
 DEFINE_validator(vfs_meta_rpc_timeout_ms, brpc::PassValidate);
 
 DEFINE_int32(vfs_meta_rpc_retry_times, 8, "rpc retry time");
 DEFINE_validator(vfs_meta_rpc_retry_times, brpc::PassValidate);
-
-DEFINE_bool(vfs_meta_batch_operation_enable, false,
-            "enable batch operation, default is false");
-DEFINE_validator(vfs_meta_batch_operation_enable, brpc::PassValidate);
 
 DEFINE_uint32(vfs_meta_batch_operation_merge_delay_us, 10,
               "batch operation merge delay us.");
@@ -224,6 +208,19 @@ DEFINE_bool(
     fuse_enable_parallel_dirops, true,
     "enable parallel lookup and readdir requests in the same directory");
 DEFINE_validator(fuse_enable_parallel_dirops, brpc::PassValidate);
+
+// Disabled by default: the KILLPRIV_V2 contract (filesystem clears
+// suid/sgid/security.capability on write/truncate/open(O_TRUNC)) is not
+// implemented, and libfuse does not even forward FUSE_WRITE_KILL_SUIDGID /
+// FUSE_OPEN_KILL_SUIDGID to the write/open callbacks. Enabling it makes the
+// kernel skip its own privilege removal, so suid/sgid bits survive writes by
+// non-owners (pjdfstest chmod/12.t). With v2 off, the kernel clears the bits
+// itself via setattr(FATTR_KILL_SUIDGID), which FuseOpSetAttr translates
+// into a mode update.
+DEFINE_bool(fuse_enable_handle_killpriv_v2, false,
+            "filesystem handles killing suid/sgid/cap on write/truncate/open, "
+            "avoids kernel getxattr(security.capability) before every write");
+DEFINE_validator(fuse_enable_handle_killpriv_v2, brpc::PassValidate);
 
 DEFINE_int32(fuse_max_readahead_kb, 131072,
              "maximum number of bytes that the kernel will read ahead");

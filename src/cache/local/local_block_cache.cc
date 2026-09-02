@@ -217,6 +217,16 @@ Status LocalBlockCache::Prefetch(BlockHandle handle, size_t length,
   return status;
 }
 
+Status LocalBlockCache::Delete(BlockHandle handle, DeleteOption /*option*/) {
+  DCHECK_RUNNING("LocalBlockCache");
+
+  auto status = store_->Delete(handle);
+  if (!status.ok()) {
+    LOG(ERROR) << "Fail to delete block key=" << handle.Filename();
+  }
+  return status;
+}
+
 void LocalBlockCache::AsyncPut(BlockHandle handle, IOBuffer block,
                                AsyncCallback cb, PutOption option) {
   DCHECK_RUNNING("LocalBlockCache");
@@ -288,6 +298,15 @@ void LocalBlockCache::AsyncPrefetch(BlockHandle handle, size_t length,
                                     AsyncCallback cb, PrefetchOption option) {
   DCHECK_RUNNING("LocalBlockCache");
 
+  // Fast path: already-cached block needs no bthread, Prefetch() rechecks
+  // for requests that raced past here before the block was cached.
+  if (IsCached(handle)) {
+    if (cb) {
+      cb(Status::OK());
+    }
+    return;
+  }
+
   auto tracker = prefetch_tracker_;
   auto status = tracker->Add(handle.Filename());
   if (status.IsExist()) {
@@ -305,6 +324,24 @@ void LocalBlockCache::AsyncPrefetch(BlockHandle handle, size_t length,
           cb(status);
         }
         tracker->Remove(handle.Filename());
+      });
+
+  if (tid != 0) {
+    joiner_->BackgroundJoin(tid);
+  }
+}
+
+void LocalBlockCache::AsyncDelete(BlockHandle handle, AsyncCallback cb,
+                                  DeleteOption option) {
+  DCHECK_RUNNING("LocalBlockCache");
+
+  auto* self = GetSelfPtr();
+  auto tid = iutil::RunInBthread(
+      [self, handle = std::move(handle), cb, option]() mutable {
+        Status status = self->Delete(std::move(handle), option);
+        if (cb) {
+          cb(status);
+        }
       });
 
   if (tid != 0) {

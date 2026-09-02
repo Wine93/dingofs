@@ -24,17 +24,13 @@ template void RenameTask<FileSystem::RenameParam>::Run();
 
 template <typename T>
 void RenameTask<T>::Run() {
-  FileSystem::RenameResult out;
+  RenameResult out;
   auto status = fs_->Rename(*ctx_, param_, out);
 
   if (cb_ != nullptr) {
     cb_(status);
   } else {
-    old_parent_version_ = out.old_parent_version;
-    new_parent_version_ = out.new_parent_version;
-    child_ino_ = out.child_ino;
-    deleted_ino_ = out.deleted_ino;
-
+    result_ = std::move(out);
     status_ = status;
     Signal();
   }
@@ -45,9 +41,9 @@ bool Renamer::Init() {
   return worker_->Init();
 }
 
-bool Renamer::Destroy() {
+bool Renamer::Stop() {
   if (worker_) {
-    worker_->Destroy();
+    worker_->Stop();
   }
 
   return true;

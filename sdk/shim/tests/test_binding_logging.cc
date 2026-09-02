@@ -26,6 +26,9 @@
  *   conf_file log_dir : logs written to path from conf_file
  *   no log_dir set    : logs written to /tmp (matches glog's own default)
  *
+ * Group 3 — startup configuration ordering (1 case)
+ *   trace conf flags : TraceManager captures flags after conf_file is loaded
+ *
  * --- Subprocess design ---
  * DingoFS registers spdlog loggers once per process at BindingClient
  * construction time.  Creating a second instance in the same process
@@ -47,6 +50,8 @@
 #include <glog/logging.h>
 
 #include "binding_client.h"
+#include "common/options/common.h"
+#include "common/sync_point.h"
 
 using dingofs::client::BindingClient;
 using dingofs::client::BindingConfig;
@@ -250,7 +255,7 @@ static void test_log_dir_from_conf_file() {
 
 /* Case 3: neither config.log_dir nor conf_file sets log_dir.
  * Expected: logs go to /tmp, matching glog's own default.
- * We must NOT see logs in ~/.dingofs/log/. */
+ * We must NOT see logs in ~/.dingo/log/. */
 static void test_log_dir_default_tmp() {
     const char* name = "log_dir: not set  →  logs in /tmp (glog default)";
 
@@ -268,10 +273,10 @@ static void test_log_dir_default_tmp() {
 
         ASSERT(name, check_log_file_in("/tmp", "dingofs-binding.info.log.", name));
 
-        /* DingoFS default dir (~/.dingofs/log/) must NOT have been used. */
+        /* DingoFS default dir (~/.dingo/log/) must NOT have been used. */
         const char* dingofs_default = getenv("HOME");
         if (dingofs_default) {
-            std::string default_log = std::string(dingofs_default) + "/.dingofs/log";
+            std::string default_log = std::string(dingofs_default) + "/.dingo/log";
             ASSERT(name, !dir_has_file_with_prefix(default_log,
                                                    "dingofs-binding.info.log."));
         }
@@ -291,6 +296,49 @@ static void test_log_dir_default_tmp() {
     }
 
     PASS(name);
+}
+
+/* ============================================================================
+ * Group 3 — startup configuration ordering
+ * ============================================================================ */
+
+static void test_trace_config_from_conf_file() {
+    const char* name =
+        "trace config: TraceManager captures flags after conf_file load";
+
+#ifdef NDEBUG
+    PASS(name);
+#else
+    const std::string endpoint = "127.0.0.1:14317";
+    const std::string conf_path = "/tmp/dingofs-trace-test-conffile.conf";
+    FILE* f = fopen(conf_path.c_str(), "w");
+    ASSERT(name, f != nullptr);
+    fprintf(f, "--otlp_export_endpoint=%s\n", endpoint.c_str());
+    fclose(f);
+
+    bool captured = false;
+    std::string captured_endpoint;
+    dingofs::SyncPoint::GetInstance()->SetCallBack(
+        "TraceManager::TraceManager:after_config_capture", [&](void*) {
+            captured = true;
+            captured_endpoint = dingofs::FLAGS_otlp_export_endpoint;
+        });
+    dingofs::SyncPoint::GetInstance()->EnableProcessing();
+
+    BindingConfig cfg = make_config(/*log_dir=*/"", conf_path);
+    cfg.init_glog = false;
+    BindingClient client;
+    client.Start(cfg);
+
+    dingofs::SyncPoint::GetInstance()->DisableProcessing();
+    dingofs::SyncPoint::GetInstance()->ClearAllCallBacks();
+    client.Stop();
+    unlink(conf_path.c_str());
+
+    ASSERT(name, captured);
+    ASSERT(name, captured_endpoint == endpoint);
+    PASS(name);
+#endif
 }
 
 /* ============================================================================
@@ -315,6 +363,8 @@ int main(int argc, char* argv[]) {
         else if (strcmp(id, "dir-explicit") == 0) test_log_dir_explicit();
         else if (strcmp(id, "dir-conffile") == 0) test_log_dir_from_conf_file();
         else if (strcmp(id, "dir-default")  == 0) test_log_dir_default_tmp();
+        else if (strcmp(id, "trace-conffile") == 0)
+            test_trace_config_from_conf_file();
         else { fprintf(stderr, "unknown case: %s\n", id); return 1; }
         return g_fail > 0 ? 1 : 0;
     }
@@ -330,6 +380,9 @@ int main(int argc, char* argv[]) {
         {"dir-explicit", "[dir] explicit config.log_dir  →  logs in that dir"},
         {"dir-conffile", "[dir] log_dir via conf_file     →  logs in conf_file dir"},
         {"dir-default",  "[dir] no log_dir set            →  logs in /tmp"},
+        /* Group 3: startup configuration ordering */
+        {"trace-conffile",
+         "[trace] conf_file flags loaded before TraceManager construction"},
     };
 
     int total_pass = 0, total_fail = 0;

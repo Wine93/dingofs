@@ -61,7 +61,6 @@ class Inode {
         symlink_(attr.symlink()),
         rdev_(attr.rdev()),
         flags_(attr.flags()),
-        maybe_tiny_file_(attr.maybe_tiny_file()),
         base_version_(attr.version()),
         parents_(attr.parents().begin(), attr.parents().end()) {
     last_active_time_s_ = utils::Timestamp();
@@ -71,9 +70,6 @@ class Inode {
 
     for (const auto& xattr : attr.xattrs()) {
       xattrs_.emplace(xattr.first, xattr.second);
-    }
-    for (const auto& boundary : attr.shard_boundaries()) {
-      shard_boundaries_.push_back(boundary);
     }
   }
 
@@ -92,10 +88,10 @@ class Inode {
         symlink_(attr_with_mutation.attr.symlink()),
         rdev_(attr_with_mutation.attr.rdev()),
         flags_(attr_with_mutation.attr.flags()),
-        maybe_tiny_file_(attr_with_mutation.attr.maybe_tiny_file()),
         base_version_(attr_with_mutation.attr.version()),
         parents_(attr_with_mutation.attr.parents().begin(), attr_with_mutation.attr.parents().end()) {
     last_active_time_s_ = utils::Timestamp();
+    last_refresh_time_s_ = utils::Timestamp();
 
     total_delta_version_ = 0;
     delta_versions_.resize(kDirAttrMutationNum, 0);
@@ -106,9 +102,6 @@ class Inode {
 
     for (const auto& xattr : attr_with_mutation.attr.xattrs()) {
       xattrs_.emplace(xattr.first, xattr.second);
-    }
-    for (const auto& boundary : attr_with_mutation.attr.shard_boundaries()) {
-      shard_boundaries_.push_back(boundary);
     }
   }
   ~Inode() = default;
@@ -172,10 +165,6 @@ class Inode {
     utils::ReadLockGuard lk(lock_);
     return flags_;
   }
-  bool MaybeTinyFile() const {
-    utils::ReadLockGuard lk(lock_);
-    return maybe_tiny_file_;
-  }
   uint64_t BaseVersion() const {
     utils::ReadLockGuard lk(lock_);
     return base_version_;
@@ -208,12 +197,6 @@ class Inode {
     return (it != xattrs_.end()) ? it->second : "";
   }
 
-  std::vector<std::string> ShardBoundaries() const {
-    utils::ReadLockGuard lk(lock_);
-
-    return shard_boundaries_;
-  }
-
   void PutIf(const AttrEntry& attr, const std::string& reason);
   void PutIf(const AttrWithMutation& attr_with_mutation, const std::string& reason);
   AttrEntry PutByMutation(const AttrMutationEntry& mutation, const std::string& reason);
@@ -224,6 +207,8 @@ class Inode {
 
   void UpdateLastActiveTime() { last_active_time_s_.store(utils::Timestamp(), std::memory_order_relaxed); }
   uint64_t LastActiveTimeS() { return last_active_time_s_.load(std::memory_order_relaxed); }
+
+  bool IsFresh();
 
  private:
   void Put(const AttrEntry& attr);
@@ -243,13 +228,10 @@ class Inode {
   std::string symlink_;
   uint64_t rdev_{0};
   uint32_t flags_;
-  bool maybe_tiny_file_{false};
 
   static constexpr size_t kDefaultParentNum = 8;
   absl::InlinedVector<mds::Ino, kDefaultParentNum> parents_;
   absl::flat_hash_map<std::string, std::string> xattrs_;
-
-  std::vector<std::string> shard_boundaries_;
 
   uint64_t length_{0};
   uint64_t ctime_{0};
@@ -265,6 +247,7 @@ class Inode {
   uint64_t total_delta_version_{0};
 
   std::atomic<uint64_t> last_active_time_s_{0};
+  std::atomic<uint64_t> last_refresh_time_s_{0};
 };
 
 class InodeCache;
@@ -282,6 +265,8 @@ class InodeCache {
   InodeCache& operator=(InodeCache&&) = delete;
 
   static InodeCacheSPtr New(uint32_t fs_id) { return std::make_shared<InodeCache>(fs_id); }
+
+  InodeSPtr Insert(const AttrEntry& attr, const std::string& reason);
 
   InodeSPtr PutIf(const AttrEntry& attr, const std::string& reason);
   InodeSPtr PutIf(const AttrWithMutation& attr_with_mutation, const std::string& reason);

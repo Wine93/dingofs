@@ -77,6 +77,8 @@ class MDSClient {
 
   RPC& GetRpc();
 
+  Ino QueryParentIno(Ino ino);
+
   // Out param `last_fs_version` receives the FsInfo.version echoed by MDS
   // in HeartbeatResponse.client.last_fs_version (zero when the response did
   // not carry a client reply, e.g. heartbeat for a non-client role or
@@ -131,21 +133,30 @@ class MDSClient {
   Status RmDir(ContextSPtr& ctx, Ino parent, const std::string& name, Ino& ino,
                AttrEntry& parent_attr_entry);
 
+  struct ReadDirEntry {
+    Ino ino;
+    std::string name;
+    AttrEntry attr_entry;
+  };
   virtual Status ReadDir(ContextSPtr& ctx, Ino ino, uint64_t fh,
                          const std::string& last_name, uint32_t limit,
-                         bool with_attr, std::vector<DirEntry>& entries);
+                         bool with_attr, std::vector<ReadDirEntry>& entries);
 
   Status Open(ContextSPtr& ctx, Ino ino, int flags,
               const std::string& session_id, bool prefetch_chunk,
               const std::vector<mds::ChunkDescriptor>& chunk_descriptors,
-              bool prefetch_data, AttrEntry& attr_entry,
-              std::vector<mds::ChunkEntry>& chunks, std::string& data,
-              uint64_t& data_version);
+              AttrEntry& attr_entry, std::vector<mds::ChunkEntry>& chunks);
   Status Release(ContextSPtr& ctx, Ino ino, const std::string& session_id);
 
   Status FlushFile(ContextSPtr& ctx, Ino ino, uint64_t length,
-                   std::string&& data, AttrEntry& attr_entry, bool is_final,
-                   bool& shrink_file);
+                   AttrEntry& attr_entry);
+
+  // conditional length rollback on data-flush failure (ADR-0003): shrink to
+  // rollback_to_length iff rollback_to_length < current length <=
+  // last_write_length. Calls the RollbackFile RPC.
+  Status RollbackFile(ContextSPtr& ctx, Ino ino, uint64_t last_write_length,
+                      uint64_t rollback_to_length, AttrEntry& attr_entry,
+                      bool& shrink_file);
 
   Status Link(ContextSPtr& ctx, Ino ino, Ino new_parent,
               const std::string& new_name, AttrEntry& attr_entry,
@@ -180,19 +191,48 @@ class MDSClient {
   Status ListXAttr(ContextSPtr& ctx, Ino ino,
                    std::map<std::string, std::string>& xattrs);
 
+  struct RenameResult {
+    AttrEntry old_parent_attr;
+    AttrEntry new_parent_attr;
+    AttrEntry child_attr;
+    AttrEntry deleted_attr;
+  };
   Status Rename(ContextSPtr& ctx, Ino old_parent, const std::string& old_name,
                 Ino new_parent, const std::string& new_name,
-                std::vector<Ino>& effected_inos);
+                RenameResult& result);
 
   Status NewSliceId(ContextSPtr& ctx, uint32_t num, uint64_t* id);
+
+  Status ReadSlice(ContextSPtr& ctx, Ino ino,
+                   const ChunkDescriptor& chunk_descriptor,
+                   mds::ChunkEntry& chunk);
 
   Status ReadSlice(ContextSPtr& ctx, Ino ino,
                    const std::vector<ChunkDescriptor>& chunk_descriptors,
                    std::vector<mds::ChunkEntry>& chunks);
 
-  Status WriteSlice(ContextSPtr& ctx, Ino ino,
-                    const std::vector<mds::DeltaSliceEntry>& delta_slices,
-                    std::vector<mds::ChunkEntry>& out_chunks);
+  struct ReadSliceInEntry {
+    Ino ino{0};
+    uint32_t index{0};
+    uint64_t version{0};
+  };
+  struct ReadSliceOutEntry {
+    Ino ino{0};
+    mds::ChunkEntry chunk;
+  };
+  // must the same parent directory's files
+  Status ReadSlice(ContextSPtr& ctx,
+                   const std::vector<ReadSliceInEntry>& in_entries,
+                   std::vector<ReadSliceOutEntry>& out_entries);
+
+  struct WriteSliceResult {
+    AttrEntry attr;
+    std::vector<mds::ChunkEntry> chunks;
+  };
+  virtual Status WriteSlice(
+      ContextSPtr& ctx, Ino ino,
+      const std::vector<mds::DeltaSliceEntry>& delta_slices,
+      WriteSliceResult& result);
 
   struct CompactChunkParam {
     uint64_t version{0};
@@ -244,7 +284,7 @@ class MDSClient {
 
   void ProcessEpochChange();
   void ProcessNotServe();
-  void ProcessNetError(MDSMeta& mds_meta);
+  bool ProcessNetError(MDSMeta& mds_meta);
 
   template <typename Request>
   void SetAncestorInContext(Request& request, Ino ino);
@@ -296,6 +336,7 @@ Status MDSClient::SendRequest(ContextSPtr ctx, SpanScopeSPtr& span,
   bool is_refresh_mds = true;
 
   SendRequestOption option;
+  option.retry = ctx ? ctx->retry : true;
   option.timeout_retry = ctx ? ctx->timeout_retry : true;
 
   request.mutable_info()->set_request_id(
@@ -341,7 +382,9 @@ Status MDSClient::SendRequest(ContextSPtr ctx, SpanScopeSPtr& span,
         continue;
 
       } else if (status.IsNetError()) {
-        ProcessNetError(mds_meta);
+        if (!ProcessNetError(mds_meta)) {
+          return Status::NetError("no normal mds available");
+        }
 
         is_primary_mds =
             (primary_mds_id != 0 && mds_meta.ID() == primary_mds_id);
@@ -353,7 +396,7 @@ Status MDSClient::SendRequest(ContextSPtr ctx, SpanScopeSPtr& span,
     }
 
     return status;
-  } while (IsRetry(retry, FLAGS_vfs_meta_rpc_retry_times));
+  } while (option.retry && IsRetry(retry, FLAGS_vfs_meta_rpc_retry_times));
 
   return status;
 }

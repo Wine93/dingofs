@@ -19,79 +19,131 @@
 
 #include <sys/types.h>
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <mutex>
 
 #include "bvar/passive_status.h"
 #include "bvar/reducer.h"
 #include "bvar/status.h"
-#include "common/writemempool/memory_pool.h"
+#include "common/status.h"
+#include "common/writemempool/write_page_lease.h"
+#include "common/writemempool/write_page_pool.h"
+#include "common/writemempool/write_pressure_observer.h"
 
 namespace dingofs {
 
 class WriteMemPool {
  public:
   explicit WriteMemPool(int64_t total_bytes, int64_t page_size);
+  ~WriteMemPool();
 
-  ~WriteMemPool() = default;
+  WriteMemPool(const WriteMemPool&) = delete;
+  WriteMemPool& operator=(const WriteMemPool&) = delete;
 
-  // Single try, never blocks -- the only allocation primitive. Safe under
-  // write_flush_mutex_ / slice_mutex_ (SliceWriter, BlockData hold them). The
-  // underlying MemoryPool::Require() already sweeps every shard and steals from
-  // other caches, so a nullptr is a strong (near-)exhaustion signal, not a
-  // casual shard-race miss. Any waiting/retry on a null is the caller's job
-  // (FileWriter's lock-free throttle / short-write retry), never this layer.
-  char* TryAllocate();
+  // FIFO, exact-capacity admission. The caller blocks without holding any
+  // FileWriter/ChunkWriter/SliceWriter lock until all requested pages can be
+  // granted, the pool closes, or an internal allocator invariant breaks.
+  Status Acquire(size_t count, WritePageLease* lease);
 
-  void DeAllocate(char* page);
+  // Non-blocking exact admission for best-effort work such as compaction.
+  // It never bypasses queued FIFO waiters.
+  Status TryAcquire(size_t count, WritePageLease* lease);
+
+  // Returns exactly count pairwise-distinct pages previously transferred from
+  // a lease. Valid leases may still call Release after Close.
+  void Release(char* const* pages, size_t count);
+
+  // Stops admission and wakes every ungranted Acquire with Status::Stop.
+  // Existing leases and page owners remain valid and must release normally.
+  void Close();
+
+  // Registering requires no observer to be installed. Clearing prevents new
+  // callbacks and waits for every in-flight callback to return. The observer
+  // must remain alive until clearing completes and must not clear itself.
+  void SetPressureObserver(WritePressureObserver* observer);
+  void NotifyDirtyPublished();
+  bool IsPressured() const {
+    return pressured_.load(std::memory_order_acquire);
+  }
 
   int64_t GetPageSize() const;
-
   int64_t GetTotalBytes() const;
-
   int64_t GetUsedBytes() const;
 
-  double GetUsageRatio() const;
-
-  bool IsHighPressure(double threshold = 0.8) const;
-
-  // RDMA-ready: forward the underlying pool's contiguous arena base + total
-  // length for ibv_reg_mr. Mirrors ReadMemPool::BaseAddr()/TotalSize().
   char* BaseAddr() const;
+  size_t BufferSize() const;
+  size_t BufferCount() const;
   size_t TotalSize() const;
 
  private:
-  static int64_t UsedBytes(void* arg) {
-    auto* manager = reinterpret_cast<WriteMemPool*>(arg);
-    return manager->GetUsedBytes();
+  friend class WriteMemPoolTestPeer;
+  enum class AdmissionResult : uint8_t {
+    kGranted,
+    kUnavailable,
+    kClosed,
+    kBroken
+  };
+  static constexpr uint64_t kAvailableMask = UINT32_MAX;
+  static constexpr uint64_t kContended = uint64_t{1} << 32;
+  static constexpr uint64_t kClosed = uint64_t{1} << 33;
+  static constexpr uint64_t kBroken = uint64_t{1} << 34;
+
+  struct Waiter {
+    explicit Waiter(size_t requested)
+        : need(requested), queued_at(std::chrono::steady_clock::now()) {}
+
+    enum class Result : uint8_t { kWaiting, kGranted, kStopped, kBroken };
+
+    const size_t need;
+    const std::chrono::steady_clock::time_point queued_at;
+    std::condition_variable cv;
+    Result result{Result::kWaiting};
+  };
+
+  AdmissionResult TryReserveFast(size_t count);
+  bool ReserveContendedLocked(size_t count);
+  void ClearContendedLocked();
+  bool GrantWaitersLocked();
+  Status AcquireSlow(size_t count, WritePageLease* lease);
+  Status MaterializeLease(size_t count, WritePageLease* lease);
+  void BreakPool(size_t reserved_count);
+  void NotifyPressure();
+  static size_t AvailablePages(uint64_t state) {
+    return static_cast<size_t>(state & kAvailableMask);
   }
 
-  static int64_t UsedPages(void* arg) {
-    auto* manager = reinterpret_cast<WriteMemPool*>(arg);
-    return manager->used_pages_.get_value();
-  }
+  static int64_t UsedBytes(void* arg);
+  static int64_t UsedPages(void* arg);
+  static int64_t WaiterCount(void* arg);
+  static int64_t OldestWaiterUs(void* arg);
 
   const int64_t total_bytes_{0};
   const int64_t page_size_{0};
-  // Outstanding page count. A single shared atomic here was a true-sharing
-  // bottleneck: every Allocate/DeAllocate RMW'd one cache line, so the
-  // per-thread-cache MemoryPool below it could not scale (measured 64-thread
-  // alloc went 15ns->2939ns). bvar::Adder is per-thread sharded -- "<< 1" hits
-  // only the caller's shard; get_value() aggregates and is read only on the
-  // throttle check / bvar dump, not per page.
-  bvar::Adder<int64_t> used_pages_;
-  MemoryPoolUPtr pool_;
+  WritePagePoolUPtr page_pool_;
+  const size_t capacity_pages_{0};
+  std::atomic<uint64_t> admission_state_{0};
 
-  // Capacity / usage. PassiveStatus is sampled on /vars dump (off the hot
-  // path); the underlying used_pages_ atomic is the only per-op cost and it
-  // predates pooling.
-  bvar::Status<int64_t> capacity_pages_;
+  mutable std::mutex waiter_mutex_;
+  std::deque<Waiter*> waiters_;
+  std::atomic_bool pressured_{false};
+  std::mutex pressure_observer_mutex_;
+  std::condition_variable pressure_observer_cv_;
+  WritePressureObserver* pressure_observer_{nullptr};
+  size_t pressure_observer_calls_{0};
+
+  bvar::Status<int64_t> capacity_pages_var_;
   bvar::PassiveStatus<int64_t> used_pages_var_;
   bvar::PassiveStatus<int64_t> used_bytes_var_;
-
-  // Count of TryAllocate() failures (pool returned null -> caller surfaces
-  // ENOSPC / short write). Lock-free per-thread Adder, bumped only on the miss
-  // branch.
-  bvar::Adder<int64_t> alloc_fail_num_;
+  bvar::PassiveStatus<int64_t> waiter_count_var_;
+  bvar::PassiveStatus<int64_t> oldest_waiter_us_var_;
+  bvar::Adder<int64_t> acquire_wait_num_;
+  bvar::Adder<int64_t> acquire_stop_num_;
+  bvar::Adder<int64_t> try_acquire_busy_num_;
 };
 
 }  // namespace dingofs

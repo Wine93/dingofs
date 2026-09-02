@@ -21,6 +21,7 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "common/callback.h"
 #include "common/status.h"
 
 namespace dingofs {
@@ -41,9 +42,9 @@ class FileWriter;
 //   - FileWriter::refs_ remains the single source of truth for "is the
 //     object alive". `FileWriter::ReleaseRef()` is the sole place that
 //     calls `delete this` (when refs_ hits 0).
-//   - WriterTable maintains a *separate* `holders` counter per entry —
-//     it only counts outstanding AcquireWriter / PeekWriter callers. It
-//     does NOT count internal FileWriter lambdas (e.g. async flush
+//   - WriterTable maintains a *separate* `holders` counter per entry. It counts
+//     outstanding AcquireWriter / PeekWriter callers and short-lived FlushAll
+//     pins. It does NOT count internal FileWriter lambdas (e.g. async flush
 //     callbacks that AcquireRef/ReleaseRef themselves).
 //   - When `holders` drops to 0, the entry is removed from the map BEFORE
 //     the matching `Close()` and `ReleaseRef()` calls. Any lingering
@@ -55,8 +56,9 @@ class FileWriter;
 //     latency until refs_ actually hits 0 and the writer is destroyed).
 //
 // FlushAll vs Stop:
-//   - FlushAll() synchronously flushes every live writer; idempotent, can
-//     be called any time, no state change.
+//   - FlushAll() synchronously flushes every live writer; its transient holder
+//     pins prevent a concurrent last external release from closing a
+//     snapshotted writer before that writer's Flush completes.
 //   - Stop() marks stopped_ to refuse new acquires. It does NOT flush.
 //     Callers that need both should call FlushAll() first.
 class WriterTable {
@@ -69,10 +71,14 @@ class WriterTable {
 
   // Lifecycle.
   Status Start();
-  void Stop();   // refuse new acquires; does not flush
+  void Stop();  // refuse new acquires; does not flush
 
   // Synchronously flush all live writers; idempotent.
   Status FlushAll();
+
+  // Fan-outs all currently dirty writers and invokes cb exactly once after
+  // every participant callback and transient holder release completes.
+  void FlushDirtyAsync(StatusCallback cb);
 
   // Get-or-create the FileWriter for ino. Returned pointer has a holder
   // outstanding; caller MUST call ReleaseWriter exactly once.
@@ -94,7 +100,7 @@ class WriterTable {
  private:
   struct Entry {
     FileWriter* writer{nullptr};
-    int64_t holders{0};   // tracked by WriterTable, NOT FileWriter
+    int64_t holders{0};  // external holders + transient WriterTable pins
   };
 
   VFSHub* vfs_hub_{nullptr};

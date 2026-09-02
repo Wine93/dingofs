@@ -30,8 +30,8 @@ namespace infiniband {
 
 BodyReader::BodyReader(Connection* conn) : conn_(conn) {}
 
-Status BodyReader::Read(RDMABuffer* dst, const std::vector<Region>& src,
-                        size_t size) {
+Status BodyReader::Read(const char* dst, uint32_t lkey,
+                        const std::vector<Region>& src, size_t size) {
   auto status = CheckSource(src, size);
   if (!status.ok()) {
     return status;
@@ -40,7 +40,7 @@ Status BodyReader::Read(RDMABuffer* dst, const std::vector<Region>& src,
   InflightContext ctx(src.size());
   std::vector<SendWorkRequest> work_requests;
   work_requests.reserve(src.size());
-  PrepWorkRequests(dst, src, &ctx, &work_requests);
+  PrepWorkRequests(dst, lkey, src, &ctx, &work_requests);
   status = conn_->PostSendWorkRequests(work_requests);
   if (!status.ok()) {
     return status;
@@ -55,19 +55,19 @@ Status BodyReader::CheckSource(const std::vector<Region>& regions,
   size_t total_length = 0;
   for (const auto& region : regions) {
     if (region.addr == 0 || region.rkey == 0) {
-      return Status::Internal("request rdma memory context is missing");
+      return Status::InvalidParam("request rdma memory context is missing");
     }
     total_length += region.length;
   }
 
   if (regions.empty() || total_length != size) {
-    return Status::Internal(
+    return Status::InvalidParam(
         "request attachment size mismatches advertised rdma regions");
   }
   return Status::OK();
 }
 
-void BodyReader::PrepWorkRequests(RDMABuffer* dst,
+void BodyReader::PrepWorkRequests(const char* dst, uint32_t lkey,
                                   const std::vector<Region>& regions,
                                   InflightContext* ctx,
                                   std::vector<SendWorkRequest>* work_requests) {
@@ -75,9 +75,9 @@ void BodyReader::PrepWorkRequests(RDMABuffer* dst,
   SendWorkRequest wr;
   for (int i = 0; i < regions.size(); i++) {
     wr.opcode = OpCode::kRDMARead;
-    wr.addr = reinterpret_cast<uint64_t>(dst->data + offset);
+    wr.addr = reinterpret_cast<uint64_t>(dst + offset);
     wr.length = regions[i].length;
-    wr.lkey = dst->lkey;
+    wr.lkey = lkey;
     wr.raddr = regions[i].addr;
     wr.rkey = regions[i].rkey;
     wr.signaled = true;

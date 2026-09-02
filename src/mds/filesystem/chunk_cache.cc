@@ -18,14 +18,11 @@
 #include <utility>
 #include <vector>
 
-#include "brpc/reloadable_flags.h"
+#include "common/options/mds.h"
 #include "utils/time.h"
 
 namespace dingofs {
 namespace mds {
-
-DEFINE_uint32(mds_chunk_cache_max_count, 4 * 1024 * 1024, "chunk cache max count");
-DEFINE_validator(mds_chunk_cache_max_count, brpc::PassValidate);
 
 static const std::string kChunkCacheMetricsPrefix = "dingofs_{}_chunk_cache_{}";
 
@@ -38,7 +35,7 @@ ChunkCache::ChunkCache(uint32_t fs_id)
 
 static ChunkCache::ChunkSPtr NewChunk(ChunkEntry&& chunk) { return std::make_shared<ChunkEntry>(std::move(chunk)); }
 
-bool ChunkCache::PutIf(uint64_t ino, ChunkEntry chunk) {
+bool ChunkCache::PutIf(Ino ino, ChunkEntry chunk) {
   chunk.set_expire_time_s(utils::Timestamp());
 
   bool ret = true;
@@ -65,7 +62,7 @@ bool ChunkCache::PutIf(uint64_t ino, ChunkEntry chunk) {
   return ret;
 }
 
-void ChunkCache::Delete(uint64_t ino, uint64_t chunk_index) {
+void ChunkCache::Delete(Ino ino, uint64_t chunk_index) {
   shard_map_.withWLock(
       [ino, chunk_index](Map& map) mutable {
         Key key{.ino = ino, .chunk_index = chunk_index};
@@ -77,7 +74,7 @@ void ChunkCache::Delete(uint64_t ino, uint64_t chunk_index) {
       ino);
 }
 
-void ChunkCache::Delete(uint64_t ino) {
+void ChunkCache::Delete(Ino ino) {
   shard_map_.withWLock(
       [ino](Map& map) mutable {
         Key key{.ino = ino, .chunk_index = 0};
@@ -104,7 +101,7 @@ void ChunkCache::BatchDeleteIf(const std::function<bool(const Ino&)>& f) {
   });
 }
 
-ChunkCache::ChunkSPtr ChunkCache::Get(uint64_t ino, uint64_t chunk_index) {
+ChunkCache::ChunkSPtr ChunkCache::Get(Ino ino, uint64_t chunk_index) {
   ChunkCache::ChunkSPtr chunk;
   shard_map_.withRLock(
       [&](Map& map) mutable {
@@ -126,7 +123,7 @@ ChunkCache::ChunkSPtr ChunkCache::Get(uint64_t ino, uint64_t chunk_index) {
   return chunk;
 }
 
-std::vector<ChunkCache::ChunkSPtr> ChunkCache::Get(uint64_t ino) {
+std::vector<ChunkCache::ChunkSPtr> ChunkCache::Get(Ino ino) {
   uint64_t now_s = utils::Timestamp();
   std::vector<ChunkSPtr> chunks;
   shard_map_.withRLock(
@@ -145,6 +142,11 @@ std::vector<ChunkCache::ChunkSPtr> ChunkCache::Get(uint64_t ino) {
   access_hit_count_ << chunks.size();
 
   return chunks;
+}
+
+bool ChunkCache::IsExist(Ino ino) {
+  auto chunks = Get(ino);
+  return !chunks.empty();
 }
 
 size_t ChunkCache::Size() {
@@ -173,7 +175,7 @@ void ChunkCache::Clear() {
 }
 
 void ChunkCache::CleanExpired(uint64_t expire_s) {
-  if (Size() < FLAGS_mds_chunk_cache_max_count) return;
+  if (Size() < FLAGS_mds_clean_threshold_count) return;
 
   std::vector<Key> keys;
   shard_map_.iterate([&](const Map& map) {

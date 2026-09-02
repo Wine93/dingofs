@@ -27,7 +27,7 @@
 #include "client/vfs/components/prefetch_utils.h"
 #include "client/vfs/hub/vfs_hub.h"
 #include "common/status.h"
-#include "utils/executor/bthread/bthread_executor.h"
+#include "utils/executor/thread/executor_impl.h"
 
 namespace dingofs {
 namespace client {
@@ -46,8 +46,12 @@ int PrefetchManager::HandlePrefetch(
   for (; iter; iter++) {
     auto& context = *iter;
 
-    self->prefetch_executor_->Execute(
-        [self, context]() { self->ProcessPrefetch(context); });
+    self->prefetch_executor_->Execute([self, context]() {
+      if (!self->running_.load()) {
+        return;
+      }
+      self->ProcessPrefetch(context);
+    });
   }
 
   return 0;
@@ -61,7 +65,7 @@ Status PrefetchManager::Start(uint32_t threads) {
                                              &PrefetchManager::HandlePrefetch,
                                              this));
 
-  prefetch_executor_ = std::make_unique<BthreadExecutor>(threads);
+  prefetch_executor_ = std::make_unique<ExecutorImpl>("vfs_prefetch", threads);
   auto ok = prefetch_executor_->Start();
   if (!ok) {
     LOG(ERROR) << "Start prefetch manager executor failed.";
@@ -102,7 +106,7 @@ void PrefetchManager::SubmitTask(PrefetchContext context) {
 
 void PrefetchManager::ProcessPrefetch(const PrefetchContext& context) {
   auto span =
-      vfs_hub_->GetTraceManager()->StartSpan("VFSWrapper::ProcessPrefetch");
+      vfs_hub_->GetTraceManager()->StartSpan("PrefetchManager::ProcessPrefetch");
 
   const auto block_size = vfs_hub_->GetFsInfo().block_size;
   // Prefetch include current block

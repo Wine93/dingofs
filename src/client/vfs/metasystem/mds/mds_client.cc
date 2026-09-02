@@ -25,6 +25,7 @@
 #include "client/vfs/metasystem/mds/rpc.h"
 #include "client/vfs/vfs_meta.h"
 #include "common/const.h"
+#include "common/helper.h"
 #include "dingofs/mds.pb.h"
 #include "fmt/format.h"
 #include "glog/logging.h"
@@ -213,6 +214,13 @@ Status MDSClient::RefreshFsInfo(mds::FsInfoEntry& fs_info) {
 
 RPC& MDSClient::GetRpc() { return rpc_; }
 
+Ino MDSClient::QueryParentIno(Ino ino) {
+  Ino parent{0};
+  parent_memo_.GetParent(ino, parent);
+
+  return parent;
+}
+
 Status MDSClient::Heartbeat(
     const std::map<Ino, std::vector<std::string>>& need_keep_alive_sessions,
     uint64_t& last_fs_version) {
@@ -345,10 +353,9 @@ Status MDSClient::Lookup(ContextSPtr& ctx, Ino parent, const std::string& name,
   const auto& inode = response.inode();
 
   if (fs_info_.IsHashPartition() && mds::IsDir(inode.ino())) {
-    uint64_t last_version;
-    if (parent_memo_.GetVersion(inode.ino(), last_version) &&
-        inode.version() < last_version) {
-      // fetch last inode
+    uint64_t local_last_version = GetInodeVersion(inode.ino());
+    if (inode.version() < local_last_version) {
+      // fetch last version inode
       status = GetAttr(span_ctx, inode.ino(), attr_entry);
       if (status.ok()) {
         parent_memo_.Upsert(inode.ino(), parent, 0, use_base_version);
@@ -669,7 +676,7 @@ Status MDSClient::RmDir(ContextSPtr& ctx, Ino parent, const std::string& name,
 
 Status MDSClient::ReadDir(ContextSPtr& ctx, Ino ino, uint64_t fh,
                           const std::string& last_name, uint32_t limit,
-                          bool with_attr, std::vector<DirEntry>& entries) {
+                          bool with_attr, std::vector<ReadDirEntry>& entries) {
   CHECK(fs_id_ != 0) << "fs_id is invalid.";
 
   auto get_mds_fn = [this, ino](bool& is_primary_mds) -> MDSMeta {
@@ -710,7 +717,7 @@ Status MDSClient::ReadDir(ContextSPtr& ctx, Ino ino, uint64_t fh,
   entries.reserve(response.entries_size());
   for (const auto& entry : response.entries()) {
     parent_memo_.Upsert(entry.ino(), ino, entry.inode().version());
-    entries.push_back(Helper::ToDirEntry(entry));
+    entries.push_back(ReadDirEntry{entry.ino(), entry.name(), entry.inode()});
   }
 
   return Status::OK();
@@ -720,9 +727,7 @@ Status MDSClient::Open(
     ContextSPtr& ctx, Ino ino, int flags, const std::string& session_id,
     bool prefetch_chunk,
     const std::vector<mds::ChunkDescriptor>& chunk_descriptors,
-    bool prefetch_data, AttrEntry& attr_entry,
-    std::vector<mds::ChunkEntry>& chunks, std::string& data,
-    uint64_t& data_version) {
+    AttrEntry& attr_entry, std::vector<mds::ChunkEntry>& chunks) {
   CHECK(fs_id_ != 0) << "fs_id is invalid.";
   CHECK(!session_id.empty()) << "session_id is empty.";
 
@@ -741,7 +746,6 @@ Status MDSClient::Open(
   request.set_flags(flags);
   request.set_session_id(session_id);
   request.set_prefetch_chunk(prefetch_chunk);
-  request.set_prefetch_data(prefetch_data);
 
   if (prefetch_chunk) {
     *request.mutable_chunk_descriptors() = {chunk_descriptors.begin(),
@@ -757,13 +761,8 @@ Status MDSClient::Open(
 
   attr_entry.Swap(response.mutable_inode());
   if (prefetch_chunk) {
-    chunks = mds::Helper::PbRepeatedToVector(response.chunks());
+    chunks = ::dingofs::Helper::PbRepeatedToVector(response.chunks());
   }
-  if (prefetch_data) {
-    data.swap(*response.mutable_data());
-    data_version = response.data_version();
-  }
-
   parent_memo_.UpsertVersion(ino, response.inode().version());
 
   return Status::OK();
@@ -795,8 +794,7 @@ Status MDSClient::Release(ContextSPtr& ctx, Ino ino,
 }
 
 Status MDSClient::FlushFile(ContextSPtr& ctx, Ino ino, uint64_t length,
-                            std::string&& data, AttrEntry& attr_entry,
-                            bool is_final, bool& shrink_file) {
+                            AttrEntry& attr_entry) {
   CHECK(fs_id_ != 0) << "fs_id is invalid.";
 
   auto get_mds_fn = [this, ino](bool& is_primary_mds) -> MDSMeta {
@@ -814,11 +812,47 @@ Status MDSClient::FlushFile(ContextSPtr& ctx, Ino ino, uint64_t length,
   request.set_fs_id(fs_id_);
   request.set_ino(ino);
   request.set_length(length);
-  request.mutable_data()->assign(std::move(data));
-  request.set_is_final(is_final);
 
   auto status = SendRequest(SpanScope::GetContext(span, ctx), span, get_mds_fn,
                             "MDSService", "FlushFile", request, response);
+
+  if (!status.ok()) {
+    SpanScope::SetStatus(span, status);
+    return status;
+  }
+
+  parent_memo_.UpsertVersion(ino, response.inode().version());
+
+  attr_entry.Swap(response.mutable_inode());
+
+  return status;
+}
+
+Status MDSClient::RollbackFile(ContextSPtr& ctx, Ino ino,
+                               uint64_t last_write_length,
+                               uint64_t rollback_to_length,
+                               AttrEntry& attr_entry, bool& shrink_file) {
+  CHECK(fs_id_ != 0) << "fs_id is invalid.";
+
+  auto get_mds_fn = [this, ino](bool& is_primary_mds) -> MDSMeta {
+    return GetMds(ino, is_primary_mds);
+  };
+
+  auto span = trace_manager_.StartChildSpan("MDSClient::RollbackFile",
+                                            ctx->GetTraceSpan());
+
+  pb::mds::RollbackFileRequest request;
+  pb::mds::RollbackFileResponse response;
+
+  SetAncestorInContext(request, ino);
+
+  request.set_fs_id(fs_id_);
+  request.set_ino(ino);
+  request.set_last_write_length(last_write_length);
+  request.set_rollback_to_length(rollback_to_length);
+
+  auto status = SendRequest(SpanScope::GetContext(span, ctx), span, get_mds_fn,
+                            "MDSService", "RollbackFile", request, response);
 
   if (!status.ok()) {
     SpanScope::SetStatus(span, status);
@@ -1061,6 +1095,7 @@ Status MDSClient::GetAttr(ContextSPtr& ctx, Ino ino, AttrEntry& attr_entry) {
 
   request.set_fs_id(fs_id_);
   request.set_ino(ino);
+  request.set_reason(ctx->reason);
 
   auto status = SendRequest(SpanScope::GetContext(span, ctx), span, get_mds_fn,
                             "MDSService", "GetAttr", request, response);
@@ -1148,6 +1183,9 @@ Status MDSClient::SetAttr(ContextSPtr& ctx, Ino ino, const Attr& attr,
     temp_to_set |= kSetAttrFlags;
   }
 
+  temp_to_set |=
+      to_set & (kSetAttrKillSuid | kSetAttrKillSgid | kSetAttrKillPriv);
+
   request.set_to_set(temp_to_set);
 
   auto status = SendRequest(SpanScope::GetContext(span, ctx), span, get_mds_fn,
@@ -1162,7 +1200,8 @@ Status MDSClient::SetAttr(ContextSPtr& ctx, Ino ino, const Attr& attr,
   out.attr_entry.Swap(response.mutable_inode());
   out.shrink_file = response.shrink_file();
   out.expand_file = response.expand_file();
-  out.effected_chunks = mds::Helper::PbRepeatedToVector(response.chunks());
+  out.effected_chunks =
+      ::dingofs::Helper::PbRepeatedToVector(response.chunks());
 
   return Status::OK();
 }
@@ -1302,8 +1341,7 @@ Status MDSClient::ListXAttr(ContextSPtr& ctx, Ino ino,
 
 Status MDSClient::Rename(ContextSPtr& ctx, Ino old_parent,
                          const std::string& old_name, Ino new_parent,
-                         const std::string& new_name,
-                         std::vector<Ino>& effected_inos) {
+                         const std::string& new_name, RenameResult& result) {
   CHECK(fs_id_ != 0) << "fs_id is invalid.";
 
   auto get_mds_fn = [this, new_parent](bool& is_primary_mds) -> MDSMeta {
@@ -1343,29 +1381,34 @@ Status MDSClient::Rename(ContextSPtr& ctx, Ino old_parent,
     return status;
   }
 
+  const auto& child_inode = response.child_inode();
+  const auto& deleted_inode = response.deleted_inode();
+
   if (request.context().is_bypass_cache()) {
-    parent_memo_.UpsertVersionAndRenameRefCount(new_parent,
-                                                response.new_parent_version());
+    parent_memo_.UpsertVersionAndRenameRefCount(
+        new_parent, response.new_parent_inode().version());
 
   } else {
-    parent_memo_.UpsertVersion(new_parent, response.new_parent_version());
+    parent_memo_.UpsertVersion(new_parent,
+                               response.new_parent_inode().version());
   }
   if (old_parent != new_parent) {
-    parent_memo_.UpsertVersionAndRenameRefCount(old_parent,
-                                                response.old_parent_version());
+    parent_memo_.UpsertVersionAndRenameRefCount(
+        old_parent, response.old_parent_inode().version());
 
-    if (response.child_ino() != 0)
-      parent_memo_.Upsert(response.child_ino(), new_parent);
+    if (child_inode.ino() != 0)
+      parent_memo_.Upsert(child_inode.ino(), new_parent);
   }
 
-  if (response.deleted_ino() != 0) parent_memo_.Delete(response.deleted_ino());
+  if (child_inode.ino() != 0)
+    parent_memo_.UpsertVersion(child_inode.ino(), child_inode.version());
+  if (deleted_inode.ino() != 0)
+    parent_memo_.UpsertVersion(deleted_inode.ino(), deleted_inode.version());
 
-  // update effected inodes
-  effected_inos.push_back(old_parent);
-  if (new_parent != old_parent) effected_inos.push_back(new_parent);
-  if (response.child_ino() != 0) effected_inos.push_back(response.child_ino());
-  if (response.deleted_ino() != 0)
-    effected_inos.push_back(response.deleted_ino());
+  result.old_parent_attr.Swap(response.mutable_old_parent_inode());
+  result.new_parent_attr.Swap(response.mutable_new_parent_inode());
+  result.child_attr.Swap(response.mutable_child_inode());
+  result.deleted_attr.Swap(response.mutable_deleted_inode());
 
   return Status::OK();
 }
@@ -1397,6 +1440,18 @@ Status MDSClient::NewSliceId(ContextSPtr& ctx, uint32_t num, uint64_t* id) {
   return Status::OK();
 }
 
+Status MDSClient::ReadSlice(ContextSPtr& ctx, Ino ino,
+                            const ChunkDescriptor& chunk_descriptor,
+                            mds::ChunkEntry& chunk) {
+  std::vector<mds::ChunkEntry> chunks;
+  Status status = ReadSlice(ctx, ino, {chunk_descriptor}, chunks);
+  if (!status.ok()) return status;
+
+  if (!chunks.empty()) chunk = std::move(chunks.front());
+
+  return Status::OK();
+}
+
 Status MDSClient::ReadSlice(
     ContextSPtr& ctx, Ino ino,
     const std::vector<ChunkDescriptor>& chunk_descriptors,
@@ -1420,8 +1475,8 @@ Status MDSClient::ReadSlice(
   request.set_fs_id(fs_id_);
   request.set_ino(ino);
 
-  mds::Helper::VectorToPbRepeated(chunk_descriptors,
-                                  request.mutable_chunk_descriptors());
+  ::dingofs::Helper::VectorToPbRepeated(chunk_descriptors,
+                                        request.mutable_chunk_descriptors());
 
   auto status = SendRequest(SpanScope::GetContext(span, ctx), span, get_mds_fn,
                             "MDSService", "ReadSlice", request, response);
@@ -1430,7 +1485,56 @@ Status MDSClient::ReadSlice(
     return status;
   }
 
-  chunks = mds::Helper::PbRepeatedToVector(*response.mutable_chunks());
+  if (response.chunks().empty()) return Status::NotFound("not found chunk");
+
+  chunks = ::dingofs::Helper::PbRepeatedToVector(*response.mutable_chunks());
+
+  return Status::OK();
+}
+
+Status MDSClient::ReadSlice(ContextSPtr& ctx,
+                            const std::vector<ReadSliceInEntry>& in_entries,
+                            std::vector<ReadSliceOutEntry>& out_entries) {
+  CHECK(!in_entries.empty()) << "in_entries is empty.";
+  CHECK(fs_id_ != 0) << "fs_id is invalid.";
+  const Ino ino = in_entries.front().ino;
+  CHECK(ino != 0) << "ino is zero.";
+
+  auto get_mds_fn = [this, ino](bool& is_primary_mds) -> MDSMeta {
+    return GetMds(ino, is_primary_mds);
+  };
+
+  auto span = trace_manager_.StartChildSpan("MDSClient::ReadSlice",
+                                            ctx->GetTraceSpan());
+
+  pb::mds::BatchReadSliceRequest request;
+  pb::mds::BatchReadSliceResponse response;
+
+  auto* mut_ctx = request.mutable_context();
+  mut_ctx->set_inode_version(GetInodeVersion(ino));
+
+  request.set_fs_id(fs_id_);
+
+  for (const auto& entry : in_entries) {
+    auto* mut_entry = request.add_entries();
+    mut_entry->set_ino(entry.ino);
+    mut_entry->set_index(entry.index);
+    mut_entry->set_version(entry.version);
+  }
+
+  auto status = SendRequest(SpanScope::GetContext(span, ctx), span, get_mds_fn,
+                            "MDSService", "BatchReadSlice", request, response);
+  if (!status.ok()) {
+    SpanScope::SetStatus(span, status);
+    return status;
+  }
+
+  for (const auto& entry : response.entries()) {
+    ReadSliceOutEntry out_entry;
+    out_entry.ino = entry.ino();
+    out_entry.chunk = entry.chunk();
+    out_entries.push_back(std::move(out_entry));
+  }
 
   return Status::OK();
 }
@@ -1438,7 +1542,7 @@ Status MDSClient::ReadSlice(
 Status MDSClient::WriteSlice(
     ContextSPtr& ctx, Ino ino,
     const std::vector<mds::DeltaSliceEntry>& delta_slices,
-    std::vector<mds::ChunkEntry>& out_chunks) {
+    WriteSliceResult& result) {
   CHECK(fs_id_ != 0) << "fs_id is invalid.";
   CHECK(ctx != nullptr) << "context is nullptr.";
 
@@ -1456,7 +1560,8 @@ Status MDSClient::WriteSlice(
   request.set_fs_id(fs_id_);
   request.set_ino(ino);
 
-  mds::Helper::VectorToPbRepeated(delta_slices, request.mutable_delta_slices());
+  ::dingofs::Helper::VectorToPbRepeated(delta_slices,
+                                        request.mutable_delta_slices());
 
   auto status = SendRequest(SpanScope::GetContext(span, ctx), span, get_mds_fn,
                             "MDSService", "WriteSlice", request, response);
@@ -1465,7 +1570,8 @@ Status MDSClient::WriteSlice(
     return status;
   }
 
-  out_chunks = mds::Helper::PbRepeatedToVector(response.chunks());
+  result.attr = response.inode();
+  result.chunks = ::dingofs::Helper::PbRepeatedToVector(response.chunks());
 
   return Status::OK();
 }
@@ -1512,9 +1618,10 @@ Status MDSClient::CompactChunk(ContextSPtr& ctx, Ino ino, uint32_t chunk_index,
     request.add_new_slices()->CopyFrom(slice);
   }
 
-  ctx->timeout_retry = false;
-  auto status = SendRequest(SpanScope::GetContext(span, ctx), span, get_mds_fn,
-                            "MDSService", "CompactChunk", request, response);
+  auto span_ctx = SpanScope::GetContext(span, ctx);
+  span_ctx->retry = false;
+  auto status = SendRequest(span_ctx, span, get_mds_fn, "MDSService",
+                            "CompactChunk", request, response);
   chunk_entry.Swap(response.mutable_chunk());
   if (!status.ok()) {
     SpanScope::SetStatus(span, status);
@@ -1550,9 +1657,10 @@ Status MDSClient::CopyFileRange(ContextSPtr& ctx,
   request.set_len(param.len);
   request.set_flags(param.flags);
 
-  ctx->timeout_retry = false;
-  auto status = SendRequest(SpanScope::GetContext(span, ctx), span, get_mds_fn,
-                            "MDSService", "CopyFileRange", request, response);
+  auto span_ctx = SpanScope::GetContext(span, ctx);
+  span_ctx->timeout_retry = false;
+  auto status = SendRequest(span_ctx, span, get_mds_fn, "MDSService",
+                            "CopyFileRange", request, response);
   if (!status.ok()) {
     SpanScope::SetStatus(span, status);
     return status;
@@ -1560,7 +1668,8 @@ Status MDSClient::CopyFileRange(ContextSPtr& ctx,
 
   out.bytes_copied = response.bytes_copied();
   out.attr_entry.Swap(response.mutable_dst_inode());
-  out.effected_chunks = mds::Helper::PbRepeatedToVector(response.dst_chunks());
+  out.effected_chunks =
+      ::dingofs::Helper::PbRepeatedToVector(response.dst_chunks());
 
   return Status::OK();
 }
@@ -1600,7 +1709,8 @@ Status MDSClient::Fallocate(ContextSPtr& ctx, Ino ino, int32_t mode,
   out.attr_entry.Swap(response.mutable_inode());
   out.shrink_file = response.shrink_file();
   out.expand_file = response.expand_file();
-  out.effected_chunks = mds::Helper::PbRepeatedToVector(response.chunks());
+  out.effected_chunks =
+      ::dingofs::Helper::PbRepeatedToVector(response.chunks());
 
   return Status::OK();
 }
@@ -1682,7 +1792,7 @@ bool MDSClient::UpdateRouter() {
 
   fs_info_.Update(new_fs_info);
 
-  if (!mds_discovery_.RefreshFullyMDSList()) {
+  if (!mds_discovery_.RefreshFullyMDSList(true)) {
     LOG(ERROR) << "[meta.client] refresh mds discovery fail.";
     return false;
   }
@@ -1710,12 +1820,13 @@ void MDSClient::ProcessNotServe() {
   }
 }
 
-void MDSClient::ProcessNetError(MDSMeta& mds_meta) {
+bool MDSClient::ProcessNetError(MDSMeta& mds_meta) {
   // set the current mds as abnormal
   mds_discovery_.SetAbnormalMDS(mds_meta.ID());
 
+  uint64_t old_mds_id = mds_meta.ID();
   // get a normal mds
-  auto mdses = mds_discovery_.GetNormalMDS();
+  auto mdses = mds_discovery_.GetNormalMDS(false);
   for (auto& mds : mdses) {
     if (mds.ID() != mds_meta.ID()) {
       LOG(INFO) << fmt::format(
@@ -1725,6 +1836,8 @@ void MDSClient::ProcessNetError(MDSMeta& mds_meta) {
       break;
     }
   }
+
+  return old_mds_id != mds_meta.ID();
 }
 
 }  // namespace meta

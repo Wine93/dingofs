@@ -16,7 +16,7 @@
 
 /*
  * DingoFS Metadata Benchmark (mdtest-like) — bypass FUSE, call the client
- * VFSWrapper C++ API directly.
+ * ClientSession C++ API directly.
  *
  * This tool stress-tests the client-side metadata path (VFS -> MDS) with
  * concurrent directory and file creation, similar to mdtest with -I -L
@@ -73,7 +73,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "client/vfs/vfs_wrapper.h"
+#include "client/vfs/client_session.h"
 #include "common/logging.h"
 #include "common/meta.h"
 #include "common/status.h"
@@ -117,11 +117,16 @@ using dingofs::Attr;
 using dingofs::DirEntry;
 using dingofs::Ino;
 using dingofs::Status;
+using dingofs::client::ClientSession;
+using dingofs::client::Context;
 using dingofs::client::DingofsConfig;
-using dingofs::client::VFSWrapper;
+
+const Context kBenchContext{static_cast<uint32_t>(getuid()),
+                            static_cast<uint32_t>(getgid()),
+                            static_cast<int32_t>(getpid()), 0};
 
 static double NowSec() {
-  struct timespec ts{};
+  struct timespec ts {};
   if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
     return 0.0;
   }
@@ -191,12 +196,12 @@ static std::vector<std::string> SplitPath(const std::string& path) {
 
 // Resolve an absolute path to its inode. Returns 0 on success, -errno on
 // failure.
-static int ResolvePath(VFSWrapper* vfs, const std::string& path, Ino* ino) {
+static int ResolvePath(ClientSession* vfs, const std::string& path, Ino* ino) {
   std::vector<std::string> parts = SplitPath(path);
   Ino parent = dingofs::kRootIno;
   for (const auto& name : parts) {
     Attr attr;
-    Status s = vfs->Lookup(parent, name, &attr);
+    Status s = vfs->Lookup(kBenchContext, parent, name, &attr);
     if (!s.ok()) {
       LOG(ERROR) << fmt::format("resolve path fail, path({}) error({}).", path,
                                 s.ToString());
@@ -209,7 +214,7 @@ static int ResolvePath(VFSWrapper* vfs, const std::string& path, Ino* ino) {
 }
 
 // Resolve the parent directory of `path` and extract the final component name.
-static int ResolveParent(VFSWrapper* vfs, const std::string& path,
+static int ResolveParent(ClientSession* vfs, const std::string& path,
                          Ino* parent_ino, std::string* name) {
   if (path.empty() || path[0] != '/') return -EINVAL;
 
@@ -289,7 +294,7 @@ struct TreeSpec {
     LOG(INFO) << "Saved ino " << ino << " for dir " << path;
   }
 
-  Ino ResolveParent(VFSWrapper* vfs, const std::string& path) {
+  Ino ResolveParent(ClientSession* vfs, const std::string& path) {
     const std::string dir_path = DirName(path);
 
     {
@@ -383,13 +388,13 @@ struct ThreadResult {
   std::string error_path;  // path of first error
 };
 
-static int CreateDir(VFSWrapper* vfs, const std::string& path) {
+static int CreateDir(ClientSession* vfs, const std::string& path) {
   Ino parent;
   std::string name;
   int rc = ResolveParent(vfs, path, &parent, &name);
   if (rc != 0) return rc;
   Attr attr;
-  Status s = vfs->MkDir(parent, name, getuid(), getgid(), 0755, &attr);
+  Status s = vfs->MkDir(kBenchContext, parent, name, 0755, &attr);
   if (!s.ok()) {
     LOG(ERROR) << fmt::format("create dir fail, parent({}) name({}) error({}).",
                               parent, name, s.ToString());
@@ -398,12 +403,12 @@ static int CreateDir(VFSWrapper* vfs, const std::string& path) {
   return StatusToErrno(s);
 }
 
-static int CreateDir(VFSWrapper* vfs, Ino parent, const std::string& name,
+static int CreateDir(ClientSession* vfs, Ino parent, const std::string& name,
                      Ino& ino) {
   CHECK(parent != 0) << "Invalid parent inode 0 for " << name;
 
   Attr attr;
-  Status s = vfs->MkDir(parent, name, getuid(), getgid(), 0755, &attr);
+  Status s = vfs->MkDir(kBenchContext, parent, name, 0755, &attr);
   if (!s.ok()) {
     LOG(ERROR) << fmt::format("create dir fail, parent({}) name({}) error({}).",
                               parent, name, s.ToString());
@@ -414,12 +419,12 @@ static int CreateDir(VFSWrapper* vfs, Ino parent, const std::string& name,
   return StatusToErrno(s);
 }
 
-static int UnlinkPath(VFSWrapper* vfs, const std::string& path) {
+static int UnlinkPath(ClientSession* vfs, const std::string& path) {
   Ino parent;
   std::string name;
   int rc = ResolveParent(vfs, path, &parent, &name);
   if (rc != 0) return rc;
-  Status s = vfs->Unlink(parent, name);
+  Status s = vfs->Unlink(kBenchContext, parent, name);
   if (!s.ok()) {
     LOG(ERROR) << fmt::format("unlink fail, parent({}) name({}) error({}).",
                               parent, name, s.ToString());
@@ -427,12 +432,12 @@ static int UnlinkPath(VFSWrapper* vfs, const std::string& path) {
   return StatusToErrno(s);
 }
 
-static int RemoveDir(VFSWrapper* vfs, const std::string& path) {
+static int RemoveDir(ClientSession* vfs, const std::string& path) {
   Ino parent;
   std::string name;
   int rc = ResolveParent(vfs, path, &parent, &name);
   if (rc != 0) return rc;
-  Status s = vfs->RmDir(parent, name);
+  Status s = vfs->RmDir(kBenchContext, parent, name);
   if (!s.ok()) {
     LOG(ERROR) << fmt::format("rmdir fail, parent({}) name({}) error({}).",
                               parent, name, s.ToString());
@@ -441,13 +446,13 @@ static int RemoveDir(VFSWrapper* vfs, const std::string& path) {
   return StatusToErrno(s);
 }
 
-static int CreateEmptyFile(VFSWrapper* vfs, Ino parent,
+static int CreateEmptyFile(ClientSession* vfs, Ino parent,
                            const std::string& name) {
   CHECK(parent != 0) << "Invalid parent inode 0 for " << name;
 
   uint64_t fh = 0;
   Attr attr;
-  Status s = vfs->Create(parent, name, getuid(), getgid(), 33188,
+  Status s = vfs->Create(kBenchContext, parent, name, 33188,
                          O_CREAT | O_WRONLY | O_EXCL, &fh, &attr);
   if (!s.ok()) {
     LOG(ERROR) << fmt::format(
@@ -456,7 +461,7 @@ static int CreateEmptyFile(VFSWrapper* vfs, Ino parent,
     return StatusToErrno(s);
   }
 
-  s = vfs->Release(attr.ino, fh);
+  s = vfs->Release(kBenchContext, attr.ino, fh);
 
   return StatusToErrno(s);
 }
@@ -472,7 +477,7 @@ static int CreateEmptyFile(VFSWrapper* vfs, Ino parent,
 // unique mode: thread i creates its whole subtree (BFS order).
 // On error the thread records it and stops; other threads keep going
 // (the thread still participates in all barriers to avoid deadlock).
-static void UniqueWorker(VFSWrapper* vfs, TreeSpec* spec,
+static void UniqueWorker(ClientSession* vfs, TreeSpec* spec,
                          pthread_barrier_t* barrier,
                          ProgressTracker* dir_progress,
                          ProgressTracker* file_progress, ThreadResult* result) {
@@ -617,7 +622,7 @@ struct SharedWork {
   }
 };
 
-static void SharedWorker(VFSWrapper* vfs, TreeSpec* spec, SharedWork* work,
+static void SharedWorker(ClientSession* vfs, TreeSpec* spec, SharedWork* work,
                          pthread_barrier_t* barrier,
                          ProgressTracker* dir_progress,
                          ProgressTracker* file_progress, ThreadResult* result) {
@@ -695,14 +700,14 @@ static void SharedWorker(VFSWrapper* vfs, TreeSpec* spec, SharedWork* work,
 // Returns 0 on success, first -errno on failure.
 // ---------------------------------------------------------------------------
 
-static int RemoveTreeRecursive(VFSWrapper* vfs, const std::string& path) {
+static int RemoveTreeRecursive(ClientSession* vfs, const std::string& path) {
   Ino dir_ino;
   int rc = ResolvePath(vfs, path, &dir_ino);
   if (rc != 0) return rc;
 
   uint64_t fh = 0;
   bool need_cache = false;
-  Status s = vfs->OpenDir(dir_ino, &fh, need_cache);
+  Status s = vfs->OpenDir(kBenchContext, dir_ino, &fh, need_cache);
   if (!s.ok()) return StatusToErrno(s);
 
   std::vector<DirEntry> entries;
@@ -714,12 +719,12 @@ static int RemoveTreeRecursive(VFSWrapper* vfs, const std::string& path) {
     return true;
   };
 
-  s = vfs->ReadDir(dir_ino, fh, 0, true, handler);
+  s = vfs->ReadDir(kBenchContext, dir_ino, fh, 0, true, handler);
   if (!s.ok()) {
-    vfs->ReleaseDir(dir_ino, fh);
+    vfs->ReleaseDir(kBenchContext, dir_ino, fh);
     return StatusToErrno(s);
   }
-  vfs->ReleaseDir(dir_ino, fh);
+  vfs->ReleaseDir(kBenchContext, dir_ino, fh);
 
   int first_err = 0;
   for (const auto& entry : entries) {
@@ -820,7 +825,7 @@ int main(int argc, char** argv) {
   std::cout << "  total files: " << total_files << "\n";
   std::cout << "\n";
 
-  // ---- Configure logging before VFSWrapper starts ----
+  // ---- Configure logging before ClientSession starts ----
   FLAGS_log_dir = FLAGS_bench_log_dir;
   dingofs::FLAGS_log_level = FLAGS_bench_log_level;
 
@@ -835,7 +840,7 @@ int main(int argc, char** argv) {
   dingofs::Logger::Init("dingo-mdtest-bench");
 
   // ---- Mount ----
-  auto vfs = std::make_unique<VFSWrapper>();
+  auto vfs = std::make_unique<ClientSession>();
   DingofsConfig config;
   config.mds_addrs = FLAGS_bench_mds_addr;
   config.fs_name = FLAGS_bench_fs_name;

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "common/helper.h"
 #include "fmt/core.h"
 #include "gflags/gflags.h"
 #include "glog/logging.h"
@@ -20,11 +21,11 @@
 #include "test/unit/coverage/coverage.h"
 
 static void InitLog(const std::string& log_dir) {
-  if (!dingofs::mds::Helper::IsExistPath(log_dir)) {
-    dingofs::mds::Helper::CreateDirectories(log_dir);
+  if (!::dingofs::Helper::IsExistPath(log_dir)) {
+    ::dingofs::Helper::CreateDirectories(log_dir);
   }
 
-  FLAGS_logbufsecs = 0;
+  FLAGS_logbufsecs = 10;
   FLAGS_stop_logging_if_full_disk = true;
   FLAGS_minloglevel = google::GLOG_INFO;
   FLAGS_logbuflevel = google::GLOG_INFO;

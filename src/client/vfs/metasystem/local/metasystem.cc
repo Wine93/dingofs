@@ -227,7 +227,7 @@ Status LocalMetaSystem::Init(bool /*skip_mount*/) {
 }
 
 void LocalMetaSystem::Stop(bool /*skip_unmount*/) {
-  crontab_manager_.Destroy();
+  crontab_manager_.Stop();
 
   CloseLevelDB();
 }
@@ -351,7 +351,7 @@ Status LocalMetaSystem::MkNod(ContextSPtr, Ino parent, const std::string& name,
   return Status::OK();
 }
 
-Status LocalMetaSystem::Open(ContextSPtr, Ino ino, int flags, uint64_t) {
+Status LocalMetaSystem::Open(ContextSPtr, Ino ino, int flags, uint64_t, bool*) {
   const uint32_t fs_id = fs_info_.fs_id();
   const uint64_t now_ns = utils::TimestampNs();
 
@@ -382,9 +382,13 @@ Status LocalMetaSystem::Open(ContextSPtr, Ino ino, int flags, uint64_t) {
     auto status = Get(inode_key, value);
 
     attr_entry = MetaCodec::DecodeInodeValue(value);
+    std::vector<KeyValue> kvs;
 
     if (flags & O_TRUNC) {
       file_length = attr_entry.length();
+      status =
+          AppendZeroSlicesToExistingChunks(fs_id, ino, 0, file_length, kvs);
+      if (!status.ok()) return status;
       attr_entry.set_length(0);
 
       attr_entry.set_ctime(std::max(attr_entry.ctime(), now_ns));
@@ -395,11 +399,10 @@ Status LocalMetaSystem::Open(ContextSPtr, Ino ino, int flags, uint64_t) {
 
     attr_entry.set_version(attr_entry.version() + 1);
 
-    // write to leveldb
-    std::vector<KeyValue> kvs = {
-        {KeyValue::OpType::kPut, inode_key,
-         MetaCodec::EncodeInodeValue(attr_entry)},
-    };
+    // Commit the inode and zero-slice updates atomically. Otherwise a later
+    // sparse rewrite can expose slices that belonged to the truncated file.
+    kvs.push_back({KeyValue::OpType::kPut, inode_key,
+                   MetaCodec::EncodeInodeValue(attr_entry)});
     status = Put(kvs);
     if (!status.ok()) return status;
   }
@@ -418,7 +421,8 @@ Status LocalMetaSystem::Create(ContextSPtr ctx, Ino parent,
   auto status = MkNod(ctx, parent, name, uid, gid, mode, 0, attr);
   if (!status.ok()) return status;
 
-  status = Open(ctx, attr->ino, flags, fh);
+  bool keep_cache = true;
+  status = Open(ctx, attr->ino, flags, fh, &keep_cache);
   if (!status.ok()) return status;
 
   return Status::OK();
@@ -778,7 +782,7 @@ Status LocalMetaSystem::ReadDir(ContextSPtr ctx, Ino ino, uint64_t fh,
     }
 
     AttrEntry attr_entry;
-    status = GetAttrEntry(ino, attr_entry);
+    status = GetAttrEntry(entry.ino, attr_entry);
     if (!status.ok()) return status;
 
     if (with_attr) entry.attr = meta::Helper::ToAttr(attr_entry);
@@ -1065,6 +1069,16 @@ Status LocalMetaSystem::SetAttr(ContextSPtr, Ino ino, int to_set,
     if (to_set & kSetAttrGid) {
       attr_entry.set_gid(in_attr.gid);
     }
+    if (to_set & (kSetAttrKillSuid | kSetAttrKillSgid | kSetAttrKillPriv)) {
+      uint32_t mode = attr_entry.mode();
+      if (to_set & (kSetAttrKillSuid | kSetAttrKillPriv)) {
+        mode &= ~S_ISUID;
+      }
+      if (to_set & (kSetAttrKillSgid | kSetAttrKillPriv)) {
+        mode &= ~S_ISGID;
+      }
+      attr_entry.set_mode(mode);
+    }
 
     struct timespec now;
     CHECK(clock_gettime(CLOCK_REALTIME, &now) == 0) << "get current time fail.";
@@ -1200,10 +1214,12 @@ Status LocalMetaSystem::Fallocate(ContextSPtr, Ino ino, int mode,
     std::vector<KeyValue> kvs;
 
     // Write zero slices covering [offset, end_offset), split by chunk
-    // boundaries. This is used for both PUNCH_HOLE and allocate-with-zero,
-    // since in local mode data on object storage is untouched and reads
-    // return zeros via id=0 slices.
-    uint64_t cursor = offset;
+    // boundaries, for PUNCH_HOLE / ZERO_RANGE only: data on object storage is
+    // untouched and reads return zeros via id=0 slices.
+    // ponytail: plain allocate (mode == 0) must only extend the length —
+    // appending zero slices there shadows already-written data (slices are
+    // append-ordered) and silently corrupts the file.
+    uint64_t cursor = (mode == 0) ? end_offset : offset;
     while (cursor < end_offset) {
       const uint64_t chunk_index = cursor / chunk_size;
       const uint64_t chunk_pos = cursor % chunk_size;
@@ -1273,6 +1289,55 @@ Status LocalMetaSystem::AppendZeroSliceToChunk(uint32_t fs_id, Ino ino,
 
   kvs.push_back({KeyValue::OpType::kPut, chunk_key,
                  MetaCodec::EncodeChunkValue(chunk_entry)});
+  return Status::OK();
+}
+
+Status LocalMetaSystem::AppendZeroSlicesToExistingChunks(
+    uint32_t fs_id, Ino ino, uint64_t offset, uint64_t end_offset,
+    std::vector<KeyValue>& kvs) {
+  if (offset >= end_offset) return Status::OK();
+
+  const uint64_t chunk_size = fs_info_.chunk_size();
+  const uint64_t first_chunk = offset / chunk_size;
+  const uint64_t last_chunk = (end_offset - 1) / chunk_size;
+  auto* iter = db_->NewIterator(leveldb::ReadOptions());
+  iter->Seek(MetaCodec::EncodeChunkKey(fs_id, ino, first_chunk));
+
+  while (iter->Valid() && MetaCodec::IsChunkKey(iter->key().ToString())) {
+    uint32_t chunk_fs_id;
+    Ino chunk_ino;
+    uint64_t chunk_index;
+    MetaCodec::DecodeChunkKey(iter->key().ToString(), chunk_fs_id, chunk_ino,
+                              chunk_index);
+    if (chunk_fs_id != fs_id || chunk_ino != ino || chunk_index > last_chunk) {
+      break;
+    }
+
+    auto chunk_entry = MetaCodec::DecodeChunkValue(iter->value().ToString());
+    const uint64_t chunk_offset = chunk_index * chunk_size;
+    const uint64_t zero_start = std::max(offset, chunk_offset);
+    const uint64_t zero_end = std::min(end_offset, chunk_offset + chunk_size);
+    if (zero_start < zero_end) {
+      auto* slice_entry = chunk_entry.add_slices();
+      slice_entry->set_id(0);
+      slice_entry->set_pos(zero_start - chunk_offset);
+      slice_entry->set_size(0);
+      slice_entry->set_off(0);
+      slice_entry->set_len(zero_end - zero_start);
+      chunk_entry.set_version(chunk_entry.version() + 1);
+
+      kvs.push_back({KeyValue::OpType::kPut, iter->key().ToString(),
+                     MetaCodec::EncodeChunkValue(chunk_entry)});
+    }
+    iter->Next();
+  }
+
+  const auto iter_status = iter->status();
+  delete iter;
+  if (!iter_status.ok()) {
+    return Status::IoError(
+        fmt::format("scan chunk fail, {}.", iter_status.ToString()));
+  }
   return Status::OK();
 }
 
@@ -1743,7 +1808,8 @@ mds::FsInfoEntry LocalMetaSystem::GenFsInfo() {
   fs_info.set_block_size(kBlockSize);
   fs_info.set_chunk_size(kChunkSize);
   fs_info.set_enable_dir_stats(false);
-  fs_info.set_owner(std::getenv("USER"));
+  const char* owner = std::getenv("USER");
+  fs_info.set_owner(owner == nullptr ? "" : owner);
   fs_info.set_capacity(INT64_MAX);
   fs_info.set_recycle_time_hour(24);
   fs_info.set_create_time_s(utils::Timestamp());

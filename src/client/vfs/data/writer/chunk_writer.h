@@ -48,15 +48,18 @@ struct ChunkWriteInfo {
   const int32_t end_chunk_offset{0};
   const int64_t file_offset{0};
   const int64_t end_file_offset{0};
+  WritePageLease* lease{nullptr};
 
   explicit ChunkWriteInfo(const char* _buf, int32_t _size,
-                          int32_t _chunk_offset, int64_t _file_offset)
+                          int32_t _chunk_offset, int64_t _file_offset,
+                          WritePageLease* _lease)
       : buf(_buf),
         size(_size),
         chunk_offset(_chunk_offset),
         end_chunk_offset(_chunk_offset + size),
         file_offset(_file_offset),
-        end_file_offset(_file_offset + size) {}
+        end_file_offset(_file_offset + size),
+        lease(_lease) {}
 
   std::string ToString() const {
     return fmt::format(
@@ -72,11 +75,14 @@ class ChunkWriter {
 
   ~ChunkWriter();
 
+  // The caller must prevent new Write calls and wait for all in-flight Write
+  // calls before Stop().
   void Stop();
 
-  // chunk_offset is the offset in the chunk, not in the file.
-  Status Write(ContextSPtr ctx, const char* buf, int32_t size,
-               int32_t chunk_offset);
+  // chunk_offset is relative to the chunk. The caller must admit sufficient
+  // pages and must not call after Stop(); contract violations CHECK-fail.
+  void Write(ContextSPtr ctx, const char* buf, int32_t size,
+             int32_t chunk_offset, WritePageLease* lease);
 
   // All slice data can be flushed in concurrent, but commit must be in order.
   // If slice data is empty, the empty flush task must be submitted
@@ -110,7 +116,6 @@ class ChunkWriter {
   struct Writer {
     ChunkWriteInfo* write_info{nullptr};
     std::condition_variable cv;
-    Status status;
     bool done{false};
 
     std::string ToString() const {
@@ -144,14 +149,11 @@ class ChunkWriter {
 
   void TryCommitFlushTasks(ContextSPtr ctx);
 
+  Status GetErrorStatus() const;
+
   int64_t WritersCount() const {
     std::lock_guard<std::mutex> lg(writer_mutex_);
     return writers_.size();
-  }
-
-  Status GetErrorStatus() const {
-    std::lock_guard<std::mutex> lg(flush_mutex_);
-    return error_status_;
   }
 
   // This is used to mark the chunk as error when some operation fails,
@@ -162,11 +164,6 @@ class ChunkWriter {
     if (error_status_.ok()) {
       error_status_ = status;
     }
-  }
-
-  int64_t FlushTasksCount() const {
-    std::lock_guard<std::mutex> lg(flush_mutex_);
-    return flush_queue_.size();
   }
 
   VFSHub* hub_;
@@ -187,7 +184,11 @@ class ChunkWriter {
 
   mutable std::mutex flush_mutex_;
   std::deque<FlushTask*> flush_queue_;
-  // guarded by write_flush_mutex_
+  // Signalled when flush_queue_ becomes empty; Stop() waits on it for
+  // quiescence after DoSyncFlush. Guarded by flush_mutex_.
+  std::condition_variable flush_cv_;
+  // Guarded by flush_mutex_. Never invoke a completion callback while holding
+  // this mutex; callbacks may enter higher-level writer objects.
   // when this not ok, all write and flush should return error
   Status error_status_;
 };

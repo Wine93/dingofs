@@ -34,6 +34,9 @@ struct Context {
 
   uint64_t start_time_ns{0};
 
+  bool inner_req{false};
+
+  bool retry{true};
   bool timeout_retry{true};
 
   // Caller uid carried to MDS via proto Context.uid. Currently only used by
@@ -41,6 +44,8 @@ struct Context {
   // "root or unset" — paths that strictly enforce root must ensure the value
   // was explicitly populated by the FUSE entry point (fuse_req_ctx->uid).
   uint32_t uid{0};
+
+  std::string reason;  // reason for the request, used for log and trace
 
   std::weak_ptr<SpanScope> trace_span;
 

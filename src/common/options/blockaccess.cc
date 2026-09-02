@@ -28,12 +28,24 @@ DEFINE_validator(block_access_logging, brpc::PassValidate);
 
 // rados option
 DEFINE_int32(rados_op_timeout, 120, "rados operation timeout in seconds");
+DEFINE_bool(rados_map_refresh_enable, true,
+            "enable background refresh of the latest RADOS OSDMap");
+DEFINE_uint32(rados_map_refresh_interval_s, 60,
+              "background RADOS OSDMap refresh interval in seconds");
+DEFINE_uint32(rados_map_refresh_jitter_pct, 20,
+              "random jitter percentage for the RADOS OSDMap refresh "
+              "interval (clamped to 50)");
 
 // aws option
 DEFINE_string(s3_region, "us-east-1", "aws s3 region");
 DEFINE_int32(s3_loglevel, 4, "aws sdk log level");
 DEFINE_bool(s3_verify_ssl, false, "whether to verify ssl");
 DEFINE_int32(s3_max_connections, 32, "max connections to s3");
+DEFINE_int32(s3_crt_throughput_target_gbps, 20,
+              "crt client throughput target in Gbps; crt derives its real "
+              "connection count from ceil(target/0.4), maxConnections is "
+              "ignored on the crt path. Defaults to 20; 0 keeps the sdk "
+              "default (10.0 -> 25 connections)");
 DEFINE_int32(s3_connect_timeout, 60000, "s3 connect timeout in milliseconds");
 DEFINE_int32(s3_request_timeout, 10000, "s3 request timeout in milliseconds");
 DEFINE_bool(s3_use_crt_client, true, "whether to use crt client");
@@ -44,6 +56,9 @@ DEFINE_bool(s3_use_thread_pool, true, "whether to use thread pool");
 DEFINE_int32(s3_async_thread_num, 256, "async thread num in thread pool");
 DEFINE_bool(s3_use_virtual_address, false, "whether to use virtual address");
 DEFINE_bool(s3_enable_telemetry, false, "whether to enable telemetry");
+DEFINE_int32(s3_sdk_max_retries, 0,
+             "aws sdk internal max retries, 0 means disable sdk internal "
+             "retry (retry is handled by the upper storage client)");
 
 DEFINE_bool(use_fake_block_access, false, "use fake block access");
 

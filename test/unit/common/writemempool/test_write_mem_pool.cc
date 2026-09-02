@@ -14,11 +14,14 @@
  * limitations under the License.
  */
 
-#include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <future>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -26,180 +29,294 @@
 
 namespace dingofs {
 
-// ─── WriteMemPool ──────────────────────────────────────────────────────
-
-TEST(WriteMemPoolTest, DeAllocate_DecreasesUsed) {
-  constexpr int64_t kPageSize = 4096;
-  WriteMemPool mgr(kPageSize * 4, kPageSize);
-
-  char* page = mgr.TryAllocate();
-  ASSERT_NE(page, nullptr);
-  EXPECT_EQ(mgr.GetUsedBytes(), kPageSize);
-
-  mgr.DeAllocate(page);
-  EXPECT_EQ(mgr.GetUsedBytes(), 0);
-}
-
-TEST(WriteMemPoolTest, GetPageSize_GetTotalBytes) {
-  constexpr int64_t kPageSize = 8192;
-  constexpr int64_t kTotal = kPageSize * 8;
-  WriteMemPool mgr(kTotal, kPageSize);
-
-  EXPECT_EQ(mgr.GetPageSize(), kPageSize);
-  EXPECT_EQ(mgr.GetTotalBytes(), kTotal);
-}
-
-TEST(WriteMemPoolTest, IsHighPressure_True_WhenAboveThreshold) {
-  constexpr int64_t kPageSize = 1024;
-  // 2 pages total; allocate 2 to hit 100% usage
-  WriteMemPool mgr(kPageSize * 2, kPageSize);
-
-  char* p1 = mgr.TryAllocate();
-  char* p2 = mgr.TryAllocate();
-  ASSERT_NE(p1, nullptr);
-  ASSERT_NE(p2, nullptr);
-
-  EXPECT_TRUE(mgr.IsHighPressure());
-
-  mgr.DeAllocate(p1);
-  mgr.DeAllocate(p2);
-}
-
-TEST(WriteMemPoolTest, Concurrent_AllocAndDealloc_FinalZero) {
-  constexpr int kThreads = 4;
-  constexpr int kIters = 200;
-  constexpr int64_t kPageSize = 4096;
-
-  WriteMemPool mgr(static_cast<int64_t>(kThreads) * kIters * kPageSize,
-                   kPageSize);
-
-  std::vector<std::thread> threads;
-  threads.reserve(kThreads);
-  for (int t = 0; t < kThreads; ++t) {
-    threads.emplace_back([&mgr]() {
-      for (int i = 0; i < kIters; ++i) {
-        char* page = mgr.TryAllocate();
-        mgr.DeAllocate(page);
-      }
-    });
-  }
-  for (auto& th : threads) {
-    th.join();
+class WriteMemPoolTestPeer {
+ public:
+  static char* RemovePhysicalPage(WriteMemPool* pool) {
+    char* page = nullptr;
+    CHECK_EQ(pool->page_pool_->RequireBatch(&page, 1), 1);
+    return page;
   }
 
-  EXPECT_EQ(mgr.GetUsedBytes(), 0);
-}
-
-// ─── TryAllocate ───────────────────────────────────────────────────────
-
-TEST(WriteMemPoolTest, TryAllocate_ReturnsNonNull_IncreasesUsed) {
-  constexpr int64_t kPageSize = 4096;
-  WriteMemPool mgr(kPageSize * 4, kPageSize);
-
-  char* page = mgr.TryAllocate();
-  ASSERT_NE(page, nullptr);
-  EXPECT_EQ(mgr.GetUsedBytes(), kPageSize);
-
-  mgr.DeAllocate(page);
-  EXPECT_EQ(mgr.GetUsedBytes(), 0);
-}
-
-TEST(WriteMemPoolTest, TryAllocate_ReturnsNull_WhenExhausted_NoBlock) {
-  constexpr int64_t kPageSize = 4096;
-  WriteMemPool mgr(kPageSize * 2, kPageSize);  // 2 slots
-
-  char* a = mgr.TryAllocate();
-  char* b = mgr.TryAllocate();
-  ASSERT_NE(a, nullptr);
-  ASSERT_NE(b, nullptr);
-
-  // Pool drained -- TryAllocate returns immediately (no bounded wait) and used
-  // stays at capacity (a null result must not bump used_pages_).
-  char* c = mgr.TryAllocate();
-  EXPECT_EQ(c, nullptr);
-  EXPECT_EQ(mgr.GetUsedBytes(), 2 * kPageSize);
-
-  mgr.DeAllocate(a);
-  mgr.DeAllocate(b);
-}
-
-// ─── Perf: pooled Allocate/DeAllocate vs new char[] baseline ───────────
-
+  static void ReturnPhysicalPage(WriteMemPool* pool, char* page) {
+    pool->page_pool_->ReleaseBatch(&page, 1);
+  }
+};
 namespace {
 
-// One op = Allocate + DeAllocate. Pool is sized so the fast path always hits
-// (no bounded-acquire, no slow-path metric bumps), so this measures the
-// steady-state hot path: Require() + used_pages atomic (+ the untriggered
-// metric branch). Returns ops/sec across all threads.
-double RunPooledBench(WriteMemPool* wmp, int num_threads, int iters) {
-  std::atomic<bool> start{false};
-  std::vector<std::thread> ts;
-  ts.reserve(num_threads);
-  for (int t = 0; t < num_threads; ++t) {
-    ts.emplace_back([&] {
-      while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
-      for (int i = 0; i < iters; ++i) {
-        char* p = wmp->TryAllocate();
-        if (p != nullptr) wmp->DeAllocate(p);
-      }
-    });
+using namespace std::chrono_literals;
+
+class CountingObserver : public WritePressureObserver {
+ public:
+  void OnWritePressure() override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++event_count_;
+    cv_.notify_all();
   }
-  auto t0 = std::chrono::steady_clock::now();
-  start.store(true, std::memory_order_release);
-  for (auto& t : ts) t.join();
-  double sec =
-      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
-          .count();
-  return static_cast<double>(num_threads) * iters / sec;
+
+  bool WaitForEvent() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return cv_.wait_for(lock, 5s, [this] { return event_count_ != 0; });
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  int event_count_{0};
+};
+
+class BlockingObserver : public WritePressureObserver {
+ public:
+  void OnWritePressure() override {
+    std::unique_lock<std::mutex> lock(mutex_);
+    entered_ = true;
+    cv_.notify_all();
+    cv_.wait(lock, [this] { return released_; });
+  }
+
+  bool WaitUntilEntered() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return cv_.wait_for(lock, 5s, [this] { return entered_; });
+  }
+
+  void Release() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    released_ = true;
+    cv_.notify_all();
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  bool entered_{false};
+  bool released_{false};
+};
+
+TEST(WriteMemPoolDeathTest, RejectsZeroPageSizeBeforeDivision) {
+  EXPECT_DEATH({ WriteMemPool pool(4096, 0); }, "page_size > 0");
 }
 
-// Baseline: new char[page]/delete[] -- exactly what WriteMemPool::Allocate did
-// before pooling. Touch byte 0 so the alloc isn't optimized away.
-double RunMallocBench(int64_t page_size, int num_threads, int iters) {
-  std::atomic<bool> start{false};
-  std::vector<std::thread> ts;
-  ts.reserve(num_threads);
-  for (int t = 0; t < num_threads; ++t) {
-    ts.emplace_back([&] {
-      while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
-      for (int i = 0; i < iters; ++i) {
-        char* p = new char[page_size];
-        p[0] = static_cast<char>(i);
-        delete[] p;
+TEST(WriteMemPoolDeathTest, RejectsCapacitySmallerThanOnePage) {
+  EXPECT_DEATH({ WriteMemPool pool(4096, 8192); }, "total_bytes >= page_size");
+}
+
+TEST(WriteMemPoolDeathTest, RejectsNonIntegralPageCapacity) {
+  EXPECT_DEATH({ WriteMemPool pool(10 * 1024, 4096); }, "exact multiple");
+}
+
+TEST(WriteMemPoolTest, GeometryAndLeaseAccounting) {
+  constexpr int64_t kPage = 4096;
+  WriteMemPool pool(kPage * 4, kPage);
+  EXPECT_EQ(pool.GetPageSize(), kPage);
+  EXPECT_EQ(pool.GetTotalBytes(), kPage * 4);
+  EXPECT_EQ(pool.BufferCount(), 4);
+  EXPECT_EQ(pool.TotalSize(), kPage * 4);
+  EXPECT_NE(pool.BaseAddr(), nullptr);
+
+  {
+    WritePageLease lease;
+    ASSERT_TRUE(pool.Acquire(2, &lease).ok());
+    EXPECT_EQ(lease.Size(), 2);
+    EXPECT_EQ(pool.GetUsedBytes(), kPage * 2);
+  }
+  EXPECT_EQ(pool.GetUsedBytes(), 0);
+}
+
+TEST(WriteMemPoolTest, TakeTransfersPageOwnership) {
+  constexpr int64_t kPage = 4096;
+  WriteMemPool pool(kPage * 2, kPage);
+  char* page = nullptr;
+  {
+    WritePageLease lease;
+    ASSERT_TRUE(pool.Acquire(1, &lease).ok());
+    lease.Take(1, &page);
+    EXPECT_TRUE(lease.Empty());
+  }
+  EXPECT_EQ(pool.GetUsedBytes(), kPage);
+  pool.Release(&page, 1);
+  EXPECT_EQ(pool.GetUsedBytes(), 0);
+}
+
+TEST(WriteMemPoolTest, RemovingObserverWaitsForInFlightNotification) {
+  constexpr int64_t kPage = 4096;
+  WriteMemPool pool(kPage, kPage);
+  BlockingObserver observer;
+  pool.SetPressureObserver(&observer);
+
+  WritePageLease held;
+  ASSERT_TRUE(pool.Acquire(1, &held).ok());
+  auto blocked = std::async(std::launch::async, [&] {
+    WritePageLease lease;
+    return pool.Acquire(1, &lease);
+  });
+  if (!observer.WaitUntilEntered()) {
+    observer.Release();
+    pool.Close();
+    FAIL() << "pressure notification did not start";
+  }
+
+  std::promise<void> unregister_started;
+  auto unregister = std::async(std::launch::async, [&] {
+    unregister_started.set_value();
+    pool.SetPressureObserver(nullptr);
+  });
+  unregister_started.get_future().wait();
+  EXPECT_EQ(unregister.wait_for(50ms), std::future_status::timeout);
+
+  observer.Release();
+  EXPECT_EQ(unregister.wait_for(5s), std::future_status::ready);
+  unregister.get();
+
+  pool.Close();
+  EXPECT_TRUE(blocked.get().IsStop());
+}
+
+TEST(WriteMemPoolTest, TryAcquireIsExactAndDoesNotBypassWaiter) {
+  constexpr int64_t kPage = 4096;
+  WriteMemPool pool(kPage * 2, kPage);
+  CountingObserver observer;
+  pool.SetPressureObserver(&observer);
+
+  WritePageLease held;
+  ASSERT_TRUE(pool.Acquire(2, &held).ok());
+
+  auto blocked = std::async(std::launch::async, [&] {
+    WritePageLease lease;
+    return pool.Acquire(2, &lease);
+  });
+  ASSERT_TRUE(observer.WaitForEvent());
+
+  WritePageLease opportunistic;
+  Status s = pool.TryAcquire(1, &opportunistic);
+  EXPECT_TRUE(s.IsNotFit()) << s.ToString();
+
+  held = WritePageLease();
+  EXPECT_TRUE(blocked.get().ok());
+  pool.SetPressureObserver(nullptr);
+}
+
+TEST(WriteMemPoolTest, FifoHeadIsNotBypassedBySmallerRequest) {
+  constexpr int64_t kPage = 4096;
+  WriteMemPool pool(kPage * 3, kPage);
+  CountingObserver observer;
+  pool.SetPressureObserver(&observer);
+
+  WritePageLease initial;
+  ASSERT_TRUE(pool.Acquire(3, &initial).ok());
+  std::array<char*, 3> pages{};
+  initial.Take(pages.size(), pages.data());
+
+  std::promise<void> first_acquired;
+  auto first_acquired_future = first_acquired.get_future();
+  std::promise<void> release_first;
+  auto release_first_future = release_first.get_future();
+  auto first = std::async(std::launch::async, [&] {
+    WritePageLease lease;
+    Status s = pool.Acquire(2, &lease);
+    first_acquired.set_value();
+    release_first_future.wait();
+    return s;
+  });
+  ASSERT_TRUE(observer.WaitForEvent());
+
+  auto second = std::async(std::launch::async, [&] {
+    WritePageLease lease;
+    return pool.Acquire(1, &lease);
+  });
+
+  pool.Release(pages.data(), 1);
+  EXPECT_EQ(second.wait_for(50ms), std::future_status::timeout);
+
+  pool.Release(pages.data() + 1, 1);
+  ASSERT_EQ(first_acquired_future.wait_for(5s), std::future_status::ready);
+  EXPECT_EQ(second.wait_for(50ms), std::future_status::timeout);
+  release_first.set_value();
+  EXPECT_TRUE(first.get().ok());
+  EXPECT_TRUE(second.get().ok());
+
+  pool.Release(pages.data() + 2, 1);
+  pool.SetPressureObserver(nullptr);
+}
+
+TEST(WriteMemPoolTest, CloseWakesQueuedAcquireAndRejectsNewAdmission) {
+  constexpr int64_t kPage = 4096;
+  WriteMemPool pool(kPage, kPage);
+  CountingObserver observer;
+  pool.SetPressureObserver(&observer);
+  WritePageLease held;
+  ASSERT_TRUE(pool.Acquire(1, &held).ok());
+
+  auto blocked = std::async(std::launch::async, [&] {
+    WritePageLease lease;
+    return pool.Acquire(1, &lease);
+  });
+  ASSERT_TRUE(observer.WaitForEvent());
+  pool.Close();
+
+  Status waiting = blocked.get();
+  EXPECT_TRUE(waiting.IsStop()) << waiting.ToString();
+  WritePageLease rejected;
+  EXPECT_TRUE(pool.Acquire(1, &rejected).IsStop());
+}
+
+TEST(WriteMemPoolTest, OversizedRequestsFailWithoutQueueing) {
+  WriteMemPool pool(2 * 4096, 4096);
+  WritePageLease lease;
+  EXPECT_TRUE(pool.Acquire(3, &lease).IsNoSpace());
+  EXPECT_TRUE(pool.TryAcquire(3, &lease).IsNotFit());
+  EXPECT_FALSE(pool.IsPressured());
+}
+
+TEST(WriteMemPoolTest, ConcurrentAcquireAndReleaseReturnsToZero) {
+  constexpr int kThreads = 16;
+  constexpr int kIterations = 2000;
+  constexpr int64_t kPage = 4096;
+  WriteMemPool pool(kThreads * kPage, kPage);
+
+  std::vector<std::thread> threads;
+  for (int i = 0; i < kThreads; ++i) {
+    threads.emplace_back([&] {
+      for (int j = 0; j < kIterations; ++j) {
+        WritePageLease lease;
+        Status status = pool.Acquire(1, &lease);
+        ASSERT_TRUE(status.ok()) << status.ToString();
       }
     });
   }
-  auto t0 = std::chrono::steady_clock::now();
-  start.store(true, std::memory_order_release);
-  for (auto& t : ts) t.join();
-  double sec =
-      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
-          .count();
-  return static_cast<double>(num_threads) * iters / sec;
+  for (auto& thread : threads) thread.join();
+  EXPECT_EQ(pool.GetUsedBytes(), 0);
+}
+
+TEST(WriteMemPoolTest, ReleaseAfterCloseRestoresAccounting) {
+  constexpr int64_t kPage = 4096;
+  WriteMemPool pool(2 * kPage, kPage);
+  WritePageLease lease;
+  ASSERT_TRUE(pool.Acquire(2, &lease).ok());
+  std::array<char*, 2> pages{};
+  lease.Take(pages.size(), pages.data());
+
+  pool.Close();
+  pool.Release(pages.data(), pages.size());
+
+  EXPECT_EQ(pool.GetUsedBytes(), 0);
+  WritePageLease rejected;
+  EXPECT_TRUE(pool.TryAcquire(1, &rejected).IsStop());
+}
+
+TEST(WriteMemPoolTest, StablePhysicalShortBreaksPool) {
+  constexpr int64_t kPage = 4096;
+  WriteMemPool pool(2 * kPage, kPage);
+  char* stolen = WriteMemPoolTestPeer::RemovePhysicalPage(&pool);
+
+  WritePageLease lease;
+  Status status = pool.Acquire(2, &lease);
+  EXPECT_TRUE(status.IsInternal()) << status.ToString();
+  EXPECT_TRUE(lease.Empty());
+  EXPECT_EQ(pool.GetUsedBytes(), 0);
+
+  WritePageLease rejected;
+  EXPECT_TRUE(pool.Acquire(1, &rejected).IsInternal());
+  WriteMemPoolTestPeer::ReturnPhysicalPage(&pool, stolen);
 }
 
 }  // namespace
-
-// Prints throughput + ns/op for pooled (incl. metrics埋点) vs new char[] at
-// 1/4/16/64 threads. Not asserting numbers -- visibility for the "接池+埋点 vs
-// new char[]" comparison. Pool sized large (256 MiB) so the fast path is hit
-// and slow-path metric branches never fire.
-TEST(WriteMemPoolPerf, PooledVsMalloc) {
-  constexpr int64_t kPageSize = 65536;
-  constexpr int64_t kTotalBytes = 4096LL * kPageSize;  // 256 MiB, 4096 slots
-  constexpr int kIters = 200000;
-  WriteMemPool wmp(kTotalBytes, kPageSize);
-
-  for (int n : {1, 4, 16, 64}) {
-    double pooled = RunPooledBench(&wmp, n, kIters);
-    double mallocd = RunMallocBench(kPageSize, n, kIters);
-    LOG(INFO) << "threads=" << n
-              << "  pooled=" << static_cast<long long>(pooled) << " ops/s ("
-              << (1e9 / pooled * n)
-              << " ns/op)  malloc=" << static_cast<long long>(mallocd)
-              << " ops/s (" << (1e9 / mallocd * n)
-              << " ns/op)  pooled/malloc=" << (pooled / mallocd) << "x";
-  }
-}
-
 }  // namespace dingofs

@@ -24,11 +24,12 @@
 #include <utility>
 #include <vector>
 
+#include "common/helper.h"
 #include "dingofs/mds.pb.h"
 #include "json/value.h"
 #include "mds/common/context.h"
+#include "mds/common/inflight_controller.h"
 #include "mds/common/status.h"
-#include "mds/common/trash.h"
 #include "mds/common/type.h"
 #include "mds/filesystem/chunk_cache.h"
 #include "mds/filesystem/dentry.h"
@@ -41,6 +42,7 @@
 #include "mds/filesystem/partition.h"
 #include "mds/filesystem/renamer.h"
 #include "mds/filesystem/store_operation.h"
+#include "mds/filesystem/warmup.h"
 #include "mds/mds/mds_meta.h"
 #include "mds/quota/quota.h"
 #include "mds/statistics/dir_stat_manager.h"
@@ -112,16 +114,14 @@ struct EntryWithChunkOut {
 struct EntryOutForOpen {
   AttrEntry attr;
   std::vector<ChunkEntry> chunks;
-  std::string data_out;
-  uint64_t data_version{0};
 };
 
 class FileSystem : public std::enable_shared_from_this<FileSystem> {
  public:
   FileSystem(uint64_t self_mds_id, FsInfoSPtr fs_info, IdGeneratorUPtr ino_id_generator,
-             IdGeneratorSPtr slice_id_generator, KVStorageSPtr kv_storage, OperationProcessorSPtr operation_processor,
-             MDSMetaMapSPtr mds_meta_map, WorkerSetSPtr quota_worker_set, WorkerSetSPtr dir_stat_worker_set,
-             notify::NotifyBuddySPtr notify_buddy);
+             IdGeneratorSPtr slice_id_generator, OperationProcessorSPtr operation_processor,
+             WarmupProcessorSPtr warmup_processor, MDSMetaMapSPtr mds_meta_map, WorkerSetSPtr quota_worker_set,
+             WorkerSetSPtr dir_stat_worker_set, notify::NotifyBuddySPtr notify_buddy);
   ~FileSystem();
 
   FileSystem(const FileSystem&) = delete;
@@ -130,18 +130,19 @@ class FileSystem : public std::enable_shared_from_this<FileSystem> {
   FileSystem& operator=(FileSystem&&) = delete;
 
   static FileSystemSPtr New(uint64_t self_mds_id, FsInfoSPtr fs_info, IdGeneratorUPtr ino_id_generator,
-                            IdGeneratorSPtr slice_id_generator, KVStorageSPtr kv_storage,
-                            OperationProcessorSPtr operation_processor, MDSMetaMapSPtr mds_meta_map,
+                            IdGeneratorSPtr slice_id_generator, OperationProcessorSPtr operation_processor,
+                            WarmupProcessorSPtr warmup_processor, MDSMetaMapSPtr mds_meta_map,
                             WorkerSetSPtr quota_worker_set, WorkerSetSPtr dir_stat_worker_set,
                             notify::NotifyBuddySPtr notify_buddy) {
     return std::make_shared<FileSystem>(self_mds_id, fs_info, std::move(ino_id_generator), slice_id_generator,
-                                        kv_storage, operation_processor, mds_meta_map, quota_worker_set,
+                                        operation_processor, warmup_processor, mds_meta_map, quota_worker_set,
                                         dir_stat_worker_set, notify_buddy);
   }
 
   FileSystemSPtr GetSelfPtr();
 
   bool Init();
+  void Stop();
 
   uint32_t FsId() const { return fs_id_; }
   std::string FsName() const { return fs_info_->GetName(); }
@@ -162,6 +163,8 @@ class FileSystem : public std::enable_shared_from_this<FileSystem> {
   bool IsParentHashPartition() const {
     return fs_info_->GetPartitionType() == pb::mds::PartitionType::PARENT_ID_HASH_PARTITION;
   }
+
+  uint32_t ChunkSize() const { return fs_info_->GetChunkSize(); }
 
   bool CanServe(Context& ctx) { return ctx.IsBypassCache() ? true : can_serve_.load(std::memory_order_acquire); }
 
@@ -192,7 +195,6 @@ class FileSystem : public std::enable_shared_from_this<FileSystem> {
     std::string session_id;
     uint32_t flags{0};
     bool is_prefetch_chunk{false};
-    bool is_prefetch_data{false};
     std::map<uint32_t, uint64_t> chunk_version_map;
   };
   Status Open(Context& ctx, Ino ino, const OpenParam& param, EntryOutForOpen& out);
@@ -200,10 +202,16 @@ class FileSystem : public std::enable_shared_from_this<FileSystem> {
 
   struct FlushFileParam {
     uint64_t length{0};
-    std::string data;
-    bool is_final{false};
   };
   Status FlushFile(Context& ctx, Ino ino, const FlushFileParam& param, EntryWithFileChangeOut& entry_out);
+
+  struct RollbackFileParam {
+    // conditional length rollback (ADR-0003): shrink to rollback_to_length iff
+    // rollback_to_length < current length <= last_write_length.
+    uint64_t last_write_length{0};
+    uint64_t rollback_to_length{0};
+  };
+  Status RollbackFile(Context& ctx, Ino ino, const RollbackFileParam& param, EntryWithFileChangeOut& entry_out);
   using FileSessionParam = pb::mds::HeartbeatRequest::FileSession;
   void AsyncKeepAliveFileSession(const std::vector<FileSessionParam>& file_sessions);
 
@@ -259,12 +267,7 @@ class FileSystem : public std::enable_shared_from_this<FileSystem> {
     std::vector<Ino> old_ancestors;
     std::vector<Ino> new_ancestors;
   };
-  struct RenameResult {
-    uint64_t old_parent_version{0};
-    uint64_t new_parent_version{0};
-    Ino child_ino{0};
-    Ino deleted_ino{0};
-  };
+  using RenameResult = mds::RenameResult;
   Status Rename(Context& ctx, const RenameParam& param, RenameResult& out);
 
   Status CommitRename(Context& ctx, const RenameParam& param, RenameResult& out);
@@ -282,9 +285,12 @@ class FileSystem : public std::enable_shared_from_this<FileSystem> {
 
   // slice
   Status WriteSlice(Context& ctx, Ino ino, const std::vector<DeltaSliceEntry>& delta_slices,
-                    std::vector<ChunkEntry>& out_chunks);
+                    EntryWithChunkOut& entry_out);
   Status ReadSlice(Context& ctx, Ino ino, const std::vector<ChunkDescriptor>& chunk_descriptors,
                    std::vector<ChunkEntry>& chunks);
+
+  Status BatchReadSlice(Context& ctx, const std::vector<BatchReadSliceReqEntry>& in_entries,
+                        std::vector<BatchReadSliceResEntry>& out_entries);
 
   // copy_file_range — reflink-style: shares slices via SliceReferrer.
   struct CopyFileRangeParam {
@@ -345,6 +351,8 @@ class FileSystem : public std::enable_shared_from_this<FileSystem> {
   PartitionCache& GetPartitionCache() { return partition_cache_; }
   InodeCache& GetInodeCache() { return inode_cache_; }
 
+  ChunkCache& GetChunkCache() { return chunk_cache_; }
+
   quota::QuotaManager& GetQuotaManager() { return quota_manager_; }
   ParentMemo& GetParentMemo() { return parent_memo_; }
 
@@ -386,7 +394,8 @@ class FileSystem : public std::enable_shared_from_this<FileSystem> {
   Status GetPartition(Context& ctx, uint64_t version, Ino parent, PartitionPtr& out_partition);
   PartitionPtr GetPartitionFromCache(Ino parent);
   std::vector<PartitionPtr> GetAllPartitionsFromCache();
-  Status GetPartitionFromStore(Context& ctx, Ino parent, const std::string& reason, PartitionPtr& out_partition);
+  Status FetchPartition(Context& ctx, Ino parent, const std::string& reason, PartitionPtr& out_partition);
+  Status DoFetchPartition(Context& ctx, Ino parent, const std::string& reason, PartitionPtr& out_partition);
 
   // get dentry
   Status GetDentryFromStore(Ino parent, const std::string& name, Dentry& dentry);
@@ -411,6 +420,7 @@ class FileSystem : public std::enable_shared_from_this<FileSystem> {
   // inode cache
   InodeSPtr GetInodeFromCache(Ino ino);
   std::vector<InodeSPtr> GetAllInodesFromCache();
+  void InsertInodeCache(const AttrEntry& attr, const std::string& reason);
   InodeSPtr UpsertInodeCache(const AttrWithMutation& attr_with_mutation, const std::string& reason);
   InodeSPtr UpsertInodeCache(const AttrEntry& attr, const std::string& reason);
 
@@ -428,7 +438,7 @@ class FileSystem : public std::enable_shared_from_this<FileSystem> {
 
   void NotifyBuddyRefreshFsInfo(std::vector<uint64_t> mds_ids, const FsInfoEntry& fs_info, const std::string& reason);
   void NotifyBuddyRefreshInode(const AttrEntry& attr, const std::string& reason);
-  void NotifyBuddyRefreshInode(const std::vector<Ino>& parents, const AttrOrMutation& attr_or_mutation,
+  void NotifyBuddyRefreshInode(const PBvector<Ino>& parents, const AttrOrMutation& attr_or_mutation,
                                const std::string& reason);
   void NotifyBuddyCleanPartitionCache(Ino ino, const std::string& reason);
 
@@ -436,8 +446,8 @@ class FileSystem : public std::enable_shared_from_this<FileSystem> {
   // child-count deltas (both signed). Debits (unlink/rmdir/trash-move) pass
   // negative deltas; a cleaned trash-bucket entry is never a tracked dir so it
   // contributes nothing. No-op unless EnableDirStats().
-  void UpdateDirStat(Ino parent, int64_t length_delta, int64_t inode_delta, int64_t dir_delta,
-                     const std::string& reason);
+  void AsyncUpdateDirStat(Ino parent, int64_t length_delta, int64_t inode_delta, int64_t dir_delta,
+                          const std::string& reason);
 
   TrashMove BuildTrashMove(Ino parent);
 
@@ -459,14 +469,23 @@ class FileSystem : public std::enable_shared_from_this<FileSystem> {
   // for slice id
   IdGeneratorSPtr slice_id_generator_;
 
-  // persistence store dentry/inode
-  KVStorageSPtr kv_storage_;
-
   // for open/read/write/close file
   FileSessionManager file_session_manager_;
 
   // organize dentry directory tree
   PartitionCache partition_cache_;
+
+  // singleflight for FetchPartition: coalesce concurrent store fetches
+  // of the same parent to reduce backend load. Entry lifetime = one RPC.
+  // struct InflightPartitionFetch {
+  //   bthread::CountdownEvent done{1};
+  //   Status status;
+  //   PartitionPtr partition;
+  // };
+  // bthread::Mutex inflight_fetch_mutex_;
+  // absl::flat_hash_map<Ino, std::shared_ptr<InflightPartitionFetch>> inflight_fetches_;
+
+  InflightController<Ino, PartitionPtr> partition_inflight_controller_;
 
   // organize inode
   InodeCache inode_cache_;
@@ -491,6 +510,8 @@ class FileSystem : public std::enable_shared_from_this<FileSystem> {
 
   OperationProcessorSPtr operation_processor_;
 
+  WarmupProcessorSPtr warmup_processor_;
+
   // notify buddy
   notify::NotifyBuddySPtr notify_buddy_;
 
@@ -501,10 +522,8 @@ class FileSystem : public std::enable_shared_from_this<FileSystem> {
 // manage all filesystem
 class FileSystemSet {
  public:
-  FileSystemSet(CoordinatorClientSPtr coordinator_client, IdGeneratorUPtr fs_id_generator,
-                IdGeneratorSPtr slice_id_generator, KVStorageSPtr kv_storage, MDSMeta self_mds_meta,
-                MDSMetaMapSPtr mds_meta_map, OperationProcessorSPtr operation_processor, WorkerSetSPtr quota_worker_set,
-                WorkerSetSPtr dir_stat_worker_set, notify::NotifyBuddySPtr notify_buddy);
+  FileSystemSet(KVStorageSPtr kv_storage, MDSMeta self_mds_meta, MDSMetaMapSPtr mds_meta_map,
+                OperationProcessorSPtr operation_processor, notify::NotifyBuddySPtr notify_buddy);
   ~FileSystemSet();
 
   FileSystemSet(const FileSystemSet&) = delete;
@@ -512,17 +531,13 @@ class FileSystemSet {
   FileSystemSet(FileSystemSet&&) = delete;
   FileSystemSet& operator=(FileSystemSet&&) = delete;
 
-  static FileSystemSetSPtr New(CoordinatorClientSPtr coordinator_client, IdGeneratorUPtr fs_id_generator,
-                               IdGeneratorSPtr slice_id_generator, KVStorageSPtr kv_storage, MDSMeta self_mds_meta,
-                               MDSMetaMapSPtr mds_meta_map, OperationProcessorSPtr operation_processor,
-                               WorkerSetSPtr quota_worker_set, WorkerSetSPtr dir_stat_worker_set,
-                               notify::NotifyBuddySPtr notify_buddy) {
-    return std::make_shared<FileSystemSet>(coordinator_client, std::move(fs_id_generator),
-                                           std::move(slice_id_generator), kv_storage, self_mds_meta, mds_meta_map,
-                                           operation_processor, quota_worker_set, dir_stat_worker_set, notify_buddy);
+  static FileSystemSetSPtr New(KVStorageSPtr kv_storage, MDSMeta self_mds_meta, MDSMetaMapSPtr mds_meta_map,
+                               OperationProcessorSPtr operation_processor, notify::NotifyBuddySPtr notify_buddy) {
+    return std::make_shared<FileSystemSet>(kv_storage, self_mds_meta, mds_meta_map, operation_processor, notify_buddy);
   }
 
   bool Init();
+  void Stop(bool is_force);
 
   struct CreateFsParam {
     int64_t mds_id;
@@ -617,8 +632,6 @@ class FileSystemSet {
 
   Status RunOperation(Operation* operation);
 
-  CoordinatorClientSPtr coordinator_client_;
-
   // for fs id
   IdGeneratorUPtr fs_id_generator_;
   // for slice id
@@ -627,6 +640,8 @@ class FileSystemSet {
   KVStorageSPtr kv_storage_;
 
   OperationProcessorSPtr operation_processor_;
+
+  WarmupProcessorSPtr warmup_processor_;
 
   WorkerSetSPtr quota_worker_set_;
 

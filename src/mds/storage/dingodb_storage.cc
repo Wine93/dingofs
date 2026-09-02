@@ -18,6 +18,7 @@
 #include <memory>
 #include <string>
 
+#include "common/helper.h"
 #include "common/logging.h"
 #include "dingofs/error.pb.h"
 #include "fmt/format.h"
@@ -57,14 +58,6 @@ bool DingodbStorage::Init(const std::string& addr) {
 
   auto status = dingodb::sdk::Client::BuildFromAddrs(addr, &client_);
   CHECK(status.ok()) << fmt::format("build dingo sdk client fail, error: {}", status.ToString());
-
-  return true;
-}
-
-bool DingodbStorage::Destroy() {
-  LOG(INFO) << "[storage] destroy dingo storage.";
-
-  delete client_;
 
   return true;
 }
@@ -290,8 +283,8 @@ Status DingodbStorage::BatchGet(const std::vector<std::string>& keys, std::vecto
 }
 
 Status DingodbStorage::Scan(const Range& range, std::vector<KeyValue>& kvs) {
-  CHECK(range.start < range.end) << fmt::format("invalid range({}/{}).", Helper::StringToHex(range.start),
-                                                Helper::StringToHex(range.end));
+  CHECK(range.start < range.end) << fmt::format("invalid range({}/{}).", ::dingofs::Helper::StringToHex(range.start),
+                                                ::dingofs::Helper::StringToHex(range.end));
 
   auto txn = NewSdkTxn();
   if (txn == nullptr) {
@@ -411,8 +404,8 @@ Status DingodbTxn::BatchGet(const std::vector<std::string>& keys, std::vector<Ke
 }
 
 Status DingodbTxn::Scan(const Range& range, uint64_t limit, std::vector<KeyValue>& kvs) {
-  CHECK(range.start < range.end) << fmt::format("invalid range({}/{}).", Helper::StringToHex(range.start),
-                                                Helper::StringToHex(range.end));
+  CHECK(range.start < range.end) << fmt::format("invalid range({}/{}).", ::dingofs::Helper::StringToHex(range.start),
+                                                ::dingofs::Helper::StringToHex(range.end));
 
   uint64_t start_time = utils::TimestampUs();
   ON_SCOPE_EXIT([&]() { txn_trace_.read_time_us += (utils::TimestampUs() - start_time); });
@@ -427,39 +420,17 @@ Status DingodbTxn::Scan(const Range& range, uint64_t limit, std::vector<KeyValue
 }
 
 Status DingodbTxn::Scan(const Range& range, ScanHandlerType handler) {
-  Status status;
-  std::vector<KeyValue> kvs;
-  do {
-    kvs.clear();
-    status = Scan(range, FLAGS_mds_scan_batch_size, kvs);
-    if (!status.ok()) {
-      break;
-    }
-
-    bool is_exit = false;
-    for (auto& kv : kvs) {
-      if (!handler(kv.key, kv.value)) {
-        is_exit = true;
-        break;
-      }
-    }
-
-    if (is_exit) break;
-
-  } while (kvs.size() >= FLAGS_mds_scan_batch_size);
-
-  return status;
+  return Scan(range, [&](KeyValue& kv) { return handler(kv.key, kv.value); });
 }
 
 Status DingodbTxn::Scan(const Range& range, std::function<bool(KeyValue&)> handler) {
   Status status;
+  Range page = range;
   std::vector<KeyValue> kvs;
   do {
     kvs.clear();
-    status = Scan(range, FLAGS_mds_scan_batch_size, kvs);
-    if (!status.ok()) {
-      break;
-    }
+    status = Scan(page, FLAGS_mds_scan_batch_size, kvs);
+    if (!status.ok()) break;
 
     bool is_exit = false;
     for (auto& kv : kvs) {
@@ -468,10 +439,13 @@ Status DingodbTxn::Scan(const Range& range, std::function<bool(KeyValue&)> handl
         break;
       }
     }
+    if (is_exit || kvs.size() < FLAGS_mds_scan_batch_size) break;
 
-    if (is_exit) break;
-
-  } while (kvs.size() >= FLAGS_mds_scan_batch_size);
+    // Scan ranges are start-inclusive. Move just past the last key so the next
+    // page does not repeat the same full batch forever.
+    page.start = kvs.back().key;
+    page.start.push_back('\0');
+  } while (page.start < page.end);
 
   return status;
 }

@@ -15,17 +15,17 @@
 #include "mds/service/service_access.h"
 
 #include "butil/endpoint.h"
+#include "common/helper.h"
 #include "common/logging.h"
 #include "dingofs/error.pb.h"
 #include "dingofs/mds.pb.h"
 #include "fmt/core.h"
-#include "mds/common/helper.h"
 
 namespace dingofs {
 namespace mds {
 
 static const uint32_t kConnectTimeoutMs = 200;
-static const uint32_t kRpcTimeoutMs = 6000;
+static const uint32_t kRpcTimeoutMs = 2000;
 
 ChannelPool::ChannelPool() { bthread_mutex_init(&mutex_, nullptr); }
 ChannelPool::~ChannelPool() { bthread_mutex_destroy(&mutex_); }
@@ -51,7 +51,7 @@ std::shared_ptr<brpc::Channel> ChannelPool::GetChannel(const butil::EndPoint& en
   options.backup_request_ms = kRpcTimeoutMs;
   options.connection_type = brpc::ConnectionType::CONNECTION_TYPE_SINGLE;
   if (channel->Init(endpoint, nullptr) != 0) {
-    LOG(ERROR) << "init channel fail, endpoint: " << Helper::EndPointToString(endpoint);
+    LOG(ERROR) << "init channel fail, endpoint: " << ::dingofs::Helper::EndPointToString(endpoint);
     return nullptr;
   }
 

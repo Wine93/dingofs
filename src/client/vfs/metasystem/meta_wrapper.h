@@ -95,8 +95,9 @@ class MetaWrapper {
     return target_->MkNod(ctx, parent, name, uid, gid, mode, rdev, attr);
   }
 
-  Status Open(ContextSPtr ctx, Ino ino, int flags, uint64_t fh) {
-    return target_->Open(ctx, ino, flags, fh);
+  Status Open(ContextSPtr ctx, Ino ino, int flags, uint64_t fh,
+              bool* keep_cache) {
+    return target_->Open(ctx, ino, flags, fh, keep_cache);
   }
 
   Status Create(ContextSPtr ctx, Ino parent, const std::string& name,
@@ -106,6 +107,10 @@ class MetaWrapper {
   }
 
   Status Flush(ContextSPtr ctx, Ino ino, uint64_t fh);
+
+  Status RollbackFile(ContextSPtr ctx, Ino ino, uint64_t fh) {
+    return target_->RollbackFile(ctx, ino, fh);
+  }
 
   Status Close(ContextSPtr ctx, Ino ino, uint64_t fh) {
     return target_->Close(ctx, ino, fh);
@@ -235,6 +240,10 @@ class MetaWrapper {
   }
 
   bool GetSummary(Json::Value& value) { return target_->GetSummary(value); }
+
+  void SetBlockStore(BlockStore* block_store) {
+    target_->SetBlockStore(block_store);
+  }
 
   void SetWarmupManager(WarmupManager* warmup_manager) {
     target_->SetWarmupManager(warmup_manager);

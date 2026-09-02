@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <boost/intrusive_ptr.hpp>
 #include <boost/range/algorithm/find.hpp>
 #include <boost/range/algorithm/sort.hpp>
 #include <cmath>
@@ -220,12 +221,9 @@ void FileReader::SchedulePeriodicShrink() {
     return;
   }
 
-  AcquireRef();
+  boost::intrusive_ptr<FileReader> self(this);
   vfs_hub_->GetReadCleanupExecutor()->Schedule(
-      [this] {
-        RunPeriodicShrink();
-        ReleaseRef();
-      },
+      [self = std::move(self)] { self->RunPeriodicShrink(); },
       FLAGS_vfs_periodic_flush_interval_ms);
 }
 
@@ -312,9 +310,9 @@ ReadRequestSptr FileReader::NewReadRequest(int64_t s, int64_t e) {
       "actual=[{}-{}), len={}",
       uuid_, s, e, block_end, s, req_end, (req_end - s));
 
-  std::shared_ptr<ReadRequest> req(
-      new ReadRequest(ino_, chunk_indx, chunk_offset,
-                      FileRange{.offset = s, .len = (req_end - s)}));
+  std::shared_ptr<ReadRequest> req = std::make_shared<ReadRequest>(
+      ino_, chunk_indx, chunk_offset,
+      FileRange{.offset = s, .len = (req_end - s)});
 
   req->state = ReadRequestState::kNew;
   req->status = Status::OK();
@@ -346,8 +344,6 @@ ReadRequestSptr FileReader::NewReadRequest(int64_t s, int64_t e) {
     }
   }
 
-  RunReadRequest(new_req);
-
   return new_req;
 }
 
@@ -355,7 +351,7 @@ ReadRequestSptr FileReader::NewReadRequest(int64_t s, int64_t e) {
 // path so request erasure runs in the reader cleanup lane.
 void FileReader::ScheduleReadRequestCleanup(ReadRequestSptr req) {
   AcquireRef();
-  vfs_hub_->GetReadCleanupExecutor()->Execute([&, req]() {
+  vfs_hub_->GetReadCleanupExecutor()->Execute([this, req]() {
     DeleteReadRequest(req);
     ReleaseRef();
   });
@@ -368,24 +364,25 @@ void FileReader::DeleteReadRequest(ReadRequestSptr req) {
 
 // Caller holds mutex_; req->mutex is not required.
 //
-// erase() is intentionally idempotent. A request may be reclaimed by several
-// uncoordinated paths that all delete on the same (kInvalid && readers==0)
-// condition: the scheduled cleanup from ScheduleReadRequestCleanup,
-// OnReadRequestComplete, the per-read CleanUpRequest, the periodic ShrinkMem,
-// and the foreground Read cleanup. The async path decides to delete while
-// holding only req->mutex and erases later under mutex_, so a synchronous path
-// can erase the same request in the gap -- erase() then legitimately finds it
-// already gone. A CHECK(erase()==1) here SIGABRTs once pool exhaustion turns
-// many readahead requests kInvalid at the same time.
+// The CHECK is sound because eligibility is stable once true: kInvalid has no
+// outgoing transition, and readers can only rise under mutex_ (PrepareRequests
+// registers the reference before the request first runs). A failure means that
+// invariant was broken — an IncReader outside mutex_, or a request made
+// runnable before its reference was registered.
+//
+// erase() stays idempotent on purpose: several paths reclaim on the same
+// (kInvalid && readers == 0) condition — the scheduled async cleanup,
+// CleanUpRequest, ShrinkMem, InvalidateRange, the foreground Read release,
+// and the destructor. A synchronous path can erase the request between the
+// async decision and this call, so finding it already gone is legitimate;
+// assert eligibility, never the erase count.
 void FileReader::DeleteReadRequestUnlock(ReadRequestSptr req) {
   VLOG(9) << fmt::format("{} DeleteReadRequest req: {}", uuid_,
                          req->ToString());
-  CHECK(CanDeleteRequest(req));
+  CHECK(CanDeleteRequest(req)) << req->ToString() << " cannot be deleted";
 
-  // The pool slot is released when req->buffer's IOBuf block refcount hits zero
-  // (after the reply), which auto-updates the pool's OutstandingBytes. No
-  // explicit release here.
-
+  // The pool slot is released when req->buffer's IOBuf block refcount hits
+  // zero (after the reply), which auto-updates the pool's OutstandingBytes.
   requests_.erase(req->ReqId());
 }
 
@@ -469,16 +466,22 @@ void FileReader::DoReadRequst(ReadRequestSptr req) {
   auto span =
       vfs_hub_->GetTraceManager()->StartSpan("FileReader::DoReadRequst");
 
-  AcquireRef();
+  // The callback owns the FileReader through the intrusive reference: it may
+  // fire on any worker long after this stack frame is gone. The stack
+  // ChunkReader carries no async state (ChunkReadOp owns its own lifetime),
+  // so it can die as soon as ReadAsync returns.
+  boost::intrusive_ptr<FileReader> self(this);
+  ChunkReader reader(vfs_hub_, fh_, req->req);
+  const ReadBufView dst = req->dst;
+  ContextSPtr span_ctx = SpanScope::GetContext(span);
 
-  auto* reader = new ChunkReader(vfs_hub_, fh_, req->req);
-  reader->ReadAsync(SpanScope::GetContext(span), req->dst,
-                    [this, reader, req, span](Status s) {
-                      SpanScope::AddEvent(span, "Complete ReadAsync callback");
-                      this->OnReadRequestComplete(req, s);
-                      delete reader;
-                      ReleaseRef();
-                    });
+  reader.ReadAsync(std::move(span_ctx), dst,
+                   [self = std::move(self), req = std::move(req),
+                    span = std::move(span)](Status status) mutable {
+                     SpanScope::AddEvent(span, "Complete ReadAsync callback");
+                     self->OnReadRequestComplete(std::move(req),
+                                                 std::move(status));
+                   });
 }
 
 int64_t FileReader::TotalMem() const {
@@ -549,8 +552,10 @@ void FileReader::MakeReadahead(ContextSPtr ctx, const FileRange& frange) {
     int64_t req_id = it->first;
     ReadRequest* req = it->second.get();
 
+    std::unique_lock<std::mutex> req_lock(req->mutex);
+
     VLOG(9) << fmt::format("{} MakeReadahead check req: {} for frange: {}",
-                           uuid_, req->ToString(), ahead.ToString());
+                           uuid_, req->ToStringUnlock(), ahead.ToString());
 
     if (req->state == ReadRequestState::kInvalid) {
       continue;
@@ -605,6 +610,7 @@ void FileReader::MakeReadahead(ContextSPtr ctx, const FileRange& frange) {
           "{} MakeReadahead create new req for range [{},{}), len: {}", uuid_,
           s, e, (e - s));
       auto req = NewReadRequest(s, e);
+      RunReadRequest(req);
 
       s = req->req.frange.End();
     }
@@ -661,8 +667,12 @@ std::vector<int64_t> FileReader::SplitRange(ContextSPtr ctx,
   };
 
   for (const auto& [uuid, req] : requests_) {
+    // state is written by completion threads under req->mutex only; an
+    // unlocked read here is a data race even though mutex_ is held.
+    std::unique_lock<std::mutex> req_lock(req->mutex);
+
     VLOG(9) << fmt::format("{} SplitRange check req: {} for frange: {}", uuid_,
-                           req->ToString(), frange.ToString());
+                           req->ToStringUnlock(), frange.ToString());
 
     if (req->state == ReadRequestState::kInvalid) {
       continue;
@@ -733,6 +743,11 @@ std::vector<PartialReadRequest> FileReader::PrepareRequests(
         read_reqs.emplace_back(PartialReadRequest{
             .req = req, .offset = 0, .len = req->req.frange.len});
         req->IncReader();
+        // Publish the foreground ownership before the request can complete.
+        // Some BlockStore implementations and test doubles invoke callbacks
+        // synchronously; starting first would let completion observe zero
+        // readers and race a cleanup task against this acquisition.
+        RunReadRequest(req);
 
         s = req->req.frange.End();
       }
@@ -817,15 +832,27 @@ void FileReader::CheckPrefetch(ContextSPtr ctx, const Attr& attr,
       "FileReader::CheckPrefetch", ctx->GetTraceSpan());
 
   uint64_t time_now = butil::monotonic_time_s();
-  if (FLAGS_vfs_intime_warmup_enable &&
-      ((time_now - last_intime_warmup_trigger_) >
-           FLAGS_vfs_warmup_trigger_restart_interval_secs ||
-       (attr.mtime - last_intime_warmup_mtime_) >
-           FLAGS_vfs_warmup_mtime_restart_interval_secs)) {
-    LOG(INFO) << fmt::format("{} Trigger intime warmup", uuid_);
-    last_intime_warmup_trigger_ = time_now;
-    last_intime_warmup_mtime_ = attr.mtime;
+  bool trigger_warmup = false;
+  if (FLAGS_vfs_intime_warmup_enable) {
+    // Concurrent reads reach here without mutex_, so checking and advancing
+    // the two watermarks must be one atomic step or racing readers all pass
+    // the threshold and double-submit. An mtime regression (clock fix,
+    // cross-node drift, truncate-recreate) means changed content, so it
+    // triggers explicitly instead of via unsigned-subtraction wraparound.
+    std::lock_guard<std::mutex> lk(intime_warmup_mutex_);
+    if ((time_now - last_intime_warmup_trigger_) >
+            FLAGS_vfs_warmup_trigger_restart_interval_secs ||
+        attr.mtime < last_intime_warmup_mtime_ ||
+        (attr.mtime - last_intime_warmup_mtime_) >
+            FLAGS_vfs_warmup_mtime_restart_interval_secs) {
+      last_intime_warmup_trigger_ = time_now;
+      last_intime_warmup_mtime_ = attr.mtime;
+      trigger_warmup = true;
+    }
+  }
 
+  if (trigger_warmup) {
+    LOG(INFO) << fmt::format("{} Trigger intime warmup", uuid_);
     vfs_hub_->GetWarmupManager()->SubmitTask(WarmupTaskContext{ino_});
   }
 
@@ -993,8 +1020,10 @@ Status FileReader::Read(ContextSPtr ctx, DataBuffer* data_buffer, int64_t size,
 Status FileReader::GetAttr(ContextSPtr ctx, Attr* attr) {
   auto span = vfs_hub_->GetTraceManager()->StartChildSpan("FileWriter::GetAttr",
                                                           ctx->GetTraceSpan());
-  Status s = vfs_hub_->GetMetaSystem()->GetAttr(SpanScope::GetContext(span),
-                                                ino_, attr);
+
+  auto span_ctx = SpanScope::GetContext(span);
+  span_ctx->inner_req = true;
+  Status s = vfs_hub_->GetMetaSystem()->GetAttr(span_ctx, ino_, attr);
   if (!s.ok()) {
     LOG(WARNING) << fmt::format("{} GetAttr failed, status: {}", uuid_,
                                 s.ToString());

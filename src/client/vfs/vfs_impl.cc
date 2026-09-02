@@ -30,6 +30,7 @@
 #include "client/vfs/components/uid_gid_mapper.h"
 #include "client/vfs/components/warmup_manager.h"
 #include "client/vfs/data/reader/file_reader.h"
+#include "client/vfs/data/reader/reader_registry.h"
 #include "client/vfs/data/writer/file_writer.h"
 #include "client/vfs/data_buffer.h"
 #include "client/vfs/handle/handle_manager.h"
@@ -94,16 +95,22 @@ void VFSImpl::LocalPairToHashed(uint32_t uid, uint32_t gid, uint32_t& out_uid,
   mapper->LocalPairToHashed(uid, gid, out_uid, out_gid);
 }
 
-VFSImpl::VFSImpl(const VFSConfig& vfs_conf, const ClientId& client_id)
-    : client_id_(client_id),
+VFSImpl::VFSImpl(const VFSConfig& vfs_conf, const ClientId& client_id,
+                 TraceManager& trace_manager)
+    : trace_manager_(trace_manager),
+      client_id_(client_id),
       mount_root_path_(
           vfs_conf.mount_root_path.empty() ? "/" : vfs_conf.mount_root_path),
-      vfs_hub_(std::make_unique<VFSHubImpl>(vfs_conf, client_id_)){};
+      vfs_hub_(
+          std::make_unique<VFSHubImpl>(vfs_conf, client_id_, trace_manager_)) {}
 
-VFSImpl::VFSImpl(std::unique_ptr<VFSHub> hub)
-    : client_id_(), vfs_hub_(std::move(hub)) {
+VFSImpl::~VFSImpl() { StopBrpcServer(); }
+
+VFSImpl::VFSImpl(std::unique_ptr<VFSHub> hub, TraceManager& trace_manager)
+    : trace_manager_(trace_manager), client_id_(), vfs_hub_(std::move(hub)) {
   meta_system_ = vfs_hub_->GetMetaSystem();
   handle_manager_ = vfs_hub_->GetHandleManager();
+  reader_registry_ = vfs_hub_->GetReaderRegistry();
 }
 
 Status VFSImpl::Start(bool skip_mount) {
@@ -112,9 +119,9 @@ Status VFSImpl::Start(bool skip_mount) {
   DINGOFS_RETURN_NOT_OK(vfs_hub_->Start(skip_mount));
   meta_system_ = vfs_hub_->GetMetaSystem();
   handle_manager_ = vfs_hub_->GetHandleManager();
+  reader_registry_ = vfs_hub_->GetReaderRegistry();
 
   DINGOFS_RETURN_NOT_OK(ResolveMountRoot());
-
   DINGOFS_RETURN_NOT_OK(StartBrpcServer());
 
   return Status::OK();
@@ -132,13 +139,14 @@ Status VFSImpl::ResolveMountRoot() {
   Ino parent = kRootIno;
   ContextSPtr ctx = std::make_shared<Context>("");
   std::vector<std::string> dir_names;
-  Helper::SplitString(mount_root_path_, '/', dir_names);
+  ::dingofs::Helper::SplitString(mount_root_path_, '/', dir_names);
   // remove the empty string before the first '/'
   if (!dir_names.empty()) dir_names.erase(dir_names.begin());
   for (const auto& dir_name : dir_names) {
     if (dir_name.empty()) break;
 
     Attr attr;
+    ctx->inner_req = true;
     Status s = meta_system_->Lookup(ctx, parent, dir_name, &attr);
     if (!s.ok()) {
       LOG(ERROR) << fmt::format(
@@ -159,7 +167,10 @@ Status VFSImpl::ResolveMountRoot() {
   return Status::OK();
 }
 
-Status VFSImpl::Stop(bool skip_unmount) { return vfs_hub_->Stop(skip_unmount); }
+Status VFSImpl::Stop(bool skip_unmount) {
+  StopBrpcServer();
+  return vfs_hub_->Stop(skip_unmount);
+}
 
 bool VFSImpl::Dump(ContextSPtr ctx, Json::Value& value) {
   CHECK(handle_manager_ != nullptr) << "handle_manager is null";
@@ -209,14 +220,6 @@ bool VFSImpl::Load(ContextSPtr ctx, const Json::Value& value) {
   }
 
   return meta_system_->Load(ctx, value);
-}
-
-double VFSImpl::GetAttrTimeout(const FileType& type) {  // NOLINT
-  return FLAGS_fuse_attr_cache_timeout_s;
-}
-
-double VFSImpl::GetEntryTimeout(const FileType& type) {  // NOLINT
-  return FLAGS_fuse_entry_cache_timeout_s;
 }
 
 static Attr GenerateTrashDirAttr() {
@@ -315,6 +318,9 @@ Status VFSImpl::SetAttr(ContextSPtr ctx, Ino ino, int set, const Attr& in_attr,
   // write still buffered here could land *after* the truncate and re-expose the
   // bytes the truncate was meant to drop.
   if (set & kSetAttrSize) {
+    if (!IsValidFileSize(in_attr.length)) {
+      return Status::FileTooLarge("file size too large");
+    }
     Status s = handle_manager_->FlushByIno(ino);
     if (!s.ok()) return s;
   }
@@ -329,9 +335,9 @@ Status VFSImpl::SetAttr(ContextSPtr ctx, Ino ino, int set, const Attr& in_attr,
   // Truncate (size change) must invalidate cached read buffers — readahead
   // buffers in FileReader::requests_ are indexed by (ino, frange) and would
   // otherwise serve stale data after the inode shrinks/grows.
-  if (s.ok() && (set & kSetAttrSize)) {
-    handle_manager_->InvalidateByIno(ino, 0,
-                                     std::numeric_limits<int64_t>::max());
+  if ((s.ok() || s.IsNetError()) && (set & kSetAttrSize)) {
+    reader_registry_->InvalidateByIno(ino, 0,
+                                      std::numeric_limits<int64_t>::max());
   }
 
   return s;
@@ -343,6 +349,18 @@ Status VFSImpl::Fallocate(ContextSPtr ctx, Ino ino, int mode, uint64_t offset,
     return Status::NoPermitted("fallocate on internal node");
   }
 
+  if (mode & FALLOC_FL_COLLAPSE_RANGE) {
+    const uint64_t chunk_size = vfs_hub_->GetFsInfo().chunk_size;
+    if (mode != FALLOC_FL_COLLAPSE_RANGE || chunk_size == 0 || length == 0 ||
+        offset % chunk_size != 0 || length % chunk_size != 0) {
+      return Status::InvalidParam("invalid collapse range");
+    }
+  }
+
+  if (!IsValidFileSize(offset + length)) {
+    return Status::FileTooLarge("file size too large");
+  }
+
   // Same ordering requirement as truncate: PUNCH_HOLE / ZERO_RANGE write zero
   // slices that must shadow already-written data, so flush buffered writes
   // first — otherwise a late-flushed write lands after and survives the hole.
@@ -350,13 +368,14 @@ Status VFSImpl::Fallocate(ContextSPtr ctx, Ino ino, int mode, uint64_t offset,
   if (!s.ok()) return s;
 
   s = meta_system_->Fallocate(ctx, TranslateIno(ino), mode, offset, length);
-  // Mirror the SetAttr(size) path: PUNCH_HOLE / ZERO_RANGE / extending the
-  // file all change byte contents in [offset, offset+length); cached readahead
-  // buffers in FileReader::requests_ on the same fd would otherwise serve
-  // stale bytes for the affected range.
-  if (s.ok()) {
-    handle_manager_->InvalidateByIno(ino, static_cast<int64_t>(offset),
-                                     static_cast<int64_t>(length));
+  // Collapse shifts every byte after offset, so invalidate the rest of the
+  // read cache. Other fallocate modes only change the requested range.
+  if (s.ok() || s.IsNetError()) {
+    const int64_t invalidate_length = mode == FALLOC_FL_COLLAPSE_RANGE
+                                          ? std::numeric_limits<int64_t>::max()
+                                          : static_cast<int64_t>(length);
+    reader_registry_->InvalidateByIno(ino, static_cast<int64_t>(offset),
+                                      invalidate_length);
   }
 
   return s;
@@ -378,6 +397,10 @@ Status VFSImpl::CopyFileRange(ContextSPtr ctx, Ino src_ino, uint64_t src_off,
     return Status::InvalidParam("unsupported copy_file_range flags");
   }
   if (len == 0) return Status::OK();
+
+  if (!IsValidFileSize(src_off + len) || !IsValidFileSize(dst_off + len)) {
+    return Status::FileTooLarge("file size too large");
+  }
 
   // Same-file overlap is undefined by POSIX; reject before touching MDS.
   if (src_ino == dst_ino) {
@@ -404,8 +427,8 @@ Status VFSImpl::CopyFileRange(ContextSPtr ctx, Ino src_ino, uint64_t src_off,
 
   // Invalidate any in-flight reader caches for the rewritten dst range.
   if (*bytes_copied > 0) {
-    handle_manager_->InvalidateByIno(dst_ino, static_cast<int64_t>(dst_off),
-                                     static_cast<int64_t>(*bytes_copied));
+    reader_registry_->InvalidateByIno(dst_ino, static_cast<int64_t>(dst_off),
+                                      static_cast<int64_t>(*bytes_copied));
   }
 
   return s;
@@ -528,7 +551,8 @@ Status VFSImpl::Link(ContextSPtr ctx, Ino ino, Ino new_parent,
   return s;
 }
 
-Status VFSImpl::Open(ContextSPtr ctx, Ino ino, int flags, uint64_t* fh) {
+Status VFSImpl::Open(ContextSPtr ctx, Ino ino, int flags, uint64_t* fh,
+                     bool* keep_cache) {
   // check if ino is .stats inode,if true ,get metric data and generate
   // inodeattr information
   uint64_t gfh = vfs::FhGenerator::GenFh();
@@ -542,7 +566,6 @@ Status VFSImpl::Open(ContextSPtr ctx, Ino ino, int flags, uint64_t* fh) {
   }
 
   if (BAIDU_UNLIKELY(ino == kStatsIno)) {
-    // uint64_t gfh = vfs::FhGenerator::GenFh();
     MetricsDumper metrics_dumper;
     bvar::DumpOptions opts;
     int ret = bvar::Variable::dump_exposed(&metrics_dumper, &opts);
@@ -571,7 +594,17 @@ Status VFSImpl::Open(ContextSPtr ctx, Ino ino, int flags, uint64_t* fh) {
     return Status::OK();
   }
 
-  Status s = meta_system_->Open(ctx, TranslateIno(ino), flags, gfh);
+  // Flush the handle if O_TRUNC flag is set
+  if (flags & O_TRUNC) {
+    Status s = handle_manager_->FlushByIno(ino);
+    if (!s.ok()) return s;
+  }
+
+  Status s = meta_system_->Open(ctx, TranslateIno(ino), flags, gfh, keep_cache);
+  if ((flags & O_TRUNC) && (s.ok() || s.IsNetError())) {
+    reader_registry_->InvalidateByIno(ino, 0,
+                                      std::numeric_limits<int64_t>::max());
+  }
   if (s.ok()) {
     auto* handle = handle_manager_->NewHandle(gfh, ino, flags);
     if (handle == nullptr) {
@@ -618,8 +651,8 @@ Status VFSImpl::Read(ContextSPtr ctx, Ino ino, DataBuffer* data_buffer,
   Status s;
   auto handle = handle_manager_->FindHandlerGuard(fh);
   VFS_CHECK_HANDLE(handle.get(), ino, fh);
-  auto span = vfs_hub_->GetTraceManager()->StartChildSpan("VFSImpl::Read",
-                                                          ctx->GetTraceSpan());
+  auto span =
+      trace_manager_.StartChildSpan("VFSImpl::Read", ctx->GetTraceSpan());
   // read .stats file data
   if (BAIDU_UNLIKELY(ino == kStatsIno)) {
     size_t file_size = handle->file_buffer.size;
@@ -634,6 +667,10 @@ Status VFSImpl::Read(ContextSPtr ctx, Ino ino, DataBuffer* data_buffer,
     return Status::OK();
   }
 
+  if (!IsValidFileSize(offset + size)) {
+    return Status::FileTooLarge("file size too large");
+  }
+
   if (handle->resources.reader == nullptr) {
     LOG(ERROR) << "reader is null in handle, ino: " << ino << ", fh: " << fh;
     s = Status::BadFd(fmt::format("bad fh:{}", fh));
@@ -641,19 +678,9 @@ Status VFSImpl::Read(ContextSPtr ctx, Ino ino, DataBuffer* data_buffer,
     return s;
   }
 
-  if (FLAGS_vfs_tiny_file_data_enable) {
-    // read from meta system
-    s = meta_system_->Read(SpanScope::GetContext(span), ino, fh, offset, size,
-                           *data_buffer, *out_rsize);
-    if (!s.IsNoData()) {
-      SpanScope::SetStatus(span, s);
-      return s;
-    }
-  }
-
   {
-    auto flush_span = vfs_hub_->GetTraceManager()->StartChildSpan(
-        "VFSImpl::Read.Flush", span);
+    auto flush_span =
+        trace_manager_.StartChildSpan("VFSImpl::Read.Flush", span);
     // Flush all writers for this inode across all open file handles.
     // This ensures read-after-write consistency when multiple file descriptors
     // are open for the same inode: data buffered by any writer fd is flushed
@@ -682,8 +709,8 @@ Status VFSImpl::Write(ContextSPtr ctx, Ino ino, const char* buf, uint64_t size,
   auto handle = handle_manager_->FindHandlerGuard(fh);
   VFS_CHECK_HANDLE(handle.get(), ino, fh);
 
-  auto span = vfs_hub_->GetTraceManager()->StartChildSpan("VFSImpl::Write",
-                                                          ctx->GetTraceSpan());
+  auto span =
+      trace_manager_.StartChildSpan("VFSImpl::Write", ctx->GetTraceSpan());
 
   if (handle->resources.writer == nullptr) {
     LOG(ERROR) << "writer is null (read-only fh), ino: " << ino
@@ -692,26 +719,25 @@ Status VFSImpl::Write(ContextSPtr ctx, Ino ino, const char* buf, uint64_t size,
     return s;
   }
 
+  if (!IsValidFileSize(offset + size)) {
+    return Status::FileTooLarge("file size too large");
+  }
+
   s = handle->resources.writer->Write(SpanScope::GetContext(span), buf, size,
                                       offset, out_wsize);
-  // Use *out_wsize, not size: writer->Write may short-write (OK with
-  // *out_wsize < size) when the page pool is exhausted mid-write. Metadata must
-  // reflect only what is durable -- MetaSystem::Write extends the inode length
-  // to offset + len, so passing the full size would claim bytes that were never
-  // written (reads past the durable prefix would see a phantom hole).
+  // Use *out_wsize, not size: shutdown or a sticky writer failure can stop a
+  // multi-chunk write after a successful prefix. Metadata must reflect only
+  // bytes accepted by the writer.
   if (s.ok() && *out_wsize > 0) {
     s = meta_system_->Write(SpanScope::GetContext(span), ino, buf, offset,
                             *out_wsize, fh);
     // Invalidate read cache for all handles of this inode in the written range,
     // so that no other open file descriptor can serve stale cached data.
-    handle_manager_->InvalidateByIno(ino, static_cast<int64_t>(offset),
-                                     static_cast<int64_t>(*out_wsize));
+    reader_registry_->InvalidateByIno(ino, static_cast<int64_t>(offset),
+                                      static_cast<int64_t>(*out_wsize));
   }
 
-  // No status logging here: VFSImpl returns Status without logging per-op
-  // outcomes (like the other ops); the uniform status + out_wsize record lives
-  // in VFSWrapper's access log, the pool-pressure locality in SliceWriter, and
-  // the failure rate in the vfs_write_pool_alloc_fail_num metric.
+  // ClientSession's access log records status + out_wsize uniformly.
   return s;
 }
 
@@ -727,12 +753,35 @@ Status VFSImpl::Flush(ContextSPtr ctx, Ino ino, uint64_t fh) {
   // O_RDONLY fh has no writer — nothing to flush at the data layer.
   if (handle->resources.writer != nullptr) {
     s = handle->resources.writer->Flush();
-    if (!s.ok()) return s;
+    if (!s.ok()) {
+      RollbackFile(ctx, ino, fh);
+      return s;
+    }
   }
 
   s = meta_system_->Flush(ctx, ino, fh);
 
   return s;
+}
+
+void VFSImpl::RollbackFile(ContextSPtr ctx, Ino ino, uint64_t fh) {
+  // Data flush failed: this round of writes is abandoned (ADR-0003). Ask the
+  // meta system to conditionally shrink the file length back to the flush
+  // checkpoint. Best-effort: on failure only log; the caller still returns
+  // the original flush error, and a later user-visible failure point
+  // (Flush/Release) will try again since the checkpoint condition still
+  // holds.
+  auto s = meta_system_->RollbackFile(ctx, ino, fh);
+  if (!s.ok()) {
+    LOG(ERROR) << fmt::format(
+        "[vfs.{}] rollback write length fail, fh({}) error({}).", ino, fh,
+        s.ToString());
+    if (!s.IsNetError()) return;
+  }
+
+  // Abandoned bytes may have been readable through other fhs of this ino. A
+  // network error is commit-ambiguous, so invalidate in that case as well.
+  reader_registry_->InvalidateByIno(ino, 0, INT64_MAX);
 }
 
 Status VFSImpl::Release(ContextSPtr ctx, Ino ino, uint64_t fh) {
@@ -741,7 +790,6 @@ Status VFSImpl::Release(ContextSPtr ctx, Ino ino, uint64_t fh) {
     return Status::OK();
   }
 
-  Status s;
   auto handle = handle_manager_->FindHandlerForRelease(fh);
   if (!handle) {
     VLOG(1) << "Release ignored, fh not found, ino: " << ino << ", fh: " << fh;
@@ -761,30 +809,45 @@ Status VFSImpl::Release(ContextSPtr ctx, Ino ino, uint64_t fh) {
   if (handle->resources.reader != nullptr) {
     handle->resources.reader->Close();
   }
-  if (!resources_detached) {
-    s = meta_system_->Close(ctx, ino, fh);
+
+  // Drain dirty data while the metadata file session is still alive. Dropping
+  // the last writer holder below may call FileWriter::Close(), but Close only
+  // validates the final-flush invariant and cleans up resources; it must not
+  // perform persistence I/O after this explicit Flush.
+  Status flush_status;
+  if (handle->resources.writer != nullptr) {
+    flush_status = handle->resources.writer->Flush();
+    if (!flush_status.ok()) RollbackFile(ctx, ino, fh);
   }
+
+  Status close_status =
+      !resources_detached ? meta_system_->Close(ctx, ino, fh) : Status::OK();
 
   handle_manager_->ReleaseHandler(fh);
 
-  return s;
+  // Always complete Close and release the handle, even if flushing fails.
+  // Prefer the data-flush error because it describes a possible writeback
+  // failure; otherwise return the metadata close result.
+  return !flush_status.ok() ? flush_status : close_status;
 }
 
 // TODO: seperate data flush with metadata flush
 Status VFSImpl::Fsync(ContextSPtr ctx, Ino ino, int datasync, uint64_t fh) {
-  Status s;
   auto handle = handle_manager_->FindHandlerGuard(fh);
   VFS_CHECK_HANDLE(handle.get(), ino, fh);
 
   if (handle->resources.writer != nullptr) {
-    s = handle->resources.writer->Flush();
+    Status s = handle->resources.writer->Flush();
+    if (!s.ok()) {
+      return s;
+    }
   }
 
   if (datasync == 0) {
-    s = meta_system_->Flush(ctx, ino, fh);
+    return meta_system_->Flush(ctx, ino, fh);
   }
 
-  return s;
+  return Status::OK();
 }
 
 Status VFSImpl::SetXattr(ContextSPtr ctx, Ino ino, const std::string& name,
@@ -857,34 +920,113 @@ Status VFSImpl::OpenDir(ContextSPtr ctx, Ino ino, uint64_t* fh,
   return meta_system_->OpenDir(ctx, TranslateIno(ino), *fh, need_cache);
 }
 
+uint64_t VFSImpl::SynthesizedDirEntryCount(Ino ino) const {
+  uint64_t n = 2;  // "." and ".."
+  if (BAIDU_UNLIKELY(ino == kRootIno)) {
+    ++n;                        // .stats
+    if (IsTrashVisible()) ++n;  // .trash
+  }
+  return n;
+}
+
+Ino VFSImpl::ResolveDotDotIno(Ino ino, const Attr& dir_attr) const {
+  // The FUSE-visible root has no parent in this namespace: self-loop, the
+  // POSIX convention for a filesystem root (also covers subdir mounts).
+  if (ino == kRootIno) return kRootIno;
+  // ".trash" is synthesized directly under the root; its attr has no parents.
+  if (BAIDU_UNLIKELY(ino == kTrashIno)) return kRootIno;
+  // Defensive: a parentless non-root dir self-loops rather than reporting a
+  // dangling ino.
+  if (dir_attr.parents.empty()) return ino;
+  // Reverse of TranslateIno: the real mount-root inode is known to the
+  // kernel as kRootIno.
+  Ino parent = dir_attr.parents.front();
+  return (BAIDU_UNLIKELY(parent == mount_root_ino_)) ? kRootIno : parent;
+}
+
 Status VFSImpl::ReadDir(ContextSPtr ctx, Ino ino, uint64_t fh, uint64_t offset,
                         bool with_attr, ReadDirHandler handler,
                         uint32_t& count) {
-  // root dir(add .stats file and .trash)
-  if (BAIDU_UNLIKELY(ino == kRootIno) && offset == 0) {
-    DirEntry stats_entry{kStatsIno, kStatsName,
-                         GenerateVirtualInodeAttr(kStatsIno)};
-    handler(stats_entry, 1);
+  const uint64_t synth_count = SynthesizedDirEntryCount(ino);
 
-    if (IsTrashVisible()) {
-      DirEntry trash_entry{kTrashIno, kTrashDirName, GenerateTrashDirAttr()};
-      handler(trash_entry, 2);
+  if (BAIDU_UNLIKELY(offset < synth_count)) {
+    // Positions 0/1 ("."/"..") need the directory's own attr: "."'s attr
+    // and ".."'s target both come from it. GetAttr applies
+    // RewriteRootAttr/TranslateAttrToLocal internally, so synthesized
+    // entries must go through the raw handler below — passing them through
+    // the uid/gid wrapper would translate them twice. The root-only
+    // ".stats"/".trash" positions need no attr fetch at all.
+    if (offset < 2) {
+      Attr dir_attr;
+      Status s = GetAttr(ctx, ino, &dir_attr);
+      if (!s.ok()) {
+        // A directory deleted while still held open reads as empty: skip
+        // the synthesized entries and the real-dentry stream alike (an
+        // rmdir-able directory has no children anyway).
+        if (s.IsNotExist() || s.IsNotFound()) return Status::OK();
+        LOG(ERROR) << fmt::format("readdir getattr fail, ino({}) status({}).",
+                                  ino, s.ToString());
+        return s;
+      }
+
+      // position 0: "." — a full kernel page (handler returns false) stops
+      // the stream immediately; the next readdir resumes at the unconsumed
+      // position.
+      if (offset == 0) {
+        DirEntry dot{ino, ".", dir_attr};
+        if (!handler(dot, 1)) return Status::OK();
+        ++count;
+      }
+
+      // position 1: ".."
+      DirEntry dotdot{ResolveDotDotIno(ino, dir_attr), "..", Attr{}};
+      if (with_attr) {
+        if (dotdot.ino == ino) {
+          dotdot.attr = dir_attr;  // self-loop: reuse, no extra RPC
+        } else {
+          s = GetAttr(ctx, dotdot.ino, &dotdot.attr);
+          if (!s.ok()) {
+            LOG(ERROR) << fmt::format(
+                "readdir getattr parent fail, ino({}) parent({}) status({}).",
+                ino, dotdot.ino, s.ToString());
+            return s;
+          }
+        }
+      }
+      if (!handler(dotdot, 2)) return Status::OK();
+      ++count;
+    }
+
+    // root-only positions 2/3: ".stats" then ".trash"
+    if (BAIDU_UNLIKELY(ino == kRootIno)) {
+      if (offset <= 2) {
+        DirEntry stats{kStatsIno, kStatsName,
+                       GenerateVirtualInodeAttr(kStatsIno)};
+        if (!handler(stats, 3)) return Status::OK();
+        ++count;
+      }
+      if (IsTrashVisible() && offset <= 3) {
+        DirEntry trash{kTrashIno, kTrashDirName, GenerateTrashDirAttr()};
+        if (!handler(trash, 4)) return Status::OK();
+        ++count;
+      }
     }
   }
 
+  // Real dentries. The meta stream's handler offset restarts at the delegate
+  // offset, so shift it back into the unified cookie space here. uid/gid
+  // translation applies to real entries only (see the note above).
   auto* mapper = vfs_hub_->GetUidGidMapper();
-  ReadDirHandler wrapped =
-      (with_attr && mapper != nullptr)
-          ? ReadDirHandler(
-                [this, &handler](const DirEntry& entry, uint64_t off) {
-                  DirEntry e = entry;
-                  TranslateAttrToLocal(&e.attr);
-                  return handler(e, off);
-                })
-          : handler;
+  ReadDirHandler real_handler = [this, &handler, synth_count, with_attr,
+                                 mapper](const DirEntry& entry, uint64_t off) {
+    DirEntry e = entry;
+    if (with_attr && mapper != nullptr) TranslateAttrToLocal(&e.attr);
+    return handler(e, off + synth_count);
+  };
 
-  return meta_system_->ReadDir(ctx, TranslateIno(ino), fh, offset, with_attr,
-                               wrapped, count);
+  const uint64_t real_offset = offset > synth_count ? offset - synth_count : 0;
+  return meta_system_->ReadDir(ctx, TranslateIno(ino), fh, real_offset,
+                               with_attr, real_handler, count);
 }
 
 Status VFSImpl::ReleaseDir(ContextSPtr ctx, Ino ino, uint64_t fh) {
@@ -907,7 +1049,11 @@ Status VFSImpl::RmDir(ContextSPtr ctx, Ino parent, const std::string& name) {
 }
 
 Status VFSImpl::StatFs(ContextSPtr ctx, Ino ino, FsStat* fs_stat) {
-  return meta_system_->StatFs(ctx, TranslateIno(ino), fs_stat);
+  Status s = meta_system_->StatFs(ctx, TranslateIno(ino), fs_stat);
+  if (!s.ok()) return s;
+
+  fs_stat->fs_id = vfs_hub_->GetFsInfo().id;
+  return Status::OK();
 }
 
 Status VFSImpl::Ioctl(ContextSPtr ctx, Ino ino, uint32_t uid, unsigned int cmd,
@@ -915,7 +1061,7 @@ Status VFSImpl::Ioctl(ContextSPtr ctx, Ino ino, uint32_t uid, unsigned int cmd,
                       char* out_buf, size_t out_bufsz) {
   (void)flags;
   // For internal inode, ioctl is not supported
-  if (BAIDU_UNLIKELY(IsInternalNode(ino))) {
+  if (BAIDU_UNLIKELY(IsInternalIno(ino))) {
     return Status::NotSupport("Ioctl is not supported for internal inode");
   }
 
@@ -928,6 +1074,7 @@ Status VFSImpl::Ioctl(ContextSPtr ctx, Ino ino, uint32_t uid, unsigned int cmd,
   }
 
   Attr attr;
+  ctx->inner_req = true;
   Status s = meta_system_->GetAttr(ctx, ino, &attr);
   if (!s.ok()) {
     return s;
@@ -1010,10 +1157,6 @@ Status VFSImpl::Ioctl(ContextSPtr ctx, Ino ino, uint32_t uid, unsigned int cmd,
 
   return Status::OK();
 }
-
-uint64_t VFSImpl::GetFsId() { return 10; }
-
-uint64_t VFSImpl::GetMaxNameLength() { return FLAGS_vfs_meta_max_name_length; }
 
 Status VFSImpl::GetInfo(std::string* info) {
   Json::Value root;
@@ -1128,6 +1271,23 @@ Status VFSImpl::StartBrpcServer() {
   }
 
   return Status::OK();
+}
+
+void VFSImpl::StopBrpcServer() {
+  const brpc::Server::Status status = brpc_server_.status();
+  // UNINITIALIZED has never run; READY is already fully stopped and joined.
+  // Treat both as successful no-ops so teardown remains idempotent.
+  if (status == brpc::Server::UNINITIALIZED || status == brpc::Server::READY) {
+    return;
+  }
+
+  CHECK(status == brpc::Server::RUNNING || status == brpc::Server::STOPPING)
+      << "unexpected brpc server status: " << static_cast<int>(status);
+
+  if (status == brpc::Server::RUNNING) {
+    CHECK_EQ(0, brpc_server_.Stop(0));
+  }
+  CHECK_EQ(0, brpc_server_.Join());
 }
 
 }  // namespace vfs

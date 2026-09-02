@@ -22,27 +22,15 @@
 #include <unistd.h>
 
 #include <atomic>
-#include <chrono>
+#include <boost/intrusive_ptr.hpp>
 #include <cstdint>
 #include <memory>
 #include <mutex>
-#include <thread>
 
 #include "client/vfs/common/async_util.h"
 #include "client/vfs/data/writer/chunk_writer.h"
 #include "client/vfs/hub/vfs_hub.h"
 #include "common/writemempool/write_mem_pool.h"
-
-DEFINE_int64(vfs_stale_write_sleep_us, 10, "sleep us when detect memory low");
-
-DEFINE_double(vfs_write_throttle_soft_ratio, 0.85,
-              "write buffer usage ratio at which to start soft throttle");
-DEFINE_double(vfs_write_throttle_hard_ratio, 0.95,
-              "write buffer usage ratio at which to keep throttling until "
-              "the flush worker drains it back below");
-DEFINE_int64(vfs_write_throttle_budget_ms, 5000,
-             "max time to block in hard throttle before returning NoSpace; "
-             "bounds the wait so a stalled flush can't hang the FUSE syscall");
 
 namespace dingofs {
 namespace client {
@@ -54,46 +42,13 @@ static std::atomic<uint64_t> file_flush_id_gen{1};
 
 namespace {
 
-// Throttle counters (lock-free per-thread Adder). Only bumped on the slow path
-// (usage already past soft_ratio), so the normal write path never touches them.
-bvar::Adder<int64_t> g_throttle_num("vfs_write_throttle_num");
-bvar::Adder<int64_t> g_throttle_timeout_num("vfs_write_throttle_timeout_num");
+bvar::Adder<int64_t> g_close_after_flush_failure_num(
+    "vfs_file_writer_close_after_flush_failure_num");
 
-// Memory-pressure throttle (pool-backed WriteMemPool, usage is hard-capped at
-// 100% so the old `used > total` / `> 2*total` thresholds never fire). Now
-// ratio-based with a soft pre-throttle:
-//   usage < soft_ratio  -> pass;
-//   usage >= soft_ratio -> sleep once to slow the writer;
-//   usage >= hard_ratio -> keep sleeping (bounded by budget_ms) until the
-//                          flush worker drains it back below.
-// The soft pre-throttle keeps the pool from truly filling, which would make
-// Allocate's bounded-acquire time out into ENOSPC. The wait is bounded so a
-// stalled flush (S3 down) can't D-state the FUSE syscall forever -- on timeout
-// we return NoSpace (-> ENOSPC) instead of blocking indefinitely.
-Status ApplyWriteBufferThrottle(WriteMemPool* bm) {
-  if (!bm->IsHighPressure(FLAGS_vfs_write_throttle_soft_ratio)) {
-    return Status::OK();
-  }
-
-  g_throttle_num << 1;  // soft limit hit (slow path only)
-  VLOG(1) << "WriteMemPool soft pressure, usage=" << bm->GetUsageRatio();
-  std::this_thread::sleep_for(
-      std::chrono::microseconds(FLAGS_vfs_stale_write_sleep_us));
-
-  auto deadline = std::chrono::steady_clock::now() +
-                  std::chrono::milliseconds(FLAGS_vfs_write_throttle_budget_ms);
-  while (bm->IsHighPressure(FLAGS_vfs_write_throttle_hard_ratio)) {
-    if (std::chrono::steady_clock::now() >= deadline) {
-      g_throttle_timeout_num << 1;
-      LOG(WARNING) << "WriteMemPool throttle timeout, usage="
-                   << bm->GetUsageRatio() << " used=" << bm->GetUsedBytes()
-                   << " total=" << bm->GetTotalBytes();
-      return Status::NoSpace("write buffer throttle timeout");
-    }
-    std::this_thread::sleep_for(
-        std::chrono::microseconds(10 * FLAGS_vfs_stale_write_sleep_us));
-  }
-  return Status::OK();
+size_t PageNeed(uint64_t offset, uint64_t size, uint64_t page_size) {
+  CHECK_GT(page_size, 0);
+  return static_cast<size_t>(((offset % page_size) + size + page_size - 1) /
+                             page_size);
 }
 
 }  // namespace
@@ -124,20 +79,16 @@ void FileWriter::Close() {
     cv_.wait(lg);
   }
 
-  if (!chunk_writers_.empty()) {
-    uint64_t file_flush_id = file_flush_id_gen.fetch_add(1);
-    auto flush_task =
-        std::make_unique<FileFlushTask>(ino_, file_flush_id, chunk_writers_);
-
-    Status s;
-    Synchronizer sync;
-    flush_task->RunAsync(sync.AsStatusCallBack(s));
-    sync.Wait();
-
-    if (!s.ok()) {
-      LOG(ERROR) << fmt::format("{} Failed to close file, flush error: {}",
-                                uuid_, s.ToString());
-    }
+  Status flush_status = GetStatus();
+  if (flush_status.ok()) {
+    CHECK_EQ(write_generation_, flushed_generation_)
+        << fmt::format("{} Close found unflushed data", uuid_);
+  } else {
+    g_close_after_flush_failure_num << 1;
+    LOG(ERROR) << fmt::format(
+        "{} Close after flush failure, write_generation: {}, "
+        "flushed_generation: {}, status: {}",
+        uuid_, write_generation_, flushed_generation_, flush_status.ToString());
   }
 
   for (auto& pair : chunk_writers_) {
@@ -165,17 +116,9 @@ void FileWriter::ReleaseRef() {
 
 Status FileWriter::Write(ContextSPtr ctx, const char* buf, uint64_t size,
                          uint64_t offset, uint64_t* out_wsize) {
-  // Define the out-param on every path: the early-return error paths below
-  // (sticky status / throttle timeout / closed) leave it 0 instead of relying
-  // on the caller to pre-zero.
+  // Define the out-param on every path.
   *out_wsize = 0;
-
-  // Sticky-broken fast-fail.
   DINGOFS_RETURN_NOT_OK(GetStatus());
-
-  // Memory-pressure throttle (soft pre-throttle; bounded hard wait). On timeout
-  // returns NoSpace -> ENOSPC instead of blocking the FUSE syscall forever.
-  DINGOFS_RETURN_NOT_OK(ApplyWriteBufferThrottle(vfs_hub_->GetWriteMemPool()));
 
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -203,28 +146,44 @@ Status FileWriter::Write(ContextSPtr ctx, const char* buf, uint64_t size,
 
   Status s;
   uint64_t written_size = 0;
+  WriteMemPool* pool = vfs_hub_->GetWriteMemPool();
 
   while (size > 0) {
-    int32_t write_size = static_cast<int32_t>(
+    const int32_t write_size = static_cast<int32_t>(
         std::min(size, static_cast<uint64_t>(chunk_size - chunk_offset)));
 
-    ChunkWriter* chunk = GetOrCreateChunkWriter(chunk_index);
-    s = chunk->Write(SpanScope::GetContext(span), pos, write_size,
-                     chunk_offset);
-    if (!s.ok()) {
-      // Detail-only: this chunk stopped the write (surfaces as a short write if
-      // written_size > 0, else a hard error, decided after the loop). Don't
-      // WARN per chunk -- it floods under back-pressure and misreads a
-      // successful short write; the outcome is recorded uniformly in
-      // VFSWrapper's access log (status + out_wsize), the pool-pressure
-      // locality in SliceWriter, and the failure rate in the
-      // vfs_write_pool_alloc_fail_num metric.
-      VLOG(3) << "stop write at chunk, ino: " << ino_
-              << ", chunk_index: " << chunk_index
-              << ", chunk_offset: " << chunk_offset
-              << ", write_size: " << write_size << ", status: " << s.ToString();
-      break;
+    // Capacity admission is the only blocking point and happens before any
+    // ChunkWriter/SliceWriter lock. One extra page covers worst-case
+    // unaligned boundaries; unused pages return through the lease.
+    WritePageLease lease;
+    s = pool->Acquire(PageNeed(static_cast<uint64_t>(chunk_offset),
+                               static_cast<uint64_t>(write_size),
+                               static_cast<uint64_t>(pool->GetPageSize())),
+                      &lease);
+    if (!s.ok()) break;
+
+    // Acquire may have waited while flush or shutdown changed writer state.
+    s = GetStatus();
+    if (!s.ok()) break;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (closed_) {
+        s = Status::BadFd("file already closed");
+      }
     }
+    if (!s.ok()) break;
+
+    ChunkWriter* chunk = GetOrCreateChunkWriter(chunk_index);
+    chunk->Write(SpanScope::GetContext(span), pos, write_size, chunk_offset,
+                 &lease);
+
+    // Publish every independently flushable chunk before the next Acquire can
+    // block. Pressure flush uses these generations as its dirty predicate.
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      ++write_generation_;
+    }
+    pool->NotifyDirtyPublished();
 
     pos += write_size;
     size -= write_size;
@@ -246,11 +205,8 @@ Status FileWriter::Write(ContextSPtr ctx, const char* buf, uint64_t size,
 
   *out_wsize = written_size;
 
-  // Partial progress is a POSIX short write, not a failure. SliceWriter::Write
-  // is atomic per chunk, so written_size is exactly the prefix of fully-written
-  // chunks; report OK + that prefix so the caller advances and re-issues the
-  // rest (which hits the throttle / backpressure). Only a zero-byte write
-  // surfaces the error (e.g. the very first chunk got ENOSPC).
+  // Partial progress is a POSIX short write, not a failure. A zero-byte result
+  // surfaces the admission, sticky writer, or shutdown status.
   if (written_size > 0) {
     return Status::OK();
   }
@@ -274,8 +230,13 @@ ChunkWriter* FileWriter::GetOrCreateChunkWriter(int64_t chunk_index) {
   }
 }
 
-void FileWriter::FileFlushTaskDone(uint64_t file_flush_id, StatusCallback cb,
-                                   Status status) {
+void FileWriter::FileFlushTaskDone(uint64_t file_flush_id,
+                                   uint64_t target_generation,
+                                   StatusCallback cb, Status status) {
+  if (!status.ok()) {
+    SetStatusIfBroken(status);
+  }
+
   {
     std::lock_guard<std::mutex> lock(mutex_);
     auto iter = inflight_flush_tasks_.find(file_flush_id);
@@ -285,6 +246,10 @@ void FileWriter::FileFlushTaskDone(uint64_t file_flush_id, StatusCallback cb,
                    << ", file_flush_id: " << file_flush_id
                    << ", flush_task: " << iter->second->ToString()
                    << ", status: " << status.ToString();
+    }
+
+    if (status.ok()) {
+      flushed_generation_ = std::max(flushed_generation_, target_generation);
     }
 
     inflight_flush_tasks_.erase(iter);
@@ -304,10 +269,14 @@ void FileWriter::AsyncFlush(StatusCallback cb) {
 
   FileFlushTask* flush_task{nullptr};
   uint64_t chunk_count = 0;
+  uint64_t target_generation = 0;
+  bool closed = false;
 
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    target_generation = write_generation_;
     if (closed_) {
+      closed = true;
       LOG(INFO) << fmt::format(
           "{} File::AsyncFlush skip becaue file already closed", uuid_);
     } else {
@@ -326,11 +295,20 @@ void FileWriter::AsyncFlush(StatusCallback cb) {
     }
   }
 
+  if (closed) {
+    cb(Status::BadFd("file already closed"));
+    return;
+  }
+
   if (flush_task == nullptr) {
     VLOG(3) << fmt::format(
         "{} File::AsyncFlush end file_flush_id: {}, chunk_count: {} calling "
         "callback directly",
+
         uuid_, file_flush_id, chunk_count);
+    // chunk_writers_ only grows after a successful write reaches a chunk.
+    // Therefore an empty writer has no generation that needs flushing.
+    DCHECK_EQ(target_generation, 0);
     cb(Status::OK());
     return;
   }
@@ -338,14 +316,30 @@ void FileWriter::AsyncFlush(StatusCallback cb) {
   CHECK_NOTNULL(flush_task);
 
   AcquireRef();
-  flush_task->RunAsync(
-      [this, file_flush_id, rcb = std::move(cb)](Status status) {
-        VLOG(3) << "File::AsyncFlush end ino: " << ino_
-                << ", file_flush_id: " << file_flush_id
-                << ", status: " << status.ToString();
-        FileFlushTaskDone(file_flush_id, rcb, std::move(status));
-        ReleaseRef();
-      });
+  flush_task->RunAsync([this, file_flush_id, target_generation,
+                        rcb = std::move(cb)](Status status) {
+    VLOG(3) << "File::AsyncFlush end ino: " << ino_
+            << ", file_flush_id: " << file_flush_id
+            << ", status: " << status.ToString();
+    FileFlushTaskDone(file_flush_id, target_generation, rcb, std::move(status));
+    ReleaseRef();
+  });
+}
+void FileWriter::FlushDirtyAsync(StatusCallback cb) {
+  bool dirty = false;
+  bool closed = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    closed = closed_;
+    dirty = write_generation_ > flushed_generation_;
+  }
+  if (closed) {
+    cb(Status::BadFd("file already closed"));
+  } else if (!dirty) {
+    cb(Status::OK());
+  } else {
+    AsyncFlush(std::move(cb));
+  }
 }
 
 Status FileWriter::Flush() {
@@ -353,9 +347,6 @@ Status FileWriter::Flush() {
   Synchronizer sync;
   AsyncFlush(sync.AsStatusCallBack(s));
   sync.Wait();
-  if (!s.ok()) {
-    SetStatusIfBroken(s);
-  }
   return s;
 }
 
@@ -382,13 +373,9 @@ void FileWriter::SchedulePeriodicFlush() {
     }
   }
 
-  AcquireRef();
-
+  boost::intrusive_ptr<FileWriter> self(this);
   vfs_hub_->GetWriteBackgroundExecutor()->Schedule(
-      [this] {
-        RunPeriodicFlush();
-        ReleaseRef();
-      },
+      [self = std::move(self)] { self->RunPeriodicFlush(); },
       FLAGS_vfs_periodic_flush_interval_ms);
 }
 

@@ -32,7 +32,7 @@
 
 #include "cache/api/block_cache.h"
 #include "cache/common/macro.h"
-#include "cache/common/slab_buffer.h"
+#include "cache/common/slab_pool.h"
 #include "cache/common/storage_client.h"
 #include "cache/iutil/string_util.h"
 #include "cache/local/cache_store.h"
@@ -262,9 +262,13 @@ Status TierBlockCache::Range(BlockHandle handle, off_t offset, size_t length,
     }
   }
 
-  // Finally, retrieve from storage if allowed
+  // Finally, retrieve from storage if allowed. Retry NotFound here: with
+  // writeback the block may still be staged on the writer waiting for
+  // upload. This is the single waiting point on the read path — prefetch
+  // and cache-node retrieval keep failing fast.
   if (option.retrieve_storage) {
-    status = storage_client_->Range(handle, offset, length, buffer);
+    status = storage_client_->Range(handle, offset, length, buffer,
+                                    {.retry_notfound = true});
     if (!status.ok()) {
       LOG(ERROR) << "Fail to range block from storage, key="
                  << handle.Filename() << ", status=" << status.ToString();
@@ -301,6 +305,11 @@ Status TierBlockCache::Prefetch(BlockHandle handle, size_t length,
 
   option.tier = ResolveTier(handle, option.tier);
 
+  // Prefetch fills exactly ONE tier: the local cache when present, else the
+  // cache group. With both tiers enabled the group is intentionally not
+  // warmed: PrefetchOption carries no warmup-vs-read-prefetch provenance,
+  // and read-triggered prefetch firing a group RPC per read window would
+  // regress the read path.
   Status status;
   if (UseLocal(option.tier) && EnableLocalCache()) {
     status = local_block_cache_->Prefetch(handle, length, option);
@@ -313,6 +322,32 @@ Status TierBlockCache::Prefetch(BlockHandle handle, size_t length,
   if (!status.ok()) {
     LOG(ERROR) << "Fail to prefetch block, key=" << handle.Filename()
                << ", status=" << status.ToString();
+  }
+  return status;
+}
+
+Status TierBlockCache::Delete(BlockHandle handle, DeleteOption option) {
+  DCHECK_RUNNING("TierBlockCache");
+
+  Status status;
+  if (UseLocal(option.tier) && local_block_cache_->IsEnabled()) {
+    auto s = local_block_cache_->Delete(handle, option);
+    if (!s.ok()) {
+      LOG(ERROR) << "Fail to delete block from local cache, key="
+                 << handle.Filename() << ", status=" << s.ToString();
+      status = s;
+    }
+  }
+
+  if (UseRemote(option.tier) && remote_block_cache_->IsEnabled()) {
+    auto s = remote_block_cache_->Delete(handle, option);
+    if (!s.ok()) {
+      LOG(ERROR) << "Fail to delete block from remote cache, key="
+                 << handle.Filename() << ", status=" << s.ToString();
+      if (status.ok()) {
+        status = s;
+      }
+    }
   }
   return status;
 }
@@ -407,6 +442,24 @@ void TierBlockCache::AsyncPrefetch(BlockHandle handle, size_t length,
           cb(status);
         }
         tracker->Remove(handle.Filename());
+      });
+
+  if (tid != 0) {
+    joiner_->BackgroundJoin(tid);
+  }
+}
+
+void TierBlockCache::AsyncDelete(BlockHandle handle, AsyncCallback cb,
+                                 DeleteOption option) {
+  DCHECK_RUNNING("TierBlockCache");
+
+  auto* self = GetSelfPtr();
+  auto tid = iutil::RunInBthread(
+      [self, handle = std::move(handle), cb, option]() mutable {
+        Status status = self->Delete(std::move(handle), option);
+        if (cb) {
+          cb(status);
+        }
       });
 
   if (tid != 0) {
